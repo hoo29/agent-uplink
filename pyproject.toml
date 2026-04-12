@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-uplink"
+version = "0.0.1"
+description = "Claude Sandbox"
+readme = "README.md"
+authors = [{ name = "Huw" }]
+license = { file = "LICENSE" }
+
+dependencies = []
+requires-python = ">=3.9"
+
+[project.urls]
+Homepage = "https://github.com/hoo29/agent-uplink"
+
+[project.scripts]
+agent-uplink = "agent_uplink.__main__:main"
+
+[project.optional-dependencies]
+tests = ["pytest"]
+build = ["build"]
+
+[tool.setuptools]
+packages = ["agent_uplink"]
