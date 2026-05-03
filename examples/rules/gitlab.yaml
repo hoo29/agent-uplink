@@ -1,0 +1,19 @@
+# GitLab.com - read + selected writes.
+#
+# Create a Personal Access Token with the scopes you need (typically `api`)
+# at https://gitlab.com/-/user_settings/personal_access_tokens, then store it:
+#
+#   keyring set gitlab com-pat
+#
+# For self-hosted instances, swap the host pattern and reuse or rename the
+# keyring entry as you like.
+
+rules:
+  - name: gitlab-api-read
+    host: 'gitlab\.com'
+    methods: [GET, OPTIONS]
+    paths:
+      - "/api/v4/.*"
+    inject:
+      headers:
+        PRIVATE-TOKEN: "{{keyring:gitlab:com-pat}}"

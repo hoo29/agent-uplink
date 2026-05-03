@@ -28,7 +28,7 @@ jobs:
         run: python -m build
 
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4.1.0
         with:
           subject-path: "dist/agent_uplink-*"
 

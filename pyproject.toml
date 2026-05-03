@@ -10,8 +10,11 @@ readme = "README.md"
 authors = [{ name = "Huw" }]
 license = { file = "LICENSE" }
 
-dependencies = []
-requires-python = ">=3.9"
+dependencies = [
+    "keyring",
+    "pyyaml",
+]
+requires-python = ">=3.10"
 
 [project.urls]
 Homepage = "https://github.com/hoo29/agent-uplink"
@@ -24,4 +27,7 @@ tests = ["pytest"]
 build = ["build"]
 
 [tool.setuptools]
-packages = ["agent_uplink"]
+packages = ["agent_uplink", "agent_uplink.mitm_addon"]
+
+[tool.setuptools.package-data]
+agent_uplink = ["default_rules.yaml"]
