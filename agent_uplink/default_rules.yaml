@@ -1,0 +1,8 @@
+rules:
+  - name: default-readonly
+    host: ".*"
+    methods: [GET, OPTIONS, HEAD]
+
+  - name: aws-cli
+    host: 'sts\.(?:[^.]+\.)?amazonaws\.com'
+    methods: [POST]

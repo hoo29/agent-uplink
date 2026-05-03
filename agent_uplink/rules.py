@@ -1,0 +1,140 @@
+import json
+import logging
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+import keyring
+import yaml
+
+LOGGER = logging.getLogger("agent-uplink")
+
+DEFAULT_RULES_PATH = Path(__file__).resolve().parent / "default_rules.yaml"
+
+VALID_METHODS = {
+    "GET",
+    "POST",
+    "PUT",
+    "DELETE",
+    "PATCH",
+    "HEAD",
+    "OPTIONS",
+    "CONNECT",
+    "TRACE",
+}
+
+# {{keyring:SERVICE:USERNAME}} service can't contain ':' or '}',
+# username can't contain '}' (so usernames with ':' are still allowed).
+_PLACEHOLDER_RE = re.compile(r"\{\{keyring:([^:}]+):([^}]+)\}\}")
+
+
+def _load_yaml(path: Path) -> dict:
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: expected a YAML mapping at top level")
+    return data
+
+
+def _resolve_placeholders(value: str) -> str:
+    def sub(m: re.Match) -> str:
+        service, username = m.group(1), m.group(2)
+        secret = keyring.get_password(service, username)
+        if secret is None:
+            raise RuntimeError(
+                f"keyring entry not found: service={service!r} username={username!r}"
+            )
+        return secret
+
+    return _PLACEHOLDER_RE.sub(sub, value)
+
+
+def _validate_and_resolve_rule(rule: dict, idx: int) -> dict:
+    name = rule.get("name", f"<rule[{idx}]>")
+    if "host" not in rule:
+        raise ValueError(f"{name}: missing required field 'host'")
+    if not isinstance(rule["host"], str):
+        raise ValueError(f"{name}: 'host' must be a string regex")
+    try:
+        re.compile(rule["host"])
+    except re.error as e:
+        raise ValueError(f"{name}: invalid host regex {rule['host']!r}: {e}")
+
+    methods = rule.get("methods")
+    if methods is not None:
+        if not isinstance(methods, list) or not all(
+            isinstance(m, str) for m in methods
+        ):
+            raise ValueError(f"{name}: 'methods' must be a list of strings")
+        bad = [m for m in methods if m not in VALID_METHODS]
+        if bad:
+            raise ValueError(
+                f"{name}: invalid method(s) {bad}; must be uppercase HTTP verbs"
+            )
+
+    paths = rule.get("paths")
+    if paths is not None:
+        if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+            raise ValueError(
+                f"{name}: 'paths' must be a list of regex strings")
+        for p in paths:
+            try:
+                re.compile(p)
+            except re.error as e:
+                raise ValueError(f"{name}: invalid path regex {p!r}: {e}")
+
+    resolved_headers: dict[str, str] = {}
+    inject = rule.get("inject")
+    if inject is not None:
+        headers = inject.get("headers")
+        if headers is not None:
+            if not isinstance(headers, dict):
+                raise ValueError(f"{name}: 'inject.headers' must be a mapping")
+            for k, v in headers.items():
+                if not isinstance(v, str):
+                    raise ValueError(f"{name}: header {k!r} must be a string")
+                resolved_headers[k] = _resolve_placeholders(v)
+
+    out: dict[str, Any] = {"name": name, "host": rule["host"]}
+    if methods is not None:
+        out["methods"] = methods
+    if paths is not None:
+        out["paths"] = paths
+    if resolved_headers:
+        out["inject"] = {"headers": resolved_headers}
+    return out
+
+
+def resolve(
+    user_rules_path: Path | None,
+    no_default_rules: bool,
+    out_path: Path,
+) -> None:
+    """Build resolved rules JSON at out_path with mode 0600."""
+    user_config: dict = {}
+    if user_rules_path is not None:
+        user_config = _load_yaml(user_rules_path)
+
+    use_defaults = not (no_default_rules or user_config.get(
+        "replace_defaults", False))
+    rules: list[dict] = []
+    if use_defaults:
+        defaults_config = _load_yaml(DEFAULT_RULES_PATH)
+        rules.extend(defaults_config.get("rules") or [])
+    rules.extend(user_config.get("rules") or [])
+
+    if not rules:
+        raise ValueError("no rules loaded; agent-uplink would deny everything")
+
+    resolved = sorted(
+        [_validate_and_resolve_rule(r, i) for i, r in enumerate(rules)],
+        key=lambda r: len(r["host"]),
+        reverse=True,
+    )
+    payload = json.dumps({"rules": resolved}, indent=2)
+
+    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(payload)
+    LOGGER.info(f"resolved {len(resolved)} rules -> {out_path}")

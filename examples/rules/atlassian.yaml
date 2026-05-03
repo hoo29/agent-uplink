@@ -1,0 +1,20 @@
+# Atlassian Cloud (Jira / Confluence) - classic tokens only right now
+
+rules:
+  - name: atlassian-rest-read
+    host: 'yourorg\.atlassian\.net'
+    methods: [GET, OPTIONS]
+    paths:
+      - "/wiki/rest/.*"
+    inject:
+      headers:
+        Authorization: "Basic {{keyring:atlassian:confluence-ro}}"
+
+  - name: atlassian-mcp
+    host: 'mcp\.atlassian\.com'
+    methods: [GET, OPTIONS, PUT, POST, PATCH, DELETE]
+    paths:
+      - "/v1/mcp.*"
+    inject:
+      headers:
+        Authorization: "Basic {{keyring:atlassian:mcp-ro}}"
