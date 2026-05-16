@@ -39,11 +39,11 @@ pytest
 3. Build the Claude image (`agent-uplink-claude` by default) — certs are copied into the image at build time so the container trusts mitmproxy's CA.
 4. Create a per-session directory `~/.agent_uplink/<uuid>/`.
 5. Write a filtered copy of the Claude config (strips `awsAuthRefresh`, `sandbox`, `permissions`; adds `skipDangerousModePermissionPrompt`).
-6. For each `--aws-profiles` profile: export the real AWS env vars (kept in host memory, passed only to the sidecar `docker run -e ...`), and write a dummy `~/.aws/credentials` file (mode 0600) with a deterministic dummy AKIA per profile.
+6. For each `--aws-profiles` profile: export the real AWS env vars on the host, write them as a shared-credentials-file INI blob into a per-profile `LockedSecret` (mlock'd `/dev/shm`, mode 0600) for bind-mounting into the sidecar; and write a dummy `~/.aws/credentials` file (mode 0600) with a deterministic dummy AKIA per profile for the Claude container.
 7. Resolve rules: merge `default_rules.yaml` with the user's `--rules` file, expand `{{keyring:...}}` placeholders via the host's OS keyring, embed the `aws_sigv4_routes` map (dummy AKIA → sidecar host/port), and store the resolved JSON in a `LockedSecret` (mlock'd `/dev/shm` file, mode 0600) for read-only mounting into the mitmproxy container.
 8. If there are AWS profiles, create a per-session docker network `agent-uplink-net-<id>`.
 9. Start mitmproxy container on a random host port (attached to the docker network if present) with the addon (`mitm_addon/filter.py`) and resolved rules mounted read-only; start host-side `socat` forwarding `~/.agent_uplink/<uuid>/sockets/uplink.sock` → `127.0.0.1:<port>`.
-10. For each AWS profile, start an `aws-sigv4-proxy` sidecar on the docker network, with the real AWS env vars passed via `-e`. mitmproxy reaches sidecars by container name via docker's embedded DNS.
+10. For each AWS profile, start an `aws-sigv4-proxy` sidecar on the docker network. The per-profile `LockedSecret` is bind-mounted read-only at `/aws/credentials`; `AWS_SHARED_CREDENTIALS_FILE` and `AWS_PROFILE` are set so the sidecar's SDK reads creds from the file. The sidecar runs as the host uid/gid so it can read the host-owned 0600 file under `--cap-drop=ALL`. mitmproxy reaches sidecars by container name via docker's embedded DNS.
 11. Start the Claude container (interactive, `--network none`). `entrypoint.sh` starts container-side `socat` bridging TCP 8090 → the Unix socket, then `cd`s to `$WORKDIR` and runs `claude --dangerously-skip-permissions`.
 12. On SIGINT/SIGTERM: stop all containers (mitm + sidecars + claude, 3 s timeout), terminate background processes, scrub `LockedSecret`s, remove the docker network, delete the session directory.
 
@@ -60,7 +60,7 @@ pytest
 |---|---|
 | `agent_uplink/__main__.py` | Entry point shim — re-exports `cli.main` so `python -m agent_uplink` works |
 | `agent_uplink/cli.py` | Arg parsing, signal handler wiring, top-level orchestration |
-| `agent_uplink/config.py` | Load/filter Claude settings; generate dummy AKIA per AWS profile and write a dummy `~/.aws/credentials` for the container; export real AWS env vars for sidecars |
+| `agent_uplink/config.py` | Load/filter Claude settings; generate dummy AKIA per AWS profile and write a dummy `~/.aws/credentials` for the container; export real AWS env vars and format them as a shared-credentials-file INI blob for sidecars |
 | `agent_uplink/docker_ops.py` | All `docker` invocations + `DOCKER_RUN_FLAGS` shared by all containers; per-session network + sigv4-proxy sidecar launch |
 | `agent_uplink/process.py` | `run_command`, `run_command_background`, `get_free_port` |
 | `agent_uplink/session.py` | `Session` dataclass: tracks containers/processes; idempotent `cleanup()` |
@@ -123,4 +123,4 @@ The mitm addon detects requests whose host ends in `.amazonaws.com` and whose `A
 
 Requests to `*.amazonaws.com` with no matching SigV4 route return `403`. Requests with no `Authorization: AWS4-HMAC-SHA256` header fall through to the normal allow-list (e.g. anonymous `GET` to a public S3 bucket).
 
-Real AWS credentials are obtained on the host via `aws configure export-credentials` (with an `aws sso login` fallback) and passed directly to the sidecar container via `docker run -e ...`. They never enter the Claude container, are never written to disk in the session dir, and the sidecar is on a docker network unreachable from the Claude container (`--network none`).
+Real AWS credentials are obtained on the host via `aws configure export-credentials` (with an `aws sso login` fallback), formatted as a single-profile shared-credentials-file INI blob, and stored in a per-profile `LockedSecret` (mlock'd `/dev/shm` file, mode 0600). The sidecar bind-mounts that file read-only at `/aws/credentials` and reads it via `AWS_SHARED_CREDENTIALS_FILE`; `AWS_PROFILE` is the only AWS-related env var on the container. This avoids `docker run -e AWS_SECRET_ACCESS_KEY=...`, which would expose creds to any host user with docker access (`docker inspect`) and to the sidecar's `/proc/<pid>/environ`. Creds never enter the Claude container, never hit disk, and the sidecar is on a docker network unreachable from the Claude container (`--network none`).

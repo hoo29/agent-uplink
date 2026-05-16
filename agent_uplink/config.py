@@ -71,6 +71,27 @@ def export_aws_profile_env(profile_name: str) -> dict[str, str]:
     return env
 
 
+def real_aws_credentials_ini(profile_name: str, env: dict[str, str]) -> bytes:
+    """Build a shared-credentials-file (INI) blob for one profile.
+
+    Used to feed real creds to an aws-sigv4-proxy sidecar via a mlock'd
+    /dev/shm bind-mount instead of `docker run -e ...`. Env vars on a
+    container are readable by any host user with docker access via
+    `docker inspect` and stick around in /proc/<pid>/environ.
+    """
+    key_map = {
+        "AWS_ACCESS_KEY_ID": "aws_access_key_id",
+        "AWS_SECRET_ACCESS_KEY": "aws_secret_access_key",
+        "AWS_SESSION_TOKEN": "aws_session_token",
+    }
+    lines = [f"[{profile_name}]"]
+    for env_key, ini_key in key_map.items():
+        if env_key in env:
+            lines.append(f"{ini_key} = {env[env_key]}")
+    lines.append("")
+    return "\n".join(lines).encode()
+
+
 def dummy_akia(profile_name: str) -> str:
     """Generate a deterministic dummy AKIA-format access key for a profile.
 

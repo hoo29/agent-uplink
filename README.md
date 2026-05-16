@@ -96,7 +96,7 @@ See `examples/rules/atlassian.yaml` and `examples/rules/gitlab.yaml` for worked 
 `--aws-profiles foo bar` reads the named profiles from your host AWS config (`aws configure export-credentials`, with an `aws sso login` fallback). For each profile:
 
 - The container's `~/.aws/credentials` is populated with **dummy** values: a deterministic dummy access key per profile (`AKIA` + first 16 hex chars of `sha256(profile)`) and a fixed dummy secret. Real keys never enter the Claude container.
-- A small `aws-sigv4-proxy` sidecar is started on a per-session docker network with the real AWS env vars passed via `docker run -e ...`.
+- A small `aws-sigv4-proxy` sidecar is started on a per-session docker network. Real credentials are passed via a per-profile mlock'd `/dev/shm` file (`LockedSecret`, mode 0600) bind-mounted at `/aws/credentials`, with `AWS_SHARED_CREDENTIALS_FILE` pointing the SDK at it — never via `docker run -e ...`, since env vars are visible to any host user with docker access. The sidecar runs as the invoking user's uid/gid so it can read the host-owned file under `--cap-drop=ALL`.
 - The mitmproxy addon detects `*.amazonaws.com` requests signed with `AWS4-HMAC-SHA256`, extracts the dummy AKIA from the `Credential=` field, strips the signature headers, and reroutes the request over plain HTTP to the matching sidecar — preserving the original `Host` so the sidecar signs for the right service/region before forwarding to AWS.
 
 The Claude container stays on `--network none`; sidecars live on a docker network it can't reach. STS credentials are exported once at startup, so long sessions may need a restart when they expire.

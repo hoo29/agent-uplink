@@ -10,6 +10,7 @@ from .config import (
     export_aws_profile_env,
     get_bedrock_aws_profile_name,
     load_claude_config,
+    real_aws_credentials_ini,
     write_claude_settings,
     write_dummy_aws_credentials,
 )
@@ -27,6 +28,7 @@ from .docker_ops import (
 )
 from .process import get_free_port
 from .rules import resolve as resolve_rules
+from .secret import LockedSecret
 from .session import Session, handle_signal
 
 LOGGER = logging.getLogger("agent-uplink")
@@ -132,8 +134,16 @@ def run(session: Session, args: argparse.Namespace) -> None:
             args.claude_image, username, mitm_dir, args.force_rebuild
         )
 
-    # Real AWS creds — only ever passed to sidecars on the host network.
-    real_aws_env = {p: export_aws_profile_env(p) for p in aws_profile_names}
+    # Real AWS creds — one mlock'd /dev/shm credentials file per profile,
+    # bind-mounted into the matching sidecar. Avoids `docker run -e ...`,
+    # which exposes secrets to any host user via `docker inspect`.
+    real_aws_creds_secrets: dict[str, LockedSecret] = {}
+    for profile in aws_profile_names:
+        env = export_aws_profile_env(profile)
+        safe = "".join(c if c.isalnum() or c in "._-" else "-" for c in profile)
+        secret = LockedSecret(f"aws-{safe}", real_aws_credentials_ini(profile, env))
+        real_aws_creds_secrets[profile] = secret
+        session.secrets.append(secret)
     # Fake AWS creds — written to the container's ~/.aws/credentials. The
     # dummy AKIA per profile is the key the mitm addon uses to pick the
     # right sigv4-proxy sidecar.
@@ -182,7 +192,7 @@ def run(session: Session, args: argparse.Namespace) -> None:
         for profile, name in sidecars:
             start_sigv4_proxy(
                 session, args.sigv4_proxy_image, name, network_name,
-                real_aws_env[profile],
+                profile, real_aws_creds_secrets[profile].bind_source,
             )
     start_claude_container(
         session, args.claude_image, cwd, claude_mounts, args.runtime, args.debug,

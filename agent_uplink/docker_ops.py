@@ -250,13 +250,14 @@ def start_sigv4_proxy(
     image: str,
     container_name: str,
     network: str,
-    aws_env: dict[str, str],
+    profile: str,
+    creds_bind_source: str,
 ) -> None:
     session.containers.append(container_name)
     LOGGER.info(f"starting sigv4-proxy sidecar {container_name}")
-    env_args: list[str] = []
-    for k, v in aws_env.items():
-        env_args.extend(["-e", f"{k}={v}"])
+    # Run as the host user so the bind-mounted, host-owned 0600 creds file is
+    # readable (--cap-drop=ALL strips CAP_DAC_OVERRIDE, so root-in-container
+    # cannot bypass the permission check).
     proc = run_command_background(
         [
             "docker",
@@ -267,7 +268,14 @@ def start_sigv4_proxy(
             "--memory=128m",
             "--network",
             network,
-            *env_args,
+            "-u",
+            f"{os.getuid()}:{os.getgid()}",
+            "-v",
+            f"{creds_bind_source}:/aws/credentials:ro",
+            "-e",
+            "AWS_SHARED_CREDENTIALS_FILE=/aws/credentials",
+            "-e",
+            f"AWS_PROFILE={profile}",
             image,
             "--log-failed-requests",
             "--log-signing-process",
