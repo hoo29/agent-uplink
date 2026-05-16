@@ -1,6 +1,7 @@
 # agent-uplink
 
-Run Claude Code in a hardened Docker container with all outbound traffic forced through mitmproxy.
+Run Claude Code in a hardened Docker container with very limited host disk access and with all outbound traffic
+directed through mitmproxy.
 
 The Claude container has no direct network access (`--network none`). A Unix socket bridges it to a mitmproxy
 container on the host, which inspects every request and applies an allow-list. Hosts, methods, and paths not
@@ -99,7 +100,3 @@ The root filesystem is read-only. Only the following paths are writable, and onl
 | `~/.claude/history.jsonl` | host bind (if present) | shell history |
 
 Everything else under `~/.claude/` (`settings.json`, `CLAUDE.md`, `commands/`, `skills/`) and the mitmproxy CA are mounted read-only.
-
-## TODO
-
-- don't write raw creds to disk for mitmproxy rules

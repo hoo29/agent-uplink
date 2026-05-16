@@ -1,12 +1,13 @@
 import json
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Any
 
 import keyring
 import yaml
+
+from .secret import LockedSecret
 
 LOGGER = logging.getLogger("agent-uplink")
 
@@ -109,9 +110,12 @@ def _validate_and_resolve_rule(rule: dict, idx: int) -> dict:
 def resolve(
     user_rules_path: Path | None,
     no_default_rules: bool,
-    out_path: Path,
-) -> None:
-    """Build resolved rules JSON at out_path with mode 0600."""
+) -> LockedSecret:
+    """Build resolved rules JSON in an anonymous, mlock'd memfd.
+
+    Returned LockedSecret must be close()d after the mitmproxy container is
+    stopped; until then its bind_source can be passed as a docker `-v` source.
+    """
     user_config: dict = {}
     if user_rules_path is not None:
         user_config = _load_yaml(user_rules_path)
@@ -132,9 +136,8 @@ def resolve(
         key=lambda r: len(r["host"]),
         reverse=True,
     )
-    payload = json.dumps({"rules": resolved}, indent=2)
+    payload = json.dumps({"rules": resolved}, indent=2).encode("utf-8")
 
-    fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(payload)
-    LOGGER.info(f"resolved {len(resolved)} rules -> {out_path}")
+    secret = LockedSecret("agent-uplink-rules", payload)
+    LOGGER.info(f"resolved {len(resolved)} rules into locked memfd")
+    return secret

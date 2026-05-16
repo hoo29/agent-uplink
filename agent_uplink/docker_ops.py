@@ -12,17 +12,21 @@ LOGGER = logging.getLogger("agent-uplink")
 
 ADDON_DIR = Path(__file__).resolve().parent / "mitm_addon"
 
-# Hardening flags shared by both `docker run` invocations.
-HARDENED_RUN_FLAGS: list[str] = [
+
+DOCKER_RUN_FLAGS: list[str] = [
     "--cap-drop=ALL",
-    "--cpus", "1",
-    "--ipc", "private",
+    "--cpus",
+    "1",
+    "--ipc",
+    "private",
     "--memory=0.5g",
-    "--pids-limit", "100",
+    "--pids-limit",
+    "100",
     "--read-only",
     "--rm",
     "--init",
-    "--security-opt", "no-new-privileges",
+    "--security-opt",
+    "no-new-privileges",
 ]
 
 
@@ -37,35 +41,57 @@ def ensure_mitm_certs(mitm_dir: Path, mitmproxy_image: str) -> bool:
         return False
 
     LOGGER.info("generating mitmproxy certs")
-    run_command([
-        "docker", "run",
-        "-u", f"{os.getuid()}:{os.getgid()}",
-        "--rm", "--init", "--read-only",
-        "-v", f"{mitm_dir}:/tmp/.mitmproxy",
-        "--entrypoint", "/bin/sh",
-        mitmproxy_image,
-        "-c", "exec mitmdump --set confdir=/tmp/.mitmproxy --no-server -r /dev/null",
-    ])
+    run_command(
+        [
+            "docker",
+            "run",
+            "-u",
+            f"{os.getuid()}:{os.getgid()}",
+            "--rm",
+            "--init",
+            "--read-only",
+            "-v",
+            f"{mitm_dir}:/tmp/.mitmproxy",
+            "--entrypoint",
+            "/bin/sh",
+            mitmproxy_image,
+            "-c",
+            "exec mitmdump --set confdir=/tmp/.mitmproxy --no-server -r /dev/null",
+        ]
+    )
     return True
 
 
 def check_claude_image_exists(claude_image: str) -> bool:
-    return run_command(
-        ["docker", "image", "inspect", claude_image], raise_error=False
-    ) != ""
+    return (
+        run_command(["docker", "image", "inspect", claude_image], raise_error=False)
+        != ""
+    )
 
 
-def build_claude_image(claude_image: str, username: str, mitm_dir: Path) -> None:
+def build_claude_image(
+    claude_image: str, username: str, mitm_dir: Path, force_rebuild: bool = False
+) -> None:
     LOGGER.info("(re)building claude container")
     container_dir = Path(__file__).resolve().parent / "claude_container"
     shutil.copytree(mitm_dir, container_dir / "certs", dirs_exist_ok=True)
+    build_args = [
+        "--build-arg",
+        f"USERNAME={username}",
+        "--build-arg",
+        f"USER_UID={os.getuid()}",
+        "--build-arg",
+        f"USER_GID={os.getgid()}",
+    ]
+    if force_rebuild:
+        build_args += ["--build-arg", f"CACHE_BUST={int(time.time())}"]
     run_command(
         [
-            "docker", "build",
-            "--build-arg", f"USERNAME={username}",
-            "--build-arg", f"USER_UID={os.getuid()}",
-            "--build-arg", f"USER_GID={os.getgid()}",
-            "-t", claude_image,
+            "docker",
+            "build",
+            *build_args,
+            "-t",
+            claude_image,
             str(container_dir),
         ],
         stdout=None,
@@ -90,9 +116,12 @@ def build_claude_mounts(
     uid, gid = os.getuid(), os.getgid()
 
     mounts: list[str] = [
-        "--tmpfs", "/tmp:rw,noexec,nosuid,size=200m",
-        "--tmpfs", f"{container_home / '.local' / 'share' / 'applications'}:rw,noexec,nosuid,size=200m",
-        "--tmpfs", f"{claude_dir}:rw,noexec,nosuid,size=200m,uid={uid},gid={gid}",
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,size=200m",
+        "--tmpfs",
+        f"{container_home / '.local' / 'share' / 'applications'}:rw,noexec,nosuid,size=200m",
+        "--tmpfs",
+        f"{claude_dir}:rw,noexec,nosuid,size=200m,uid={uid},gid={gid}",
     ]
 
     def vol(host: Path, container: str, mode: str | None = None) -> None:
@@ -137,34 +166,46 @@ def start_mitm_proxy(
     mitm_dir: Path,
     mitmproxy_image: str,
     port: int,
-    rules_path: Path,
+    rules_bind_source: str,
 ) -> None:
     LOGGER.info("starting socat on host")
-    socat_proc = run_command_background([
-        "socat",
-        f"UNIX-LISTEN:{session.socket_path},fork,mode=600",
-        f"TCP:127.0.0.1:{port}",
-    ])
+    socat_proc = run_command_background(
+        [
+            "socat",
+            f"UNIX-LISTEN:{session.socket_path},fork,mode=600",
+            f"TCP:127.0.0.1:{port}",
+        ]
+    )
     session.processes.append(socat_proc)
 
     container_name = f"agent-uplink-mitm-{session.id}"
     session.containers.append(container_name)
     LOGGER.info("starting mitmproxy container")
-    proc = run_command_background([
-        "docker", "run",
-        "--name", container_name,
-        *HARDENED_RUN_FLAGS,
-        "--entrypoint", "/bin/sh",
-        "-u", f"{os.getuid()}:{os.getgid()}",
-        "-v", f"{mitm_dir}:/tmp/.mitmproxy",
-        "-v", f"{ADDON_DIR}:/mnt/addon:ro",
-        "-v", f"{rules_path}:/mnt/rules.json:ro",
-        "-p", f"{port}:8080",
-        mitmproxy_image,
-        "-c",
-        "exec mitmdump --set confdir=/tmp/.mitmproxy "
-        "-s /mnt/addon/filter.py --set rules_file=/mnt/rules.json",
-    ])
+    proc = run_command_background(
+        [
+            "docker",
+            "run",
+            "--name",
+            container_name,
+            *DOCKER_RUN_FLAGS,
+            "--entrypoint",
+            "/bin/sh",
+            "-u",
+            f"{os.getuid()}:{os.getgid()}",
+            "-v",
+            f"{mitm_dir}:/tmp/.mitmproxy",
+            "-v",
+            f"{ADDON_DIR}:/mnt/addon:ro",
+            "-v",
+            f"{rules_bind_source}:/mnt/rules.json:ro",
+            "-p",
+            f"{port}:8080",
+            mitmproxy_image,
+            "-c",
+            "exec mitmdump --set confdir=/tmp/.mitmproxy "
+            "-s /mnt/addon/filter.py --set rules_file=/mnt/rules.json",
+        ]
+    )
     session.processes.append(proc)
     _ensure_container_running(container_name)
 
@@ -180,12 +221,16 @@ def start_claude_container(
     LOGGER.info("starting claude container")
     run_command(
         [
-            "docker", "run",
-            "--name", container_name,
-            *HARDENED_RUN_FLAGS,
-            "--network", "none",
+            "docker",
+            "run",
+            "--name",
+            container_name,
+            *DOCKER_RUN_FLAGS,
+            "--network",
+            "none",
             "-it",
-            "-e", f"WORKDIR={cwd}",
+            "-e",
+            f"WORKDIR={cwd}",
             *claude_mounts,
             claude_image,
         ],

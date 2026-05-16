@@ -90,7 +90,9 @@ def run(session: Session, args: argparse.Namespace) -> None:
         or args.force_rebuild
         or not check_claude_image_exists(args.claude_image)
     ):
-        build_claude_image(args.claude_image, username, mitm_dir)
+        build_claude_image(
+            args.claude_image, username, mitm_dir, args.force_rebuild
+        )
 
     aws_creds_path = write_aws_credentials(aws_profile_names, session.aws_dir)
     settings_path = write_claude_settings(claude_config, session.session_dir)
@@ -98,11 +100,13 @@ def run(session: Session, args: argparse.Namespace) -> None:
         username, settings_path, aws_creds_path, session.socket_path, mitm_dir, cwd
     )
 
-    rules_path = session.session_dir / "rules.json"
-    resolve_rules(args.rules, args.no_default_rules, rules_path)
+    rules_secret = resolve_rules(args.rules, args.no_default_rules)
+    session.secrets.append(rules_secret)
 
     port = get_free_port()
-    start_mitm_proxy(session, mitm_dir, args.mitmproxy_image, port, rules_path)
+    start_mitm_proxy(
+        session, mitm_dir, args.mitmproxy_image, port, rules_secret.bind_source
+    )
     start_claude_container(session, args.claude_image, cwd, claude_mounts)
 
 

@@ -36,7 +36,9 @@ RUN if [ "${USER_GID}" != "1000" ]; then groupadd --gid "${USER_GID}" "${USERNAM
      else \
        usermod --login "${USERNAME}" --move-home --home "/home/${USERNAME}" "$(getent passwd 1000 | cut -d: -f1)"; \
      fi
-RUN su - ${USERNAME} -c "curl -fsSL https://claude.ai/install.sh | bash"
+ARG CACHE_BUST=0
+RUN echo "cache-bust=${CACHE_BUST}" \
+  && su - ${USERNAME} -c "curl -fsSL https://claude.ai/install.sh | bash"
 
 COPY certs/ /mnt/certs/
 COPY certs/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/mitmproxy-ca-cert.crt

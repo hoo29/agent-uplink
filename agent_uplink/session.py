@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .process import run_command
+from .secret import LockedSecret
 
 LOGGER = logging.getLogger("agent-uplink")
 
@@ -20,6 +21,7 @@ class Session:
     aws_dir: Path
     containers: list[str] = field(default_factory=list)
     processes: list[subprocess.Popen] = field(default_factory=list)
+    secrets: list[LockedSecret] = field(default_factory=list)
     _cleaned_up: bool = field(default=False, init=False, repr=False)
 
     @classmethod
@@ -53,6 +55,11 @@ class Session:
                 LOGGER.warning(
                     f"process {p.pid} didn't respond to SIGTERM, SIGKILL'ing")
                 p.kill()
+        # Containers and host processes that bind-mounted any secret are gone,
+        # so the only refs left are ours — close() now zeros pages before free.
+        for s in self.secrets:
+            s.close()
+        self.secrets.clear()
         shutil.rmtree(self.session_dir, ignore_errors=True)
 
 
