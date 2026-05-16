@@ -124,7 +124,6 @@ These host paths are bind-mounted writable, because Claude state needs to persis
 | `<cwd>` | your project working directory |
 | `~/.claude.json` | Claude global config |
 | `~/.claude/projects/<project-id>/` | per-project history and state |
-| `~/.claude/.credentials.json` | Claude credentials (if present) |
 | `~/.claude/history.jsonl` | shell history (if present) |
 
 Everything else under `~/.claude/` (`settings.json`, `CLAUDE.md`, `commands/`, `skills/`) and the mitmproxy CA are mounted read-only.
