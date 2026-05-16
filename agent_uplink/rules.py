@@ -131,8 +131,12 @@ def resolve(
     user_rules_path: Path | None,
     no_default_rules: bool,
     auth_mode: str,
+    aws_sigv4_routes: dict[str, dict[str, Any]] | None = None,
 ) -> LockedSecret:
     """Build resolved rules JSON in an anonymous, mlock'd memfd.
+
+    `aws_sigv4_routes` maps dummy AKIA → {upstream_host, upstream_port} so the
+    addon can route AWS requests to the matching aws-sigv4-proxy sidecar.
 
     Returned LockedSecret must be close()d after the mitmproxy container is
     stopped; until then its bind_source can be passed as a docker `-v` source.
@@ -158,8 +162,15 @@ def resolve(
         key=lambda r: len(r["host"]),
         reverse=True,
     )
-    payload = json.dumps({"rules": resolved}, indent=2).encode("utf-8")
+    out: dict[str, Any] = {"rules": resolved}
+    if aws_sigv4_routes:
+        out["aws_sigv4_routes"] = aws_sigv4_routes
+    payload = json.dumps(out, indent=2).encode("utf-8")
 
     secret = LockedSecret("agent-uplink-rules", payload)
-    LOGGER.info(f"resolved {len(resolved)} rules into locked memfd")
+    LOGGER.info(
+        f"resolved {len(resolved)} rules"
+        + (f", {len(aws_sigv4_routes)} sigv4 routes" if aws_sigv4_routes else "")
+        + " into locked memfd"
+    )
     return secret

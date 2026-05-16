@@ -164,12 +164,22 @@ def _ensure_container_running(container_name: str) -> None:
     LOGGER.debug(f"container {container_name} is running")
 
 
+def create_network(name: str) -> None:
+    LOGGER.info(f"creating docker network {name}")
+    run_command(["docker", "network", "create", name])
+
+
+def remove_network(name: str) -> None:
+    run_command(["docker", "network", "rm", name], raise_error=False)
+
+
 def start_mitm_proxy(
     session: Session,
     mitm_dir: Path,
     mitmproxy_image: str,
     port: int,
     rules_bind_source: str,
+    network: str | None = None,
 ) -> None:
     LOGGER.info("starting socat on host")
     socat_proc = run_command_background(
@@ -184,6 +194,7 @@ def start_mitm_proxy(
     container_name = f"agent-uplink-mitm-{session.id}"
     session.containers.append(container_name)
     LOGGER.info("starting mitmproxy container")
+    network_args = ["--network", network] if network else []
     proc = run_command_background(
         [
             "docker",
@@ -192,6 +203,7 @@ def start_mitm_proxy(
             container_name,
             *DOCKER_RUN_FLAGS,
             "--memory=0.5g",
+            *network_args,
             "--entrypoint",
             "/bin/sh",
             "-u",
@@ -208,6 +220,39 @@ def start_mitm_proxy(
             "-c",
             "exec mitmdump --set confdir=/tmp/.mitmproxy "
             "-s /mnt/addon/filter.py --set rules_file=/mnt/rules.json",
+        ]
+    )
+    session.processes.append(proc)
+    _ensure_container_running(container_name)
+
+
+def start_sigv4_proxy(
+    session: Session,
+    image: str,
+    container_name: str,
+    network: str,
+    aws_env: dict[str, str],
+) -> None:
+    session.containers.append(container_name)
+    LOGGER.info(f"starting sigv4-proxy sidecar {container_name}")
+    env_args: list[str] = []
+    for k, v in aws_env.items():
+        env_args.extend(["-e", f"{k}={v}"])
+    proc = run_command_background(
+        [
+            "docker",
+            "run",
+            "--name",
+            container_name,
+            *DOCKER_RUN_FLAGS,
+            "--memory=128m",
+            "--network",
+            network,
+            *env_args,
+            image,
+            "--log-failed-requests",
+            "--log-signing-process",
+            "-v",
         ]
     )
     session.processes.append(proc)

@@ -2,6 +2,8 @@
 
 Run Claude Code in a hardened container with no direct network access. All outbound traffic is routed through a mitmproxy sidecar that enforces an allow-list and can inject credentials from your OS keyring, so secrets never enter the Claude container.
 
+AWS requests get the same treatment via SigV4 re-signing: the container holds only dummy AWS credentials, and mitmproxy reroutes signed AWS requests to an `aws-sigv4-proxy` sidecar (one per profile) that re-signs with the real keys kept on the host. See [AWS profiles](#aws-profiles).
+
 **Linux only.** The design depends on gVisor (`runsc`), Linux paths (`/home/<user>/...`), and Unix-socket bind-mount semantics that Docker Desktop on macOS/Windows does not provide. WSL2 works.
 
 ## Install
@@ -25,7 +27,7 @@ agent-uplink --bedrock --aws-profiles profile1 profile2        # also inject AWS
 agent-uplink --anthropic --force-rebuild                       # rebuild the Claude image
 ```
 
-Other flags: `--claude-image`, `--mitmproxy-image`, `--runtime` (see [Runtime](#runtime)).
+Other flags: `--claude-image`, `--mitmproxy-image`, `--sigv4-proxy-image`, `--runtime` (see [Runtime](#runtime)).
 
 State lives under `~/.agent_uplink/`; each run gets a session directory that is cleaned up on exit.
 
@@ -88,6 +90,20 @@ keyring set my-service my-user
 On Linux/WSL2 this needs Secret Service (e.g. `gnome-keyring`) running, or the encrypted file backend from `keyrings.alt`.
 
 See `examples/rules/atlassian.yaml` and `examples/rules/gitlab.yaml` for worked configurations.
+
+## AWS profiles
+
+`--aws-profiles foo bar` reads the named profiles from your host AWS config (`aws configure export-credentials`, with an `aws sso login` fallback). For each profile:
+
+- The container's `~/.aws/credentials` is populated with **dummy** values: a deterministic dummy access key per profile (`AKIA` + first 16 hex chars of `sha256(profile)`) and a fixed dummy secret. Real keys never enter the Claude container.
+- A small `aws-sigv4-proxy` sidecar is started on a per-session docker network with the real AWS env vars passed via `docker run -e ...`.
+- The mitmproxy addon detects `*.amazonaws.com` requests signed with `AWS4-HMAC-SHA256`, extracts the dummy AKIA from the `Credential=` field, strips the signature headers, and reroutes the request over plain HTTP to the matching sidecar — preserving the original `Host` so the sidecar signs for the right service/region before forwarding to AWS.
+
+The Claude container stays on `--network none`; sidecars live on a docker network it can't reach. STS credentials are exported once at startup, so long sessions may need a restart when they expire.
+
+Requests to `*.amazonaws.com` with no matching SigV4 route return `403`. Unsigned requests (e.g. anonymous `GET` to a public S3 bucket) fall through to the normal allow-list.
+
+`--bedrock` mode is a separate path: it injects a bearer token at the mitm layer (no AWS signing needed), so `--bedrock` doesn't require `--aws-profiles` unless you also want non-Bedrock AWS access.
 
 ## Security posture
 

@@ -22,6 +22,7 @@ class Session:
     containers: list[str] = field(default_factory=list)
     processes: list[subprocess.Popen] = field(default_factory=list)
     secrets: list[LockedSecret] = field(default_factory=list)
+    network: str | None = None
     _cleaned_up: bool = field(default=False, init=False, repr=False)
 
     @classmethod
@@ -60,6 +61,11 @@ class Session:
         for s in self.secrets:
             s.close()
         self.secrets.clear()
+        if self.network is not None:
+            run_command(
+                ["docker", "network", "rm", self.network], raise_error=False
+            )
+            self.network = None
         shutil.rmtree(self.session_dir, ignore_errors=True)
 
 
