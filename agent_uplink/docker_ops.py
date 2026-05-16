@@ -19,9 +19,8 @@ DOCKER_RUN_FLAGS: list[str] = [
     "1",
     "--ipc",
     "private",
-    "--memory=0.5g",
     "--pids-limit",
-    "100",
+    "300",
     "--read-only",
     "--rm",
     "--init",
@@ -106,6 +105,7 @@ def build_claude_mounts(
     socket_path: Path,
     mitm_dir: Path,
     cwd: Path,
+    debug_host_dir: Path | None = None,
 ) -> list[str]:
     project_id = str(Path.cwd()).replace("/", "-")
     host_project_dir = HOST_CLAUDE_DIR / "projects" / project_id
@@ -139,13 +139,16 @@ def build_claude_mounts(
         host_path = HOST_CLAUDE_DIR / name
         if host_path.exists():
             vol(host_path, f"{claude_dir}/{name}", "ro")
-    for name in [".credentials.json", "history.jsonl"]:
+    for name in ["history.jsonl"]:
         host_path = HOST_CLAUDE_DIR / name
         if host_path.exists():
             vol(host_path, f"{claude_dir}/{name}", "rw")
 
     if aws_creds_path is not None:
         vol(aws_creds_path, str(container_home / ".aws"), "ro")
+
+    if debug_host_dir is not None:
+        vol(debug_host_dir, f"{claude_dir}/debug", "rw")
 
     return mounts
 
@@ -188,6 +191,7 @@ def start_mitm_proxy(
             "--name",
             container_name,
             *DOCKER_RUN_FLAGS,
+            "--memory=0.5g",
             "--entrypoint",
             "/bin/sh",
             "-u",
@@ -215,10 +219,13 @@ def start_claude_container(
     claude_image: str,
     cwd: Path,
     claude_mounts: list[str],
+    runtime: str,
+    debug: bool = False,
 ) -> None:
     container_name = f"agent-uplink-claude-{session.id}"
     session.containers.append(container_name)
     LOGGER.info("starting claude container")
+    debug_env = ["-e", "AGENT_UPLINK_DEBUG=1"] if debug else []
     run_command(
         [
             "docker",
@@ -226,11 +233,14 @@ def start_claude_container(
             "--name",
             container_name,
             *DOCKER_RUN_FLAGS,
+            "--memory=1g",
+            f"--runtime={runtime}",
             "--network",
             "none",
             "-it",
             "-e",
             f"WORKDIR={cwd}",
+            *debug_env,
             *claude_mounts,
             claude_image,
         ],

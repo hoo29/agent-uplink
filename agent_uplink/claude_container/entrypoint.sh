@@ -7,4 +7,8 @@ fi
 
 socat TCP-LISTEN:8090,fork,reuseaddr UNIX-CONNECT:/mnt/socket/uplink.sock >/dev/null 2>&1 &
 cd "$WORKDIR"
-exec claude -d --dangerously-skip-permissions
+if [[ -n "$AGENT_UPLINK_DEBUG" ]]; then
+  exec claude -d --dangerously-skip-permissions
+else
+  exec claude --dangerously-skip-permissions
+fi

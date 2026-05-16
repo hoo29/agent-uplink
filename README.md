@@ -1,19 +1,8 @@
 # agent-uplink
 
-Run Claude Code in a hardened Docker container with very limited host disk access and with all outbound traffic
-directed through mitmproxy.
+Run Claude Code in a hardened container with no direct network access. All outbound traffic is routed through a mitmproxy sidecar that enforces an allow-list and can inject credentials from your OS keyring, so secrets never enter the Claude container.
 
-The Claude container has no direct network access (`--network none`). A Unix socket bridges it to a mitmproxy
-container on the host, which inspects every request and applies an allow-list. Hosts, methods, and paths not
-on the list return `403`.
-Credentials can be injected from your OS keyring for secrets apart from AWS so they never enter the Claude container.
-For AWS, temporary credentials are generated on start for the profiles specified.
-
-## Requirements
-
-- `docker`, `socat`, and Python 3.10+ on `PATH`
-- `aws` CLI only if you use `--aws-profiles`
-- Must be run from inside your home directory (`/home/<user>/...`)
+**Linux only.** The design depends on gVisor (`runsc`), Linux paths (`/home/<user>/...`), and Unix-socket bind-mount semantics that Docker Desktop on macOS/Windows does not provide. WSL2 works.
 
 ## Install
 
@@ -21,39 +10,65 @@ For AWS, temporary credentials are generated on start for the profiles specified
 pip install -e .
 ```
 
+Requires `docker`, `socat`, and Python 3.10+ on `PATH`. `aws` CLI is needed only for `--aws-profiles`. Run from inside your home directory.
+
 ## Usage
 
+One of `--anthropic` or `--bedrock` is required — it picks the provider env var injected into the container and the auth rule injected on top of the defaults.
+
 ```bash
-# Run with defaults (allows GET and OPTIONS to any host; blocks everything else)
-agent-uplink
-
-# Use additional rules from a YAML file
-agent-uplink --rules examples/rules/atlassian.yaml
-
-# Use only your rules, no defaults
-agent-uplink --rules my.yaml --no-default-rules
-
-# Pass AWS credentials from named profiles
-agent-uplink --aws-profiles profile1 profile2
-
-# Rebuild the Claude image
-agent-uplink --force-rebuild
+agent-uplink --anthropic                                       # Anthropic API
+agent-uplink --bedrock                                         # AWS Bedrock (bearer token)
+agent-uplink --anthropic --rules examples/rules/atlassian.yaml # add rules on top of defaults
+agent-uplink --anthropic --rules my.yaml --no-default-rules    # use only your rules (you must supply auth)
+agent-uplink --bedrock --aws-profiles profile1 profile2        # also inject AWS credentials
+agent-uplink --anthropic --force-rebuild                       # rebuild the Claude image
 ```
 
-Other flags:
+Other flags: `--claude-image`, `--mitmproxy-image`, `--runtime` (see [Runtime](#runtime)).
 
-- `--claude-image <name>` - override the Claude image name
-- `--mitmproxy-image <name>` - override the mitmproxy image
+State lives under `~/.agent_uplink/`; each run gets a session directory that is cleaned up on exit.
 
-State is kept under `~/.agent_uplink/`. Each run gets its own session directory, cleaned up on exit.
+### Required keyring secrets per mode
+
+The mode's auth rule injects a bearer token from the host keyring. Populate before first run:
+
+| Mode | Keyring entry | Populate with |
+| --- | --- | --- |
+| `--anthropic` | service `anthropic`, user `key` | `jq -r '.claudeAiOauth.accessToken // .apiKey' ~/.claude/.credentials.json \| keyring set anthropic key` |
+| `--bedrock` | service `bedrock`, user `key` | `keyring set bedrock key` (paste the value of `AWS_BEARER_TOKEN_BEDROCK`) |
+
+Anthropic OAuth access tokens from `claude login` expire (hours) and the container has no way to refresh them; re-run the extract command when they expire, or use a long-lived API key.
+
+`--no-default-rules` skips the mode's auth rule too — you must supply your own in `--rules`.
+
+## Runtime
+
+The Claude container defaults to `--runtime=runsc` ([gVisor](https://gvisor.dev/)) for a stronger isolation boundary than `runc`. Override with `--runtime runc` if gVisor isn't installed.
+
+gVisor must be registered in `/etc/docker/daemon.json` with `--host-uds=all` so the container can reach the host-side Unix socket that bridges to mitmproxy:
+
+```json
+{
+    "runtimes": {
+        "runsc": {
+            "path": "/usr/local/bin/runsc",
+            "runtimeArgs": [
+                "--network=host",
+                "--host-uds=all"
+            ]
+        }
+    }
+}
+```
+
+Restart Docker after editing (`sudo systemctl restart docker`).
 
 ## Rules
 
-A rule file is YAML:
+Rules are YAML, evaluated in order; first match wins. Your rules are appended to the bundled defaults unless `--no-default-rules` is passed.
 
 ```yaml
-replace_defaults: false   # optional; same as --no-default-rules
-
 rules:
   - name: my-rule
     host: '<regex>'             # required, matched with re.fullmatch
@@ -64,39 +79,36 @@ rules:
         Authorization: 'Bearer {{keyring:my-service:my-user}}'
 ```
 
-Rules are evaluated in order; the first match wins. By default, the rules in your file are appended to the bundled defaults.
-
-`{{keyring:SERVICE:USERNAME}}` placeholders are resolved on the host via the OS keyring before any container starts. A failed lookup aborts startup.
-
-See `examples/rules/atlassian.yaml` and `examples/rules/gitlab.yaml` for full examples.
-
-### Storing credentials
+`{{keyring:SERVICE:USERNAME}}` placeholders are resolved on the host before any container starts; a failed lookup aborts startup. Store secrets with:
 
 ```bash
-keyring set my-service my-user   # prompts for the secret
-keyring get my-service my-user   # verify
+keyring set my-service my-user
 ```
 
-- macOS uses Keychain; Windows uses Credential Locker. Both work out of the box.
-- Linux/WSL2 needs Secret Service (e.g. `gnome-keyring`) running, or the encrypted file backend from `keyrings.alt`.
+On Linux/WSL2 this needs Secret Service (e.g. `gnome-keyring`) running, or the encrypted file backend from `keyrings.alt`.
 
-## Container security posture
+See `examples/rules/atlassian.yaml` and `examples/rules/gitlab.yaml` for worked configurations.
 
-Designed to contain rogue AI commands such as unintended shell calls, API requests, or secrets leaked via prompt injection. It is not a malware sandbox;
-containers are not a security boundary and it won't stop code that's actively trying to escape.
+## Security posture
 
-- `--network none`, `--cap-drop=ALL`, `--read-only`, `--security-opt no-new-privileges`
-- `--pids-limit 100`, `--memory 0.5g`, `--cpus 1`
-- mitmproxy CA is baked into the image at build time so TLS interception is transparent
+Designed to contain rogue AI behaviour but is not a malware sandbox even with gvisor.
 
-The root filesystem is read-only. Only the following paths are writable, and only those needed for Claude state to persist across sessions are bind-mounted from the host:
+The root filesystem is read-only. A handful of paths are writable as ephemeral `tmpfs` (wiped on container exit, `noexec`, `nosuid`):
 
-| Path in container | Backing | Purpose |
-| --- | --- | --- |
-| `<cwd>` | host bind | your project working directory |
-| `~/.claude.json` | host bind | Claude global config |
-| `~/.claude/projects/<project-id>/` | host bind | per-project history and state |
-| `~/.claude/.credentials.json` | host bind (if present) | Claude credentials |
-| `~/.claude/history.jsonl` | host bind (if present) | shell history |
+| Path in container | Size |
+| --- | --- |
+| `/tmp` | 200m |
+| `~/.claude/` | 200m |
+| `~/.local/share/applications/` | 200m |
+
+These host paths are bind-mounted writable, because Claude state needs to persist across sessions:
+
+| Path in container | Purpose |
+| --- | --- |
+| `<cwd>` | your project working directory |
+| `~/.claude.json` | Claude global config |
+| `~/.claude/projects/<project-id>/` | per-project history and state |
+| `~/.claude/.credentials.json` | Claude credentials (if present) |
+| `~/.claude/history.jsonl` | shell history (if present) |
 
 Everything else under `~/.claude/` (`settings.json`, `CLAUDE.md`, `commands/`, `skills/`) and the mitmproxy CA are mounted read-only.

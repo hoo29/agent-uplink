@@ -9,6 +9,14 @@ LOGGER = logging.getLogger("agent-uplink")
 
 HOST_CLAUDE_DIR = Path.home() / ".claude"
 
+# Placeholder values injected into the container's settings.json so the Claude
+# CLI takes the chosen auth path. The real credentials are added by mitmproxy
+# header injection (see rules.py) and never enter the container.
+AUTH_MODE_ENV: dict[str, dict[str, str]] = {
+    "anthropic": {"ANTHROPIC_AUTH_TOKEN": "placeholder"},
+    "bedrock": {"AWS_BEARER_TOKEN_BEDROCK": "placeholder"},
+}
+
 
 def load_claude_config() -> dict:
     return json.loads((HOST_CLAUDE_DIR / "settings.json").read_text(encoding="utf8"))
@@ -18,11 +26,14 @@ def get_bedrock_aws_profile_name(claude_config: dict) -> str | None:
     return claude_config.get("env", {}).get("AWS_PROFILE")
 
 
-def write_claude_settings(claude_config: dict, session_dir: Path) -> Path:
+def write_claude_settings(
+    claude_config: dict, session_dir: Path, auth_mode: str
+) -> Path:
     filtered = dict(claude_config)
-    for key in ["awsAuthRefresh", "sandbox", "permissions"]:
+    for key in ["awsAuthRefresh", "sandbox"]:
         filtered.pop(key, None)
     filtered["skipDangerousModePermissionPrompt"] = True
+    filtered.setdefault("env", {}).update(AUTH_MODE_ENV[auth_mode])
     settings_path = session_dir / "settings.json"
     settings_path.write_text(json.dumps(filtered, indent=2))
     return settings_path
@@ -30,9 +41,13 @@ def write_claude_settings(claude_config: dict, session_dir: Path) -> Path:
 
 def _export_aws_profile(profile_name: str) -> list[str]:
     cmd = [
-        "aws", "configure", "export-credentials",
-        "--format", "env-no-export",
-        "--profile", profile_name,
+        "aws",
+        "configure",
+        "export-credentials",
+        "--format",
+        "env-no-export",
+        "--profile",
+        profile_name,
     ]
     try:
         creds_raw = run_command(cmd)
@@ -50,9 +65,7 @@ def _export_aws_profile(profile_name: str) -> list[str]:
     return creds
 
 
-def write_aws_credentials(
-    aws_profile_names: list[str], aws_dir: Path
-) -> Path | None:
+def write_aws_credentials(aws_profile_names: list[str], aws_dir: Path) -> Path | None:
     if not aws_profile_names:
         return None
     LOGGER.info("generating temp aws credentials")

@@ -13,6 +13,26 @@ LOGGER = logging.getLogger("agent-uplink")
 
 DEFAULT_RULES_PATH = Path(__file__).resolve().parent / "default_rules.yaml"
 
+# Per-mode auth rule injected on top of the bundled defaults. Keep the keyring
+# entry name (the value after `keyring:`) in sync with the docs/examples that
+# tell users how to populate it.
+MODE_AUTH_RULES: dict[str, dict[str, Any]] = {
+    "anthropic": {
+        "name": "anthropic-auth",
+        "host": r"api\.anthropic\.com",
+        "inject": {
+            "headers": {"Authorization": "Bearer {{keyring:anthropic:key}}"},
+        },
+    },
+    "bedrock": {
+        "name": "bedrock-auth",
+        "host": r"bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com",
+        "inject": {
+            "headers": {"Authorization": "Bearer {{keyring:bedrock:key}}"},
+        },
+    },
+}
+
 VALID_METHODS = {
     "GET",
     "POST",
@@ -110,6 +130,7 @@ def _validate_and_resolve_rule(rule: dict, idx: int) -> dict:
 def resolve(
     user_rules_path: Path | None,
     no_default_rules: bool,
+    auth_mode: str,
 ) -> LockedSecret:
     """Build resolved rules JSON in an anonymous, mlock'd memfd.
 
@@ -126,6 +147,7 @@ def resolve(
     if use_defaults:
         defaults_config = _load_yaml(DEFAULT_RULES_PATH)
         rules.extend(defaults_config.get("rules") or [])
+        rules.append(MODE_AUTH_RULES[auth_mode])
     rules.extend(user_config.get("rules") or [])
 
     if not rules:
