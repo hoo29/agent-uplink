@@ -6,6 +6,43 @@ AWS requests get the same treatment via SigV4 re-signing: the container holds on
 
 **Linux only.** The design depends on gVisor (`runsc`), Linux paths (`/home/<user>/...`), and Unix-socket bind-mount semantics that Docker Desktop on macOS/Windows does not provide. WSL2 works.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph host["host"]
+        keyring[("OS keyring")]
+        awscreds[("AWS creds<br/>(mlock'd /dev/shm)")]
+        socat["socat<br/>(unix → tcp)"]
+    end
+
+    subgraph claude_ctr["Claude container (--network none, runsc)"]
+        claude["claude CLI"]
+        csocat["socat<br/>(tcp → unix)"]
+        claude -->|HTTPS via dummy proxy| csocat
+    end
+
+    subgraph dnet["per-session docker network"]
+        mitm["mitmproxy<br/>+ filter addon<br/>(allow-list, header injection,<br/>SigV4 rerouting)"]
+        sidecar1["aws-sigv4-proxy<br/>(profile 1)"]
+        sidecarN["aws-sigv4-proxy<br/>(profile N)"]
+    end
+
+    internet(("Internet"))
+    aws(("AWS APIs"))
+
+    csocat -->|unix socket bind-mount| socat
+    socat --> mitm
+    keyring -.->|resolved at startup| mitm
+    awscreds -.->|bind-mount ro| sidecar1
+    awscreds -.->|bind-mount ro| sidecarN
+    mitm -->|allowed + injected| internet
+    mitm -->|SigV4 reroute by dummy AKIA| sidecar1
+    mitm -->|SigV4 reroute by dummy AKIA| sidecarN
+    sidecar1 -->|re-signed| aws
+    sidecarN -->|re-signed| aws
+```
+
 ## Install
 
 ```bash
