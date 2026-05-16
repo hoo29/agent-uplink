@@ -6,19 +6,24 @@ from functools import partial
 from pathlib import Path
 
 from .config import (
+    AUTH_MODE_ENV,
+    export_aws_profile_env,
     get_bedrock_aws_profile_name,
     load_claude_config,
-    write_aws_credentials,
     write_claude_settings,
+    write_dummy_aws_credentials,
 )
 from .docker_ops import (
+    CLAUDE_IMAGE_MAX_AGE_SECONDS,
     build_claude_image,
     build_claude_mounts,
-    check_claude_image_exists,
+    create_network,
     ensure_mitm_certs,
+    get_claude_image_age_seconds,
     get_container_home,
     start_claude_container,
     start_mitm_proxy,
+    start_sigv4_proxy,
 )
 from .process import get_free_port
 from .rules import resolve as resolve_rules
@@ -27,6 +32,8 @@ from .session import Session, handle_signal
 LOGGER = logging.getLogger("agent-uplink")
 
 STATE_DIR = Path.home() / ".agent_uplink"
+
+DEFAULT_SIGV4_PROXY_IMAGE = "public.ecr.aws/aws-observability/aws-sigv4-proxy:latest"
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,13 +44,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-a", "--aws-profiles",
         type=str, nargs="*", action="extend", default=[],
-        help="AWS profiles to provide credentials for",
+        help="AWS profiles to provide credentials for (one sigv4-proxy sidecar per profile)",
     )
     parser.add_argument(
         "-m", "--mitmproxy-image", type=str, default="mitmproxy/mitmproxy",
     )
     parser.add_argument(
         "-c", "--claude-image", type=str, default="agent-uplink-claude",
+    )
+    parser.add_argument(
+        "--sigv4-proxy-image", type=str, default=DEFAULT_SIGV4_PROXY_IMAGE,
     )
     parser.add_argument(
         "-f", "--force-rebuild",
@@ -58,6 +68,23 @@ def parse_args() -> argparse.Namespace:
         "--no-default-rules", action="store_true",
         help="Don't merge built-in defaults (allow GET/OPTIONS everywhere)",
     )
+    parser.add_argument(
+        "--runtime", type=str, default="runsc",
+        help="Docker runtime for the Claude container (e.g. runsc, runc)",
+    )
+    parser.add_argument(
+        "-d", "--debug",
+        action=argparse.BooleanOptionalAction, default=False,
+        help="Run claude with -d and mount ~/.claude/debug from the container "
+             "to /tmp/agent-uplink-debug/<session-id> on the host",
+    )
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    for mode in AUTH_MODE_ENV:
+        mode_group.add_argument(
+            f"--{mode}", dest="auth_mode", action="store_const", const=mode,
+            help=f"Configure container for {mode} auth "
+                 f"(injects placeholder {', '.join(AUTH_MODE_ENV[mode])})",
+        )
     return parser.parse_args()
 
 
@@ -68,6 +95,13 @@ def validate_cwd(username: str, cwd: Path) -> None:
     if cwd != home and home not in cwd.parents:
         raise ValueError(
             f"agent-uplink must be run from within {home}, got: {cwd}")
+
+
+def _sidecar_name(session_id: str, profile: str) -> str:
+    # Container names: lowercase, [a-zA-Z0-9_.-]. AWS profile names allow more,
+    # so sanitize defensively.
+    safe = "".join(c if c.isalnum() or c in "._-" else "-" for c in profile)
+    return f"agent-uplink-sigv4-{session_id}-{safe}"
 
 
 def run(session: Session, args: argparse.Namespace) -> None:
@@ -83,27 +117,76 @@ def run(session: Session, args: argparse.Namespace) -> None:
     bedrock_profile = get_bedrock_aws_profile_name(claude_config)
     if bedrock_profile is not None:
         aws_profile_names.append(bedrock_profile)
+    # dedupe, preserve order
+    aws_profile_names = list(dict.fromkeys(aws_profile_names))
 
     certs_generated = ensure_mitm_certs(mitm_dir, args.mitmproxy_image)
+    image_age = get_claude_image_age_seconds(args.claude_image)
     if (
         certs_generated
         or args.force_rebuild
-        or not check_claude_image_exists(args.claude_image)
+        or image_age is None
+        or image_age > CLAUDE_IMAGE_MAX_AGE_SECONDS
     ):
-        build_claude_image(args.claude_image, username, mitm_dir)
+        build_claude_image(
+            args.claude_image, username, mitm_dir, args.force_rebuild
+        )
 
-    aws_creds_path = write_aws_credentials(aws_profile_names, session.aws_dir)
-    settings_path = write_claude_settings(claude_config, session.session_dir)
-    claude_mounts = build_claude_mounts(
-        username, settings_path, aws_creds_path, session.socket_path, mitm_dir, cwd
+    # Real AWS creds — only ever passed to sidecars on the host network.
+    real_aws_env = {p: export_aws_profile_env(p) for p in aws_profile_names}
+    # Fake AWS creds — written to the container's ~/.aws/credentials. The
+    # dummy AKIA per profile is the key the mitm addon uses to pick the
+    # right sigv4-proxy sidecar.
+    aws_creds_path, profile_to_akia = write_dummy_aws_credentials(
+        aws_profile_names, session.aws_dir
     )
 
-    rules_path = session.session_dir / "rules.json"
-    resolve_rules(args.rules, args.no_default_rules, rules_path)
+    settings_path = write_claude_settings(
+        claude_config, session.session_dir, args.auth_mode
+    )
+    debug_host_dir: Path | None = None
+    if args.debug:
+        debug_host_dir = Path("/tmp/agent-uplink-debug") / session.id
+        debug_host_dir.mkdir(parents=True, exist_ok=True)
+        LOGGER.info(f"debug mode: claude logs → {debug_host_dir}")
+
+    claude_mounts = build_claude_mounts(
+        username, settings_path, aws_creds_path, session.socket_path,
+        mitm_dir, cwd, debug_host_dir,
+    )
+
+    sigv4_routes: dict[str, dict] = {}
+    sidecars: list[tuple[str, str]] = []  # (profile, container_name)
+    for profile, akia in profile_to_akia.items():
+        name = _sidecar_name(session.id, profile)
+        sigv4_routes[akia] = {"upstream_host": name, "upstream_port": 8080}
+        sidecars.append((profile, name))
+
+    rules_secret = resolve_rules(
+        args.rules, args.no_default_rules, args.auth_mode, sigv4_routes
+    )
+    session.secrets.append(rules_secret)
+
+    network_name: str | None = None
+    if sidecars:
+        network_name = f"agent-uplink-net-{session.id}"
+        create_network(network_name)
+        session.network = network_name
 
     port = get_free_port()
-    start_mitm_proxy(session, mitm_dir, args.mitmproxy_image, port, rules_path)
-    start_claude_container(session, args.claude_image, cwd, claude_mounts)
+    start_mitm_proxy(
+        session, mitm_dir, args.mitmproxy_image, port,
+        rules_secret.bind_source, network_name,
+    )
+    if network_name is not None:
+        for profile, name in sidecars:
+            start_sigv4_proxy(
+                session, args.sigv4_proxy_image, name, network_name,
+                real_aws_env[profile],
+            )
+    start_claude_container(
+        session, args.claude_image, cwd, claude_mounts, args.runtime, args.debug,
+    )
 
 
 def main() -> None:

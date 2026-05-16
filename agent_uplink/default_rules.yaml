@@ -1,8 +1,20 @@
-rules:
-  - name: default-readonly
-    host: ".*"
-    methods: [GET, OPTIONS, HEAD]
+# The provider auth rule (api.anthropic.com / bedrock-runtime.<region>.amazonaws.com)
+# is injected at runtime based on --anthropic / --bedrock; see MODE_AUTH_RULES
+# in rules.py.
 
-  - name: aws-cli
-    host: 'sts\.(?:[^.]+\.)?amazonaws\.com'
-    methods: [POST]
+rules:
+  - name: claude-logs
+    host: .*\.datadoghq\.com
+    methods: ["POST"]
+    paths:
+      - /api/v2/logs
+
+  - name: claude-changelog
+    host: raw\.githubusercontent\.com
+    methods: ["GET"]
+    paths:
+      - /anthropics/claude-code/refs/heads/main/CHANGELOG\.md
+
+  - name: claude-downloads
+    host: downloads\.claude\.ai
+    methods: ["GET"]
