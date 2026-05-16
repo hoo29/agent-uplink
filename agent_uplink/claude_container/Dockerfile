@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   less \
   net-tools \
   procps \
+  python3 \
   socat \
   unzip \
   util-linux \

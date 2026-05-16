@@ -117,6 +117,7 @@ def build_claude_mounts(
     mitm_dir: Path,
     cwd: Path,
     debug_host_dir: Path | None = None,
+    oauth_creds_path: Path | None = None,
 ) -> list[str]:
     project_id = str(Path.cwd()).replace("/", "-")
     host_project_dir = HOST_CLAUDE_DIR / "projects" / project_id
@@ -157,6 +158,9 @@ def build_claude_mounts(
 
     if aws_creds_path is not None:
         vol(aws_creds_path, str(container_home / ".aws"), "ro")
+
+    if oauth_creds_path is not None:
+        vol(oauth_creds_path, f"{claude_dir}/.credentials.json", "ro")
 
     if debug_host_dir is not None:
         vol(debug_host_dir, f"{claude_dir}/debug", "rw")

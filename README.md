@@ -68,18 +68,16 @@ Other flags: `--claude-image`, `--mitmproxy-image`, `--sigv4-proxy-image`, `--ru
 
 State lives under `~/.agent_uplink/`; each run gets a session directory that is cleaned up on exit.
 
-### Required keyring secrets per mode
+### Required secrets per mode
 
-The mode's auth rule injects a bearer token from the host keyring. Populate before first run:
-
-| Mode | Keyring entry | Populate with |
+| Mode | Source | Populate with |
 | --- | --- | --- |
-| `--anthropic` | service `anthropic`, user `key` | `jq -r '.claudeAiOauth.accessToken // .apiKey' ~/.claude/.credentials.json \| keyring set anthropic key` |
-| `--bedrock` | service `bedrock`, user `key` | `keyring set bedrock key` (paste the value of `AWS_BEARER_TOKEN_BEDROCK`) |
+| `--anthropic` | `~/.claude/.credentials.json` | `claude login` (the file's OAuth token is read on the host; the container only sees a fake placeholder) |
+| `--bedrock` | service `bedrock`, user `key` in the host keyring | `keyring set bedrock key` (paste the value of `AWS_BEARER_TOKEN_BEDROCK`) |
 
-Anthropic OAuth access tokens from `claude login` expire (hours) and the container has no way to refresh them; re-run the extract command when they expire, or use a long-lived API key.
+Anthropic mode refreshes `~/.claude/.credentials.json` on the host when the OAuth token is near expiry, so runs survive across token rotations.
 
-`--no-default-rules` skips the mode's auth rule too — you must supply your own in `--rules`.
+`--no-default-rules` skips the mode's auth rule too — for `--bedrock` you must supply your own in `--rules`. (`--anthropic` always wires up the OAuth-backed rule from the host's credentials file.)
 
 ## Runtime
 

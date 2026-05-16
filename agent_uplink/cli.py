@@ -5,14 +5,20 @@ import signal
 from functools import partial
 from pathlib import Path
 
+import keyring
+
 from .config import (
     AUTH_MODE_ENV,
+    AUTH_MODES,
     export_aws_profile_env,
     get_bedrock_aws_profile_name,
     load_claude_config,
+    read_anthropic_oauth_credentials,
     real_aws_credentials_ini,
+    refresh_anthropic_oauth_if_expiring,
     write_claude_settings,
     write_dummy_aws_credentials,
+    write_fake_oauth_credentials,
 )
 from .docker_ops import (
     CLAUDE_IMAGE_MAX_AGE_SECONDS,
@@ -44,48 +50,72 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "-a", "--aws-profiles",
-        type=str, nargs="*", action="extend", default=[],
+        "-a",
+        "--aws-profiles",
+        type=str,
+        nargs="*",
+        action="extend",
+        default=[],
         help="AWS profiles to provide credentials for (one sigv4-proxy sidecar per profile)",
     )
     parser.add_argument(
-        "-m", "--mitmproxy-image", type=str, default="mitmproxy/mitmproxy",
+        "-m",
+        "--mitmproxy-image",
+        type=str,
+        default="mitmproxy/mitmproxy",
     )
     parser.add_argument(
-        "-c", "--claude-image", type=str, default="agent-uplink-claude",
+        "-c",
+        "--claude-image",
+        type=str,
+        default="agent-uplink-claude",
     )
     parser.add_argument(
-        "--sigv4-proxy-image", type=str, default=DEFAULT_SIGV4_PROXY_IMAGE,
+        "--sigv4-proxy-image",
+        type=str,
+        default=DEFAULT_SIGV4_PROXY_IMAGE,
     )
     parser.add_argument(
-        "-f", "--force-rebuild",
-        action=argparse.BooleanOptionalAction, default=False,
+        "-f",
+        "--force-rebuild",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Force rebuild of the Claude container image",
     )
     parser.add_argument(
-        "-r", "--rules", type=Path, default=None,
+        "-r",
+        "--rules",
+        type=Path,
+        default=None,
         help="YAML rules file (allow-list policy + credential injection)",
     )
     parser.add_argument(
-        "--no-default-rules", action="store_true",
+        "--no-default-rules",
+        action="store_true",
         help="Don't merge built-in defaults (allow GET/OPTIONS everywhere)",
     )
     parser.add_argument(
-        "--runtime", type=str, default="runsc",
+        "--runtime",
+        type=str,
+        default="runsc",
         help="Docker runtime for the Claude container (e.g. runsc, runc)",
     )
     parser.add_argument(
-        "-d", "--debug",
-        action=argparse.BooleanOptionalAction, default=False,
+        "-d",
+        "--debug",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="Run claude with -d and mount ~/.claude/debug from the container "
-             "to /tmp/agent-uplink-debug/<session-id> on the host",
+        "to /tmp/agent-uplink-debug/<session-id> on the host",
     )
     mode_group = parser.add_mutually_exclusive_group(required=True)
-    for mode in AUTH_MODE_ENV:
+    for mode in AUTH_MODES:
         mode_group.add_argument(
-            f"--{mode}", dest="auth_mode", action="store_const", const=mode,
-            help=f"Configure container for {mode} auth "
-                 f"(injects placeholder {', '.join(AUTH_MODE_ENV[mode])})",
+            f"--{mode}",
+            dest="auth_mode",
+            action="store_const",
+            const=mode,
+            help=f"Configure container for {mode} auth",
         )
     return parser.parse_args()
 
@@ -95,8 +125,7 @@ def validate_cwd(username: str, cwd: Path) -> None:
     # only paths under /home/<username>/ exist on both sides.
     home = get_container_home(username)
     if cwd != home and home not in cwd.parents:
-        raise ValueError(
-            f"agent-uplink must be run from within {home}, got: {cwd}")
+        raise ValueError(f"agent-uplink must be run from within {home}, got: {cwd}")
 
 
 def _sidecar_name(session_id: str, profile: str) -> str:
@@ -115,6 +144,23 @@ def run(session: Session, args: argparse.Namespace) -> None:
     mitm_dir.mkdir(parents=True, exist_ok=True)
 
     claude_config = load_claude_config()
+    oauth_creds_path: Path | None = None
+    oauth_token: str | None = None
+    bedrock_token: str | None = None
+    if args.auth_mode == "anthropic":
+        refresh_anthropic_oauth_if_expiring()
+        real_creds = read_anthropic_oauth_credentials()
+        oauth_creds_path, oauth_token = write_fake_oauth_credentials(
+            real_creds, session.session_dir
+        )
+        LOGGER.info("using fake .credentials.json (real token via mitm)")
+    elif args.auth_mode == "bedrock":
+        bedrock_token = keyring.get_password("bedrock", "key")
+        if bedrock_token is None:
+            raise RuntimeError(
+                "bedrock bearer token not found in keyring; "
+                "run: keyring set bedrock key"
+            )
     aws_profile_names = list(args.aws_profiles)
     bedrock_profile = get_bedrock_aws_profile_name(claude_config)
     if bedrock_profile is not None:
@@ -130,9 +176,7 @@ def run(session: Session, args: argparse.Namespace) -> None:
         or image_age is None
         or image_age > CLAUDE_IMAGE_MAX_AGE_SECONDS
     ):
-        build_claude_image(
-            args.claude_image, username, mitm_dir, args.force_rebuild
-        )
+        build_claude_image(args.claude_image, username, mitm_dir, args.force_rebuild)
 
     # Real AWS creds — one mlock'd /dev/shm credentials file per profile,
     # bind-mounted into the matching sidecar. Avoids `docker run -e ...`,
@@ -151,9 +195,8 @@ def run(session: Session, args: argparse.Namespace) -> None:
         aws_profile_names, session.aws_dir
     )
 
-    settings_path = write_claude_settings(
-        claude_config, session.session_dir, args.auth_mode
-    )
+    auth_env = dict(AUTH_MODE_ENV.get(args.auth_mode, {}))
+    settings_path = write_claude_settings(claude_config, session.session_dir, auth_env)
     debug_host_dir: Path | None = None
     if args.debug:
         debug_host_dir = Path("/tmp/agent-uplink-debug") / session.id
@@ -161,8 +204,14 @@ def run(session: Session, args: argparse.Namespace) -> None:
         LOGGER.info(f"debug mode: claude logs → {debug_host_dir}")
 
     claude_mounts = build_claude_mounts(
-        username, settings_path, aws_creds_path, session.socket_path,
-        mitm_dir, cwd, debug_host_dir,
+        username,
+        settings_path,
+        aws_creds_path,
+        session.socket_path,
+        mitm_dir,
+        cwd,
+        debug_host_dir,
+        oauth_creds_path,
     )
 
     sigv4_routes: dict[str, dict] = {}
@@ -173,7 +222,12 @@ def run(session: Session, args: argparse.Namespace) -> None:
         sidecars.append((profile, name))
 
     rules_secret = resolve_rules(
-        args.rules, args.no_default_rules, args.auth_mode, sigv4_routes
+        args.rules,
+        args.no_default_rules,
+        args.auth_mode,
+        sigv4_routes,
+        anthropic_oauth_token=oauth_token,
+        bedrock_bearer_token=bedrock_token,
     )
     session.secrets.append(rules_secret)
 
@@ -185,17 +239,30 @@ def run(session: Session, args: argparse.Namespace) -> None:
 
     port = get_free_port()
     start_mitm_proxy(
-        session, mitm_dir, args.mitmproxy_image, port,
-        rules_secret.bind_source, network_name,
+        session,
+        mitm_dir,
+        args.mitmproxy_image,
+        port,
+        rules_secret.bind_source,
+        network_name,
     )
     if network_name is not None:
         for profile, name in sidecars:
             start_sigv4_proxy(
-                session, args.sigv4_proxy_image, name, network_name,
-                profile, real_aws_creds_secrets[profile].bind_source,
+                session,
+                args.sigv4_proxy_image,
+                name,
+                network_name,
+                profile,
+                real_aws_creds_secrets[profile].bind_source,
             )
     start_claude_container(
-        session, args.claude_image, cwd, claude_mounts, args.runtime, args.debug,
+        session,
+        args.claude_image,
+        cwd,
+        claude_mounts,
+        args.runtime,
+        args.debug,
     )
 
 

@@ -13,25 +13,6 @@ LOGGER = logging.getLogger("agent-uplink")
 
 DEFAULT_RULES_PATH = Path(__file__).resolve().parent / "default_rules.yaml"
 
-# Per-mode auth rule injected on top of the bundled defaults. Keep the keyring
-# entry name (the value after `keyring:`) in sync with the docs/examples that
-# tell users how to populate it.
-MODE_AUTH_RULES: dict[str, dict[str, Any]] = {
-    "anthropic": {
-        "name": "anthropic-auth",
-        "host": r"api\.anthropic\.com",
-        "inject": {
-            "headers": {"Authorization": "Bearer {{keyring:anthropic:key}}"},
-        },
-    },
-    "bedrock": {
-        "name": "bedrock-auth",
-        "host": r"bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com",
-        "inject": {
-            "headers": {"Authorization": "Bearer {{keyring:bedrock:key}}"},
-        },
-    },
-}
 
 VALID_METHODS = {
     "GET",
@@ -132,11 +113,19 @@ def resolve(
     no_default_rules: bool,
     auth_mode: str,
     aws_sigv4_routes: dict[str, dict[str, Any]] | None = None,
+    anthropic_oauth_token: str | None = None,
+    bedrock_bearer_token: str | None = None,
 ) -> LockedSecret:
     """Build resolved rules JSON in an anonymous, mlock'd memfd.
 
     `aws_sigv4_routes` maps dummy AKIA → {upstream_host, upstream_port} so the
     addon can route AWS requests to the matching aws-sigv4-proxy sidecar.
+
+    `anthropic_oauth_token` is required when `auth_mode == "anthropic"`; it
+    becomes the literal bearer injected on api.anthropic.com requests.
+
+    `bedrock_bearer_token` is required when `auth_mode == "bedrock"`; it
+    becomes the literal bearer injected on bedrock-runtime requests.
 
     Returned LockedSecret must be close()d after the mitmproxy container is
     stopped; until then its bind_source can be passed as a docker `-v` source.
@@ -151,7 +140,26 @@ def resolve(
     if use_defaults:
         defaults_config = _load_yaml(DEFAULT_RULES_PATH)
         rules.extend(defaults_config.get("rules") or [])
-        rules.append(MODE_AUTH_RULES[auth_mode])
+        if auth_mode == "anthropic":
+            if anthropic_oauth_token is None:
+                raise ValueError("anthropic auth mode requires an oauth token")
+            rules.append({
+                "name": "anthropic-auth",
+                "host": r"api\.anthropic\.com",
+                "inject": {
+                    "headers": {"Authorization": f"Bearer {anthropic_oauth_token}"},
+                },
+            })
+        elif auth_mode == "bedrock":
+            if bedrock_bearer_token is None:
+                raise ValueError("bedrock auth mode requires a bearer token")
+            rules.append({
+                "name": "bedrock-auth",
+                "host": r"bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com",
+                "inject": {
+                    "headers": {"Authorization": f"Bearer {bedrock_bearer_token}"},
+                },
+            })
     rules.extend(user_config.get("rules") or [])
 
     if not rules:
