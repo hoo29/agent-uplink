@@ -8,7 +8,12 @@
       "name": "Python Debugger: Module",
       "type": "debugpy",
       "request": "launch",
-      "module": "agent_uplink"
+      "module": "agent_uplink",
+      "args": [
+        "--anthropic",
+        "-a",
+        "admin"
+      ]
     }
   ]
 }

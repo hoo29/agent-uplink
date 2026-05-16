@@ -2,6 +2,7 @@ import logging
 import os
 import shutil
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import HOST_CLAUDE_DIR
@@ -61,11 +62,21 @@ def ensure_mitm_certs(mitm_dir: Path, mitmproxy_image: str) -> bool:
     return True
 
 
-def check_claude_image_exists(claude_image: str) -> bool:
-    return (
-        run_command(["docker", "image", "inspect", claude_image], raise_error=False)
-        != ""
-    )
+CLAUDE_IMAGE_MAX_AGE_SECONDS = 86_400
+
+
+def get_claude_image_age_seconds(claude_image: str) -> float | None:
+    output = run_command(
+        ["docker", "image", "inspect", "-f", "{{.Created}}", claude_image],
+        raise_error=False,
+    ).strip()
+    if not output:
+        return None
+    # docker returns RFC3339 like "2024-01-15T10:30:45.123456789Z"; trim
+    # the trailing Z and any sub-second precision Python <3.11 can't parse.
+    ts = output.rstrip("Z").split(".")[0]
+    created = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - created).total_seconds()
 
 
 def build_claude_image(
@@ -153,15 +164,23 @@ def build_claude_mounts(
     return mounts
 
 
-def _ensure_container_running(container_name: str) -> None:
-    time.sleep(1)
-    status = run_command(
-        ["docker", "inspect", "-f", "{{.State.Status}}", container_name],
-        raise_error=False,
-    ).strip()
-    if status != "running":
-        raise RuntimeError(f"container {container_name} not running")
-    LOGGER.debug(f"container {container_name} is running")
+def _ensure_container_running(container_name: str, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    status = ""
+    while time.monotonic() < deadline:
+        status = run_command(
+            ["docker", "inspect", "-f", "{{.State.Status}}", container_name],
+            raise_error=False,
+        ).strip()
+        if status == "running":
+            LOGGER.debug(f"container {container_name} is running")
+            return
+        if status in {"exited", "dead"}:
+            break
+        time.sleep(0.2)
+    raise RuntimeError(
+        f"container {container_name} not running (last status: {status or 'missing'})"
+    )
 
 
 def create_network(name: str) -> None:

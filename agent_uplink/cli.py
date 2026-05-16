@@ -14,11 +14,12 @@ from .config import (
     write_dummy_aws_credentials,
 )
 from .docker_ops import (
+    CLAUDE_IMAGE_MAX_AGE_SECONDS,
     build_claude_image,
     build_claude_mounts,
-    check_claude_image_exists,
     create_network,
     ensure_mitm_certs,
+    get_claude_image_age_seconds,
     get_container_home,
     start_claude_container,
     start_mitm_proxy,
@@ -120,10 +121,12 @@ def run(session: Session, args: argparse.Namespace) -> None:
     aws_profile_names = list(dict.fromkeys(aws_profile_names))
 
     certs_generated = ensure_mitm_certs(mitm_dir, args.mitmproxy_image)
+    image_age = get_claude_image_age_seconds(args.claude_image)
     if (
         certs_generated
         or args.force_rebuild
-        or not check_claude_image_exists(args.claude_image)
+        or image_age is None
+        or image_age > CLAUDE_IMAGE_MAX_AGE_SECONDS
     ):
         build_claude_image(
             args.claude_image, username, mitm_dir, args.force_rebuild
