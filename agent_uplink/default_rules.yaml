@@ -3,6 +3,10 @@
 # in rules.py.
 
 rules:
+  - name: default-readonly
+    host: ".*"
+    methods: [GET, OPTIONS, HEAD]
+
   - name: claude-logs
     host: .*\.datadoghq\.com
     methods: ["POST"]
