@@ -43,7 +43,9 @@ def delete_namespace(name: str, *, wait: bool = False) -> None:
     """Best-effort namespace delete. By default returns immediately; the
     cluster finishes the cascade in the background (~10-30s for kata pods)."""
     kubectl(
-        "delete", "namespace", name,
+        "delete",
+        "namespace",
+        name,
         f"--wait={'true' if wait else 'false'}",
         "--ignore-not-found=true",
         raise_error=False,
@@ -52,7 +54,12 @@ def delete_namespace(name: str, *, wait: bool = False) -> None:
 
 def namespace_exists(name: str) -> bool:
     out = kubectl(
-        "get", "namespace", name, "--ignore-not-found", "-o", "name",
+        "get",
+        "namespace",
+        name,
+        "--ignore-not-found",
+        "-o",
+        "name",
         raise_error=False,
     )
     return bool(out.strip())
@@ -60,8 +67,12 @@ def namespace_exists(name: str) -> bool:
 
 def wait_for_pod_ready(namespace: str, pod_name: str, *, timeout: int = 180) -> None:
     kubectl(
-        "wait", "--for=condition=Ready", f"pod/{pod_name}",
-        "-n", namespace, f"--timeout={timeout}s",
+        "wait",
+        "--for=condition=Ready",
+        f"pod/{pod_name}",
+        "-n",
+        namespace,
+        f"--timeout={timeout}s",
     )
 
 
@@ -71,12 +82,18 @@ def wait_for_pod_succeeded(
     """Block until a Pod with restartPolicy=Never reaches Succeeded.
     Raises if it ends up Failed or doesn't terminate in time."""
     import time
+
     deadline = time.monotonic() + timeout
     last = "<none>"
     while time.monotonic() < deadline:
         phase = kubectl(
-            "get", "pod", pod_name, "-n", namespace,
-            "-o", "jsonpath={.status.phase}",
+            "get",
+            "pod",
+            pod_name,
+            "-n",
+            namespace,
+            "-o",
+            "jsonpath={.status.phase}",
             raise_error=False,
         ).strip()
         last = phase or last
@@ -89,12 +106,14 @@ def wait_for_pod_succeeded(
     raise TimeoutError(f"pod {pod_name} not Succeeded after {timeout}s (phase={last})")
 
 
-def wait_for_deployment_ready(
-    namespace: str, name: str, *, timeout: int = 180
-) -> None:
+def wait_for_deployment_ready(namespace: str, name: str, *, timeout: int = 180) -> None:
     kubectl(
-        "rollout", "status", f"deployment/{name}",
-        "-n", namespace, f"--timeout={timeout}s",
+        "rollout",
+        "status",
+        f"deployment/{name}",
+        "-n",
+        namespace,
+        f"--timeout={timeout}s",
     )
 
 
@@ -143,7 +162,9 @@ def configmap_manifest(name: str, namespace: str, data: dict[str, str]) -> dict:
 
 
 def service_manifest(
-    name: str, namespace: str, *,
+    name: str,
+    namespace: str,
+    *,
     selector: dict[str, str],
     port: int,
     target_port: int | None = None,
@@ -170,7 +191,9 @@ def service_manifest(
 
 
 def pod_manifest(
-    name: str, namespace: str, *,
+    name: str,
+    namespace: str,
+    *,
     labels: dict[str, str],
     image: str,
     command: list[str] | None = None,
@@ -242,7 +265,9 @@ def pod_manifest(
 
 
 def deployment_manifest(
-    name: str, namespace: str, *,
+    name: str,
+    namespace: str,
+    *,
     labels: dict[str, str],
     pod_spec: dict,
     replicas: int = 1,
@@ -263,7 +288,9 @@ def deployment_manifest(
 
 
 def network_policy_manifest(
-    name: str, namespace: str, *,
+    name: str,
+    namespace: str,
+    *,
     pod_selector: dict,
     ingress: list[dict] | None = None,
     egress: list[dict] | None = None,
@@ -298,9 +325,7 @@ def tmpfs_volume(name: str, size: str = "64Mi") -> dict:
     return {"name": name, "emptyDir": {"medium": "Memory", "sizeLimit": size}}
 
 
-def secret_volume(
-    name: str, secret_name: str, *, default_mode: int = 0o644
-) -> dict:
+def secret_volume(name: str, secret_name: str, *, default_mode: int = 0o644) -> dict:
     """Default mode 0o644 matches the K8s API default. With Secret volumes
     owned by root:fsGroup, the pod's runAsUser needs world-read (0o644) or
     group-read (0o440 + matching fsGroup) to actually read the file."""
@@ -319,7 +344,7 @@ def hostpath_volume(name: str, path: str, *, hp_type: str = "Directory") -> dict
 
 
 def hardened_container_security_context(
-    *, uid: int | None = None, gid: int | None = None, run_as_non_root: bool = True
+    *, uid: int | None = None, gid: int | None = None
 ) -> dict:
     """Hardening flags safe for any of our containers. Pass uid/gid for
     images whose default user we need to override (e.g. agent image)."""
@@ -327,7 +352,7 @@ def hardened_container_security_context(
         "allowPrivilegeEscalation": False,
         "capabilities": {"drop": ["ALL"]},
         "readOnlyRootFilesystem": True,
-        "runAsNonRoot": run_as_non_root,
+        "runAsNonRoot": True,
         "seccompProfile": {"type": "RuntimeDefault"},
     }
     if uid is not None:

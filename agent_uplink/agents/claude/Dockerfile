@@ -22,6 +22,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   wget \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+RUN install -m 0755 -d /etc/apt/keyrings \
+  && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
+  && chmod a+r /etc/apt/keyrings/docker.asc \
+  && . /etc/os-release \
+  && printf "Types: deb\nURIs: https://download.docker.com/linux/ubuntu\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n" \
+    "${UBUNTU_CODENAME:-$VERSION_CODENAME}" "$(dpkg --print-architecture)" \
+  > /etc/apt/sources.list.d/docker.sources \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends \
+    docker-ce \
+    docker-ce-cli \
+    containerd.io \
+    docker-buildx-plugin \
+    docker-compose-plugin \
+  && rm -rf /var/lib/apt/lists/*
+
 RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
   && unzip awscliv2.zip \
   && ./aws/install \
@@ -35,7 +51,9 @@ RUN if [ "${USER_GID}" != "1000" ]; then groupadd --gid "${USER_GID}" "${USERNAM
        useradd --uid "${USER_UID}" --gid "${USER_GID}" --shell /bin/bash --create-home "${USERNAME}"; \
      else \
        usermod --login "${USERNAME}" --move-home --home "/home/${USERNAME}" "$(getent passwd 1000 | cut -d: -f1)"; \
-     fi
+     fi \
+  && usermod -aG docker "${USERNAME}"
+
 ARG CACHE_BUST=0
 RUN echo "cache-bust=${CACHE_BUST}" \
   && su - ${USERNAME} -c "curl -fsSL https://claude.ai/install.sh | bash"
