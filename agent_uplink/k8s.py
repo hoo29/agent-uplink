@@ -325,6 +325,13 @@ def tmpfs_volume(name: str, size: str = "64Mi") -> dict:
     return {"name": name, "emptyDir": {"medium": "Memory", "sizeLimit": size}}
 
 
+def disk_emptydir_volume(name: str, size: str | None = None) -> dict:
+    ed: dict[str, Any] = {}
+    if size is not None:
+        ed["sizeLimit"] = size
+    return {"name": name, "emptyDir": ed}
+
+
 def secret_volume(name: str, secret_name: str, *, default_mode: int = 0o644) -> dict:
     """Default mode 0o644 matches the K8s API default. With Secret volumes
     owned by root:fsGroup, the pod's runAsUser needs world-read (0o644) or

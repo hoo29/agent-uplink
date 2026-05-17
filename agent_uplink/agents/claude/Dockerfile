@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   gnupg2 \
   iputils-ping \
   jq \
+  kmod \
   less \
   net-tools \
   procps \
@@ -61,7 +62,7 @@ RUN echo "cache-bust=${CACHE_BUST}" \
 COPY certs/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/mitmproxy-ca-cert.crt
 RUN update-ca-certificates
 
-USER ${USERNAME}
+COPY --chmod=0755 dockerd-entrypoint.sh /usr/local/bin/dockerd-entrypoint.sh
 
 ENV SHELL=/bin/bash
 ENV EDITOR=vim
@@ -70,3 +71,5 @@ ENV NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/mitmproxy-ca-cert.crt
 ENV AWS_CA_BUNDLE=/usr/local/share/ca-certificates/mitmproxy-ca-cert.crt
 ENV PATH="$PATH:/home/${USERNAME}/.local/bin"
 ENV USERNAME=${USERNAME}
+
+CMD ["/usr/local/bin/dockerd-entrypoint.sh"]

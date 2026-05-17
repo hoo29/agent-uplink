@@ -288,15 +288,12 @@ def _agent_pod_manifest(
         namespace=ns,
         labels=_label("agent"),
         image=full_image,
-        command=["sleep", "infinity"],
+        command=agent.container_init_command(),
         env=env,
         volumes=volumes,
         volume_mounts=mounts,
         runtime_class=runtime_class or None,
-        container_security_context=hardened_container_security_context(
-            uid=uid,
-            gid=gid,
-        ),
+        container_security_context=agent.container_security_context(uid, gid),
         pod_security_context={"fsGroup": gid},
         memory=agent.memory(),
         cpu="1",
@@ -340,7 +337,6 @@ def _network_policies(ns: str, has_sigv4: bool) -> list[dict]:
                     ],
                     "ports": [
                         {"protocol": "UDP", "port": 53},
-                        {"protocol": "TCP", "port": 53},
                     ],
                 },
             ],
@@ -555,7 +551,7 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
         session.namespace,
         "agent",
         container="main",
-        command=agent.container_command(args.debug),
+        command=agent.container_command(username, args.debug),
     )
 
 

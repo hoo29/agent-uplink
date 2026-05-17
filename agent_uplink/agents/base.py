@@ -8,6 +8,7 @@ from typing import ClassVar
 
 import yaml
 
+from ..k8s import hardened_container_security_context
 from ..session import Session
 
 
@@ -110,7 +111,20 @@ class Agent(ABC):
         USERNAME) are set by the orchestrator."""
         return {}
 
-    def container_command(self, debug: bool) -> list[str]:
+    def container_security_context(self, uid: int, gid: int) -> dict:
+        """Container-level securityContext for the agent pod. Default is the
+        full hardened context (drop-ALL, RoFS, non-root, seccomp RuntimeDefault).
+        Agents that need nested workloads (e.g. docker-in-docker) override this
+        — only the agent container is affected; mitm/sigv4 are untouched."""
+        return hardened_container_security_context(uid=uid, gid=gid)
+
+    def container_init_command(self) -> list[str]:
+        """Argv for the pod's PID 1. Default is `sleep infinity` (the agent
+        process is launched later via `kubectl exec`). Override if PID 1 needs
+        to bring up background daemons before the agent is exec'd."""
+        return ["sleep", "infinity"]
+
+    def container_command(self, username: str, debug: bool) -> list[str]:
         """Argv for `kubectl exec -it agent -- ...`. Override to launch your
         CLI directly; default drops into an interactive bash."""
         return ["bash", "-l"]
