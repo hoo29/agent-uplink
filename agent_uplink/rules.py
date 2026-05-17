@@ -7,31 +7,13 @@ from typing import Any
 import keyring
 import yaml
 
+from .agents.base import Agent
 from .secret import LockedSecret
 
 LOGGER = logging.getLogger("agent-uplink")
 
-DEFAULT_RULES_PATH = Path(__file__).resolve().parent / "default_rules.yaml"
+GENERIC_DEFAULT_RULES_PATH = Path(__file__).resolve().parent / "default_rules.yaml"
 
-# Per-mode auth rule injected on top of the bundled defaults. Keep the keyring
-# entry name (the value after `keyring:`) in sync with the docs/examples that
-# tell users how to populate it.
-MODE_AUTH_RULES: dict[str, dict[str, Any]] = {
-    "anthropic": {
-        "name": "anthropic-auth",
-        "host": r"api\.anthropic\.com",
-        "inject": {
-            "headers": {"Authorization": "Bearer {{keyring:anthropic:key}}"},
-        },
-    },
-    "bedrock": {
-        "name": "bedrock-auth",
-        "host": r"bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com",
-        "inject": {
-            "headers": {"Authorization": "Bearer {{keyring:bedrock:key}}"},
-        },
-    },
-}
 
 VALID_METHODS = {
     "GET",
@@ -130,10 +112,20 @@ def _validate_and_resolve_rule(rule: dict, idx: int) -> dict:
 def resolve(
     user_rules_path: Path | None,
     no_default_rules: bool,
-    auth_mode: str,
+    agent: Agent,
     aws_sigv4_routes: dict[str, dict[str, Any]] | None = None,
 ) -> LockedSecret:
     """Build resolved rules JSON in an anonymous, mlock'd memfd.
+
+    Layering when defaults are enabled:
+      1. agent_uplink/default_rules.yaml          (generic baseline)
+      2. agents/<name>/default_rules.yaml         (per-agent)
+      3. agent.auth_rules()                       (per-mode auth header injection)
+      4. user-supplied YAML                       (always appended)
+
+    `--no-default-rules` (or `replace_defaults: true` in the user's YAML)
+    skips layers 1-3 — the user becomes responsible for supplying any auth
+    rule needed by the chosen mode.
 
     `aws_sigv4_routes` maps dummy AKIA → {upstream_host, upstream_port} so the
     addon can route AWS requests to the matching aws-sigv4-proxy sidecar.
@@ -149,9 +141,9 @@ def resolve(
         "replace_defaults", False))
     rules: list[dict] = []
     if use_defaults:
-        defaults_config = _load_yaml(DEFAULT_RULES_PATH)
-        rules.extend(defaults_config.get("rules") or [])
-        rules.append(MODE_AUTH_RULES[auth_mode])
+        rules.extend(_load_yaml(GENERIC_DEFAULT_RULES_PATH).get("rules") or [])
+        rules.extend(agent.default_rules())
+        rules.extend(agent.auth_rules())
     rules.extend(user_config.get("rules") or [])
 
     if not rules:

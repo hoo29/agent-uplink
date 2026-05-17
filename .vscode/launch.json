@@ -10,6 +10,7 @@
       "request": "launch",
       "module": "agent_uplink",
       "args": [
+        "claude",
         "--anthropic",
         "-a",
         "admin"

@@ -6,6 +6,7 @@ if [[ "$WORKDIR" != "/home/$USERNAME" && "$WORKDIR" != "/home/$USERNAME/"* ]]; t
 fi
 
 socat TCP-LISTEN:8090,fork,reuseaddr UNIX-CONNECT:/mnt/socket/uplink.sock >/dev/null 2>&1 &
+
 cd "$WORKDIR"
 if [[ -n "$AGENT_UPLINK_DEBUG" ]]; then
   exec claude -d --dangerously-skip-permissions

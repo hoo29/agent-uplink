@@ -1,5 +1,13 @@
+"""AWS profile helpers shared by all agents.
+
+Real AWS credentials live on the host and are passed to per-profile
+`aws-sigv4-proxy` sidecars via mlock'd `/dev/shm` files (see secret.py).
+The agent container only sees dummy values, deterministically derived per
+profile so the mitm addon can map a signed request back to a sidecar by
+the AKIA in its `Authorization` header.
+"""
+
 import hashlib
-import json
 import logging
 import os
 from pathlib import Path
@@ -8,45 +16,18 @@ from .process import run_command
 
 LOGGER = logging.getLogger("agent-uplink")
 
-HOST_CLAUDE_DIR = Path.home() / ".claude"
-
-# Placeholder values injected into the container's settings.json so the Claude
-# CLI takes the chosen auth path. The real credentials are added by mitmproxy
-# header injection (see rules.py) and never enter the container.
-AUTH_MODE_ENV: dict[str, dict[str, str]] = {
-    "anthropic": {"ANTHROPIC_AUTH_TOKEN": "placeholder"},
-    "bedrock": {"AWS_BEARER_TOKEN_BEDROCK": "placeholder"},
-}
-
 # 40-char dummy AWS secret. Real secrets are 40 base64-ish chars; SDKs don't
 # validate format. The container signs with these and the signature is
 # discarded by mitmproxy before re-signing in aws-sigv4-proxy.
 _DUMMY_SECRET = "DUMMYsecret0000000000000000000000000000A"
 
 
-def load_claude_config() -> dict:
-    return json.loads((HOST_CLAUDE_DIR / "settings.json").read_text(encoding="utf8"))
-
-
-def get_bedrock_aws_profile_name(claude_config: dict) -> str | None:
-    return claude_config.get("env", {}).get("AWS_PROFILE")
-
-
-def write_claude_settings(
-    claude_config: dict, session_dir: Path, auth_mode: str
-) -> Path:
-    filtered = dict(claude_config)
-    for key in ["awsAuthRefresh", "sandbox"]:
-        filtered.pop(key, None)
-    filtered["skipDangerousModePermissionPrompt"] = True
-    filtered.setdefault("env", {}).update(AUTH_MODE_ENV[auth_mode])
-    settings_path = session_dir / "settings.json"
-    settings_path.write_text(json.dumps(filtered, indent=2))
-    return settings_path
-
-
 def export_aws_profile_env(profile_name: str) -> dict[str, str]:
-    """Return real AWS_* env vars for the given profile (host-side only)."""
+    """Return real AWS_* env vars for the given profile (host-side only).
+
+    Falls back to `aws sso login` (which launches a browser) if the initial
+    export fails, then retries.
+    """
     cmd = [
         "aws",
         "configure",
@@ -59,7 +40,6 @@ def export_aws_profile_env(profile_name: str) -> dict[str, str]:
     try:
         creds_raw = run_command(cmd)
     except Exception:
-        # SSO login launches a browser, so don't run unless needed
         run_command(["aws", "sso", "login", "--profile", profile_name])
         creds_raw = run_command(cmd)
     env: dict[str, str] = {}
@@ -105,7 +85,7 @@ def dummy_akia(profile_name: str) -> str:
 def write_dummy_aws_credentials(
     aws_profile_names: list[str], aws_dir: Path
 ) -> tuple[Path | None, dict[str, str]]:
-    """Write fake AWS creds for the container; return (mount dir, profile→akia).
+    """Write fake AWS creds for an agent container; return (mount dir, profile→akia).
 
     The container uses these dummy values to sign requests; mitmproxy strips
     the bogus signature and routes to an aws-sigv4-proxy sidecar that re-signs
@@ -128,3 +108,9 @@ def write_dummy_aws_credentials(
     with os.fdopen(fd, "w") as f:
         f.write("\n".join(lines))
     return aws_dir, profile_to_akia
+
+
+def sanitize_profile_for_container_name(profile: str) -> str:
+    """Container names allow [a-zA-Z0-9_.-]; AWS profile names allow more,
+    so sanitize defensively before using a profile name in a container name."""
+    return "".join(c if c.isalnum() or c in "._-" else "-" for c in profile)

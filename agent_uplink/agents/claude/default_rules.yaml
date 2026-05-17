@@ -1,0 +1,21 @@
+# Claude-specific allow-list rules, layered on top of the generic baseline in
+# agent_uplink/default_rules.yaml. The per-mode auth rule (api.anthropic.com /
+# bedrock-runtime.<region>.amazonaws.com) is appended at runtime by
+# ClaudeAgent.auth_rules().
+
+rules:
+  - name: claude-logs
+    host: .*\.datadoghq\.com
+    methods: ["POST"]
+    paths:
+      - /api/v2/logs
+
+  - name: claude-changelog
+    host: raw\.githubusercontent\.com
+    methods: ["GET"]
+    paths:
+      - /anthropics/claude-code/refs/heads/main/CHANGELOG\.md
+
+  - name: claude-downloads
+    host: downloads\.claude\.ai
+    methods: ["GET"]
