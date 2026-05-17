@@ -1,24 +1,8 @@
-# The provider auth rule (api.anthropic.com / bedrock-runtime.<region>.amazonaws.com)
-# is injected at runtime based on --anthropic / --bedrock; see MODE_AUTH_RULES
-# in rules.py.
+# Generic, agent-agnostic baseline rules. Layered with each agent's
+# default_rules.yaml (in agent_uplink/agents/<name>/) and the per-mode auth
+# rule contributed by the agent.
 
 rules:
   - name: default-readonly
     host: ".*"
     methods: [GET, OPTIONS, HEAD]
-
-  - name: claude-logs
-    host: .*\.datadoghq\.com
-    methods: ["POST"]
-    paths:
-      - /api/v2/logs
-
-  - name: claude-changelog
-    host: raw\.githubusercontent\.com
-    methods: ["GET"]
-    paths:
-      - /anthropics/claude-code/refs/heads/main/CHANGELOG\.md
-
-  - name: claude-downloads
-    host: downloads\.claude\.ai
-    methods: ["GET"]

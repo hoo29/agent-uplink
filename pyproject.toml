@@ -27,7 +27,18 @@ tests = ["pytest"]
 build = ["build"]
 
 [tool.setuptools]
-packages = ["agent_uplink", "agent_uplink.mitm_addon"]
+packages = [
+    "agent_uplink",
+    "agent_uplink.agents",
+    "agent_uplink.agents.claude",
+    "agent_uplink.mitm_addon",
+]
 
 [tool.setuptools.package-data]
 agent_uplink = ["default_rules.yaml"]
+"agent_uplink.agents.claude" = [
+    "default_rules.yaml",
+    "Dockerfile",
+    "entrypoint.sh",
+    "certs/*",
+]

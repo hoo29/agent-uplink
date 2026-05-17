@@ -5,7 +5,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import HOST_CLAUDE_DIR
 from .process import run_command, run_command_background
 from .session import Session
 
@@ -28,6 +27,10 @@ DOCKER_RUN_FLAGS: list[str] = [
     "--security-opt",
     "no-new-privileges",
 ]
+
+
+# Per-agent image rebuild trigger: rebuild if older than this.
+AGENT_IMAGE_MAX_AGE_SECONDS = 86_400
 
 
 def get_container_home(username: str) -> Path:
@@ -62,12 +65,9 @@ def ensure_mitm_certs(mitm_dir: Path, mitmproxy_image: str) -> bool:
     return True
 
 
-CLAUDE_IMAGE_MAX_AGE_SECONDS = 86_400
-
-
-def get_claude_image_age_seconds(claude_image: str) -> float | None:
+def get_image_age_seconds(image: str) -> float | None:
     output = run_command(
-        ["docker", "image", "inspect", "-f", "{{.Created}}", claude_image],
+        ["docker", "image", "inspect", "-f", "{{.Created}}", image],
         raise_error=False,
     ).strip()
     if not output:
@@ -79,11 +79,19 @@ def get_claude_image_age_seconds(claude_image: str) -> float | None:
     return (datetime.now(timezone.utc) - created).total_seconds()
 
 
-def build_claude_image(
-    claude_image: str, username: str, mitm_dir: Path, force_rebuild: bool = False
+def build_agent_image(
+    image: str,
+    container_dir: Path,
+    username: str,
+    mitm_dir: Path,
+    force_rebuild: bool = False,
 ) -> None:
-    LOGGER.info("(re)building claude container")
-    container_dir = Path(__file__).resolve().parent / "claude_container"
+    """Build an agent container image.
+
+    Copies the host's mitmproxy certs into <container_dir>/certs/ so the
+    Dockerfile can COPY them in (the image trusts mitmproxy's CA).
+    """
+    LOGGER.info(f"(re)building agent container image {image}")
     shutil.copytree(mitm_dir, container_dir / "certs", dirs_exist_ok=True)
     build_args = [
         "--build-arg",
@@ -101,71 +109,12 @@ def build_claude_image(
             "build",
             *build_args,
             "-t",
-            claude_image,
+            image,
             str(container_dir),
         ],
         stdout=None,
         stderr=None,
     )
-
-
-def build_claude_mounts(
-    username: str,
-    settings_path: Path,
-    aws_creds_path: Path | None,
-    socket_path: Path,
-    mitm_dir: Path,
-    cwd: Path,
-    debug_host_dir: Path | None = None,
-    oauth_creds_path: Path | None = None,
-) -> list[str]:
-    project_id = str(Path.cwd()).replace("/", "-")
-    host_project_dir = HOST_CLAUDE_DIR / "projects" / project_id
-    host_project_dir.mkdir(parents=True, exist_ok=True)
-
-    container_home = get_container_home(username)
-    claude_dir = container_home / ".claude"
-    uid, gid = os.getuid(), os.getgid()
-
-    mounts: list[str] = [
-        "--tmpfs",
-        "/tmp:rw,noexec,nosuid,size=200m",
-        "--tmpfs",
-        f"{container_home / '.local' / 'share' / 'applications'}:rw,noexec,nosuid,size=200m",
-        "--tmpfs",
-        f"{claude_dir}:rw,noexec,nosuid,size=200m,uid={uid},gid={gid}",
-    ]
-
-    def vol(host: Path, container: str, mode: str | None = None) -> None:
-        spec = f"{host}:{container}" if mode is None else f"{host}:{container}:{mode}"
-        mounts.extend(["-v", spec])
-
-    vol(settings_path, f"{claude_dir}/settings.json", "ro")
-    vol(mitm_dir, "/mnt/certs", "ro")
-    vol(host_project_dir, f"{claude_dir}/projects/{project_id}", "rw")
-    vol(Path.home() / ".claude.json", f"{container_home}/.claude.json", "rw")
-    vol(socket_path, "/mnt/socket/uplink.sock")
-    vol(cwd, str(cwd), "rw")
-
-    for name in ["CLAUDE.md", "commands", "skills"]:
-        host_path = HOST_CLAUDE_DIR / name
-        if host_path.exists():
-            vol(host_path, f"{claude_dir}/{name}", "ro")
-    for name in ["history.jsonl"]:
-        host_path = HOST_CLAUDE_DIR / name
-        if host_path.exists():
-            vol(host_path, f"{claude_dir}/{name}", "rw")
-
-    if aws_creds_path is not None:
-        vol(aws_creds_path, str(container_home / ".aws"), "ro")
-
-    if oauth_creds_path is not None:
-        vol(oauth_creds_path, f"{claude_dir}/.credentials.json", "ro")
-
-    if debug_host_dir is not None:
-        vol(debug_host_dir, f"{claude_dir}/debug", "rw")
-
-    return mounts
 
 
 def _ensure_container_running(container_name: str, timeout: float = 10.0) -> None:
@@ -290,18 +239,21 @@ def start_sigv4_proxy(
     _ensure_container_running(container_name)
 
 
-def start_claude_container(
+def start_agent_container(
     session: Session,
-    claude_image: str,
-    cwd: Path,
-    claude_mounts: list[str],
+    agent_name: str,
+    image: str,
+    mounts: list[str],
+    env: dict[str, str],
     runtime: str,
-    debug: bool = False,
+    memory: str,
 ) -> None:
-    container_name = f"agent-uplink-claude-{session.id}"
+    container_name = f"agent-uplink-{agent_name}-{session.id}"
     session.containers.append(container_name)
-    LOGGER.info("starting claude container")
-    debug_env = ["-e", "AGENT_UPLINK_DEBUG=1"] if debug else []
+    LOGGER.info(f"starting {agent_name} container")
+    env_args: list[str] = []
+    for key, value in env.items():
+        env_args.extend(["-e", f"{key}={value}"])
     run_command(
         [
             "docker",
@@ -309,16 +261,14 @@ def start_claude_container(
             "--name",
             container_name,
             *DOCKER_RUN_FLAGS,
-            "--memory=1g",
+            f"--memory={memory}",
             f"--runtime={runtime}",
             "--network",
             "none",
             "-it",
-            "-e",
-            f"WORKDIR={cwd}",
-            *debug_env,
-            *claude_mounts,
-            claude_image,
+            *env_args,
+            *mounts,
+            image,
         ],
         stdout=None,
         stderr=None,

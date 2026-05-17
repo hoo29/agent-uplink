@@ -5,30 +5,21 @@ import signal
 from functools import partial
 from pathlib import Path
 
-import keyring
-
-from .config import (
-    AUTH_MODE_ENV,
-    AUTH_MODES,
+from .agents import AGENTS, Agent
+from .aws import (
     export_aws_profile_env,
-    get_bedrock_aws_profile_name,
-    load_claude_config,
-    read_anthropic_oauth_credentials,
     real_aws_credentials_ini,
-    refresh_anthropic_oauth_if_expiring,
-    write_claude_settings,
+    sanitize_profile_for_container_name,
     write_dummy_aws_credentials,
-    write_fake_oauth_credentials,
 )
 from .docker_ops import (
-    CLAUDE_IMAGE_MAX_AGE_SECONDS,
-    build_claude_image,
-    build_claude_mounts,
+    AGENT_IMAGE_MAX_AGE_SECONDS,
+    build_agent_image,
     create_network,
     ensure_mitm_certs,
-    get_claude_image_age_seconds,
     get_container_home,
-    start_claude_container,
+    get_image_age_seconds,
+    start_agent_container,
     start_mitm_proxy,
     start_sigv4_proxy,
 )
@@ -44,12 +35,14 @@ STATE_DIR = Path.home() / ".agent_uplink"
 DEFAULT_SIGV4_PROXY_IMAGE = "public.ecr.aws/aws-observability/aws-sigv4-proxy:latest"
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Trust is a weakness",
+def _common_arg_parser() -> argparse.ArgumentParser:
+    """Parser with the flags shared by every agent subcommand. Reused as a
+    parent so each subparser inherits them and `--help` shows them."""
+    common = argparse.ArgumentParser(
+        add_help=False,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
+    common.add_argument(
         "-a",
         "--aws-profiles",
         type=str,
@@ -58,65 +51,67 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="AWS profiles to provide credentials for (one sigv4-proxy sidecar per profile)",
     )
-    parser.add_argument(
+    common.add_argument(
         "-m",
         "--mitmproxy-image",
         type=str,
         default="mitmproxy/mitmproxy",
     )
-    parser.add_argument(
-        "-c",
-        "--claude-image",
-        type=str,
-        default="agent-uplink-claude",
-    )
-    parser.add_argument(
+    common.add_argument(
         "--sigv4-proxy-image",
         type=str,
         default=DEFAULT_SIGV4_PROXY_IMAGE,
     )
-    parser.add_argument(
+    common.add_argument(
         "-f",
         "--force-rebuild",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Force rebuild of the Claude container image",
+        help="Force rebuild of the agent container image",
     )
-    parser.add_argument(
+    common.add_argument(
         "-r",
         "--rules",
         type=Path,
         default=None,
         help="YAML rules file (allow-list policy + credential injection)",
     )
-    parser.add_argument(
+    common.add_argument(
         "--no-default-rules",
         action="store_true",
         help="Don't merge built-in defaults (allow GET/OPTIONS everywhere)",
     )
-    parser.add_argument(
+    common.add_argument(
         "--runtime",
         type=str,
         default="runsc",
-        help="Docker runtime for the Claude container (e.g. runsc, runc)",
+        help="Docker runtime for the agent container (e.g. runsc, runc)",
     )
-    parser.add_argument(
+    common.add_argument(
         "-d",
         "--debug",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Run claude with -d and mount ~/.claude/debug from the container "
-        "to /tmp/agent-uplink-debug/<session-id> on the host",
+        help="Run agent in debug mode (agent-specific; e.g. claude mounts ~/.claude/debug)",
     )
-    mode_group = parser.add_mutually_exclusive_group(required=True)
-    for mode in AUTH_MODES:
-        mode_group.add_argument(
-            f"--{mode}",
-            dest="auth_mode",
-            action="store_const",
-            const=mode,
-            help=f"Configure container for {mode} auth",
+    return common
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="agent-uplink",
+        description="Trust is a weakness",
+    )
+    sub = parser.add_subparsers(dest="agent_name", required=True, metavar="AGENT")
+    common = _common_arg_parser()
+    for name, agent_cls in AGENTS.items():
+        agent_parser = sub.add_parser(
+            name,
+            parents=[common],
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            help=f"Run the {name} agent",
         )
+        agent_cls.add_cli_args(agent_parser)
     return parser.parse_args()
 
 
@@ -129,13 +124,10 @@ def validate_cwd(username: str, cwd: Path) -> None:
 
 
 def _sidecar_name(session_id: str, profile: str) -> str:
-    # Container names: lowercase, [a-zA-Z0-9_.-]. AWS profile names allow more,
-    # so sanitize defensively.
-    safe = "".join(c if c.isalnum() or c in "._-" else "-" for c in profile)
-    return f"agent-uplink-sigv4-{session_id}-{safe}"
+    return f"agent-uplink-sigv4-{session_id}-{sanitize_profile_for_container_name(profile)}"
 
 
-def run(session: Session, args: argparse.Namespace) -> None:
+def run(session: Session, args: argparse.Namespace, agent: Agent) -> None:
     username = os.environ["USER"]
     cwd = Path.cwd()
     validate_cwd(username, cwd)
@@ -143,40 +135,28 @@ def run(session: Session, args: argparse.Namespace) -> None:
     mitm_dir = STATE_DIR / "mitm"
     mitm_dir.mkdir(parents=True, exist_ok=True)
 
-    claude_config = load_claude_config()
-    oauth_creds_path: Path | None = None
-    oauth_token: str | None = None
-    bedrock_token: str | None = None
-    if args.auth_mode == "anthropic":
-        refresh_anthropic_oauth_if_expiring()
-        real_creds = read_anthropic_oauth_credentials()
-        oauth_creds_path, oauth_token = write_fake_oauth_credentials(
-            real_creds, session.session_dir
-        )
-        LOGGER.info("using fake .credentials.json (real token via mitm)")
-    elif args.auth_mode == "bedrock":
-        bedrock_token = keyring.get_password("bedrock", "key")
-        if bedrock_token is None:
-            raise RuntimeError(
-                "bedrock bearer token not found in keyring; "
-                "run: keyring set bedrock key"
-            )
+    agent.resolve_auth(session)
+
     aws_profile_names = list(args.aws_profiles)
-    bedrock_profile = get_bedrock_aws_profile_name(claude_config)
-    if bedrock_profile is not None:
-        aws_profile_names.append(bedrock_profile)
+    aws_profile_names.extend(agent.discover_aws_profiles())
     # dedupe, preserve order
     aws_profile_names = list(dict.fromkeys(aws_profile_names))
 
     certs_generated = ensure_mitm_certs(mitm_dir, args.mitmproxy_image)
-    image_age = get_claude_image_age_seconds(args.claude_image)
+    image_age = get_image_age_seconds(agent.image)
     if (
         certs_generated
         or args.force_rebuild
         or image_age is None
-        or image_age > CLAUDE_IMAGE_MAX_AGE_SECONDS
+        or image_age > AGENT_IMAGE_MAX_AGE_SECONDS
     ):
-        build_claude_image(args.claude_image, username, mitm_dir, args.force_rebuild)
+        build_agent_image(
+            agent.image,
+            agent.container_dir(),
+            username,
+            mitm_dir,
+            args.force_rebuild,
+        )
 
     # Real AWS creds — one mlock'd /dev/shm credentials file per profile,
     # bind-mounted into the matching sidecar. Avoids `docker run -e ...`,
@@ -184,34 +164,33 @@ def run(session: Session, args: argparse.Namespace) -> None:
     real_aws_creds_secrets: dict[str, LockedSecret] = {}
     for profile in aws_profile_names:
         env = export_aws_profile_env(profile)
-        safe = "".join(c if c.isalnum() or c in "._-" else "-" for c in profile)
+        safe = sanitize_profile_for_container_name(profile)
         secret = LockedSecret(f"aws-{safe}", real_aws_credentials_ini(profile, env))
         real_aws_creds_secrets[profile] = secret
         session.secrets.append(secret)
+
     # Fake AWS creds — written to the container's ~/.aws/credentials. The
     # dummy AKIA per profile is the key the mitm addon uses to pick the
     # right sigv4-proxy sidecar.
-    aws_creds_path, profile_to_akia = write_dummy_aws_credentials(
+    aws_creds_dir, profile_to_akia = write_dummy_aws_credentials(
         aws_profile_names, session.aws_dir
     )
 
-    auth_env = dict(AUTH_MODE_ENV.get(args.auth_mode, {}))
-    settings_path = write_claude_settings(claude_config, session.session_dir, auth_env)
+    agent.write_session_files(session, aws_profile_names)
+
     debug_host_dir: Path | None = None
     if args.debug:
         debug_host_dir = Path("/tmp/agent-uplink-debug") / session.id
         debug_host_dir.mkdir(parents=True, exist_ok=True)
-        LOGGER.info(f"debug mode: claude logs → {debug_host_dir}")
+        LOGGER.info(f"debug mode: agent logs → {debug_host_dir}")
 
-    claude_mounts = build_claude_mounts(
-        username,
-        settings_path,
-        aws_creds_path,
-        session.socket_path,
-        mitm_dir,
+    agent_mounts = agent.build_mounts(
+        session,
         cwd,
+        username,
+        aws_creds_dir,
+        mitm_dir,
         debug_host_dir,
-        oauth_creds_path,
     )
 
     sigv4_routes: dict[str, dict] = {}
@@ -224,10 +203,8 @@ def run(session: Session, args: argparse.Namespace) -> None:
     rules_secret = resolve_rules(
         args.rules,
         args.no_default_rules,
-        args.auth_mode,
+        agent,
         sigv4_routes,
-        anthropic_oauth_token=oauth_token,
-        bedrock_bearer_token=bedrock_token,
     )
     session.secrets.append(rules_secret)
 
@@ -256,19 +233,24 @@ def run(session: Session, args: argparse.Namespace) -> None:
                 profile,
                 real_aws_creds_secrets[profile].bind_source,
             )
-    start_claude_container(
+
+    start_agent_container(
         session,
-        args.claude_image,
-        cwd,
-        claude_mounts,
+        agent.name,
+        agent.image,
+        agent_mounts,
+        agent.container_env(cwd, args.debug),
         args.runtime,
-        args.debug,
+        agent.memory(),
     )
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
+
+    agent_cls = AGENTS[args.agent_name]
+    agent = agent_cls(args)
 
     session = Session.create(STATE_DIR)
 
@@ -278,7 +260,7 @@ def main() -> None:
 
     exit_code = 0
     try:
-        run(session, args)
+        run(session, args, agent)
     except Exception:
         LOGGER.fatal("agent-uplink failed", exc_info=True)
         exit_code = 1
