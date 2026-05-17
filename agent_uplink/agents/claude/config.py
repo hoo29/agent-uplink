@@ -36,13 +36,14 @@ def refresh_anthropic_oauth_if_expiring(threshold_seconds: int = 300) -> None:
     if seconds_left > threshold_seconds:
         return
     LOGGER.info("refreshing claude oauth token")
-    raise Exception("token refresh not working, manually start claude on host")
-    run_command(["claude", "auth", "status", "--json"])
+    run_command(["claude", "-p", "noop"])
 
 
 def read_anthropic_oauth_credentials() -> dict:
     """Return host's ~/.claude/.credentials.json contents. Raises if missing."""
-    return json.loads((HOST_CLAUDE_DIR / ".credentials.json").read_text(encoding="utf8"))
+    return json.loads(
+        (HOST_CLAUDE_DIR / ".credentials.json").read_text(encoding="utf8")
+    )
 
 
 def fake_oauth_credentials_bytes(real_creds: dict) -> tuple[bytes, str]:
