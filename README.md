@@ -2,7 +2,8 @@
 
 Run a coding agent in a Kata-containers microVM on a local k3s cluster with no direct network access. All outbound traffic is routed through a mitmproxy pod that enforces an allow-list and can inject credentials from your OS keyring, so secrets never enter the agent pod.
 
-Agent-agnostic by design: the orchestration (mitmproxy, AWS SigV4 sidecars, K8s manifest assembly, NetworkPolicy perimeter, session cleanup) is generic, and each agent (currently just Claude) is a small subclass that owns its image, auth flow, and volume layout. Add a new agent by dropping a directory under `agent_uplink/agents/<name>/` — see [Adding an agent](#adding-an-agent).
+Agent-agnostic by design: the orchestration (mitmproxy, AWS SigV4 sidecars, K8s manifest assembly, NetworkPolicy perimeter, session cleanup) is generic, and each agent (currently just Claude)
+is a small subclass that owns its image, auth flow, and volume layout. Add a new agent by dropping a directory under `agent_uplink/agents/<name>/` — see [Adding an agent](#adding-an-agent).
 
 AWS requests get the same treatment via SigV4 re-signing: the pod holds only dummy AWS credentials, and mitmproxy reroutes signed AWS requests to an `aws-sigv4-proxy` pod (one per profile) that re-signs with the real keys kept in a K8s Secret. See [AWS profiles](#aws-profiles).
 
@@ -63,7 +64,7 @@ pip install -e .
 
 Requires `kubectl`, `docker`, and Python 3.10+ on `PATH`. `aws` CLI is needed only for `--aws-profiles`. Run from inside your home directory.
 
-You also need a k3s (or compatible) cluster reachable via `kubectl`, with the `kata-qemu` RuntimeClass installed (`kubectl get runtimeclass kata-qemu`).
+You also need a k3s (or compatible) cluster reachable via `kubectl`, with a kata RuntimeClass installed. The default is `kata-clh` (Cloud Hypervisor); `kata-qemu` and `kata-fc` work too — `kubectl get runtimeclass` to see what's installed.
 
 ### One-time k3s setup for the local registry
 
@@ -121,12 +122,10 @@ Anthropic mode refreshes `~/.claude/.credentials.json` on the host when the OAut
 Only the agent pod runs in a microVM by default; the support pods (mitm, sigv4) use the cluster default runtime under a hardened security context. Trade speed against isolation per component:
 
 ```bash
---agent-runtime-class kata-qemu   # default; flip to kata-fc or '' to disable
+--agent-runtime-class kata-clh    # default; flip to kata-qemu, kata-fc, or '' to disable
 --mitm-runtime-class ''           # default '' = cluster default (e.g. crun)
 --sigv4-runtime-class ''          # default '' = cluster default
 ```
-
-Pushing `--mitm-runtime-class kata-qemu` adds ~10s of cold-start latency but isolates the mitm pod inside its own VM too. Worth it if you don't trust the mitm image or addon.
 
 ## Rules
 
@@ -187,24 +186,21 @@ The CLI will pick up the new agent as a subcommand automatically.
 
 ## Security posture
 
-Designed to contain rogue AI behaviour, not to defend against a determined attacker with a Kata-qemu escape.
+Designed to contain rogue AI behaviour.
 
-The agent pod has:
-- `runtimeClassName: kata-qemu` (microVM isolation)
-- `securityContext.capabilities.drop=[ALL]`
-- `readOnlyRootFilesystem=true`
-- `allowPrivilegeEscalation=false`
-- `runAsNonRoot=true`, `runAsUser=<host uid>`
-- `seccompProfile=RuntimeDefault`
-- `NetworkPolicy` egress restricted to `mitm:8080` and `kube-dns`
+The claude pod runs as privileged but it is within the kata VM. The agent pod hosts a nested `dockerd` so the agent can spin up testcontainers or any other Docker workload. 
+
+NetworkPolicies restrict traffic from the agent pod but not everything is funnelled through the proxy. DNS is allowed and NetworkPolicies cannot restrict Pod -> Host where pod is running traffic.
 
 Writable areas inside the agent pod are explicit `emptyDir` mounts with `medium: Memory` (effectively tmpfs):
 
-| Path in container | Size |
-| --- | --- |
-| `/tmp` | 200Mi |
-| `~/.claude/` | 200Mi |
-| `~/.local/share/applications/` | 16Mi |
+| Path in container | Size | Purpose |
+| --- | --- | --- |
+| `/tmp` | 200Mi | |
+| `~/.claude/` | 200Mi | |
+| `~/.local/share/applications/` | 16Mi | |
+| `/var/lib/docker` | 2Gi | nested `dockerd` image + container storage |
+| `/run` | 64Mi | nested `dockerd` socket + pidfile |
 
 These host paths are bind-mounted writable (`hostPath`), because Claude state needs to persist across sessions:
 
@@ -216,5 +212,3 @@ These host paths are bind-mounted writable (`hostPath`), because Claude state ne
 | `~/.claude/history.jsonl` | shell history (if present) |
 
 Everything else under `~/.claude/` (`settings.json`, `CLAUDE.md`, `commands/`, `skills/`) is mounted from a K8s `Secret` (settings/creds) or a read-only `hostPath` (CLAUDE.md, commands, skills).
-
-Support pods (mitm, sigv4) run with the same hardened container security context but the cluster default runtime. The NetworkPolicy perimeter contains them.

@@ -57,20 +57,25 @@ class ClaudeAgent(Agent):
     @classmethod
     def add_cli_args(cls, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
-            "-i", "--image",
+            "-i",
+            "--image",
             type=str,
             default=cls.default_image_repo(),
             help="Claude image repo (registry endpoint + :tag added by orchestrator)",
         )
         mode_group = parser.add_mutually_exclusive_group(required=True)
         mode_group.add_argument(
-            "--anthropic", dest="auth_mode",
-            action="store_const", const="anthropic",
+            "--anthropic",
+            dest="auth_mode",
+            action="store_const",
+            const="anthropic",
             help="Configure container for anthropic OAuth auth",
         )
         mode_group.add_argument(
-            "--bedrock", dest="auth_mode",
-            action="store_const", const="bedrock",
+            "--bedrock",
+            dest="auth_mode",
+            action="store_const",
+            const="bedrock",
             help="Configure container for AWS Bedrock bearer-token auth",
         )
 
@@ -107,19 +112,27 @@ class ClaudeAgent(Agent):
         if self._auth_mode == "anthropic":
             if self._oauth_token is None:
                 raise RuntimeError("prepare() was not called")
-            return [{
-                "name": "anthropic-auth",
-                "host": r"api\.anthropic\.com",
-                "inject": {"headers": {"Authorization": f"Bearer {self._oauth_token}"}},
-            }]
+            return [
+                {
+                    "name": "anthropic-auth",
+                    "host": r"api\.anthropic\.com",
+                    "inject": {
+                        "headers": {"Authorization": f"Bearer {self._oauth_token}"}
+                    },
+                }
+            ]
         if self._auth_mode == "bedrock":
             if self._bedrock_token is None:
                 raise RuntimeError("prepare() was not called")
-            return [{
-                "name": "bedrock-auth",
-                "host": r"bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com",
-                "inject": {"headers": {"Authorization": f"Bearer {self._bedrock_token}"}},
-            }]
+            return [
+                {
+                    "name": "bedrock-auth",
+                    "host": r"bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com",
+                    "inject": {
+                        "headers": {"Authorization": f"Bearer {self._bedrock_token}"}
+                    },
+                }
+            ]
         return []
 
     def secret_payloads(self) -> dict[str, dict[str, bytes]]:
@@ -152,44 +165,58 @@ class ClaudeAgent(Agent):
             tmpfs_volume("claude-home", "200Mi"),
             secret_volume("settings", _SETTINGS_SECRET),
             hostpath_volume("workdir", str(cwd)),
-            hostpath_volume("claude-projects", str(host_project_dir),
-                            hp_type="DirectoryOrCreate"),
-            hostpath_volume("claude-json-host", str(Path.home() / ".claude.json"),
-                            hp_type="FileOrCreate"),
+            hostpath_volume(
+                "claude-projects", str(host_project_dir), hp_type="DirectoryOrCreate"
+            ),
+            hostpath_volume(
+                "claude-json-host",
+                str(Path.home() / ".claude.json"),
+                hp_type="FileOrCreate",
+            ),
         ]
 
         mounts: list[dict] = [
             {"name": "tmp", "mountPath": "/tmp"},
-            {"name": "xdg-apps",
-             "mountPath": f"{container_home}/.local/share/applications"},
+            {
+                "name": "xdg-apps",
+                "mountPath": f"{container_home}/.local/share/applications",
+            },
             {"name": "claude-home", "mountPath": claude_dir},
-            {"name": "settings",
-             "mountPath": f"{claude_dir}/settings.json",
-             "subPath": "settings.json",
-             "readOnly": True},
+            {
+                "name": "settings",
+                "mountPath": f"{claude_dir}/settings.json",
+                "subPath": "settings.json",
+                "readOnly": True,
+            },
             {"name": "workdir", "mountPath": str(cwd)},
-            {"name": "claude-projects",
-             "mountPath": f"{claude_dir}/projects/{project_id}"},
+            {
+                "name": "claude-projects",
+                "mountPath": f"{claude_dir}/projects/{project_id}",
+            },
             {"name": "claude-json-host", "mountPath": f"{container_home}/.claude.json"},
         ]
 
         if self._fake_creds is not None:
             volumes.append(secret_volume("fake-creds", _FAKE_CREDS_SECRET))
-            mounts.append({
-                "name": "fake-creds",
-                "mountPath": f"{claude_dir}/.credentials.json",
-                "subPath": ".credentials.json",
-                "readOnly": True,
-            })
+            mounts.append(
+                {
+                    "name": "fake-creds",
+                    "mountPath": f"{claude_dir}/.credentials.json",
+                    "subPath": ".credentials.json",
+                    "readOnly": True,
+                }
+            )
 
         if aws_creds_secret_name is not None:
             volumes.append(secret_volume("aws-creds", aws_creds_secret_name))
-            mounts.append({
-                "name": "aws-creds",
-                "mountPath": f"{container_home}/.aws/credentials",
-                "subPath": "credentials",
-                "readOnly": True,
-            })
+            mounts.append(
+                {
+                    "name": "aws-creds",
+                    "mountPath": f"{container_home}/.aws/credentials",
+                    "subPath": "credentials",
+                    "readOnly": True,
+                }
+            )
 
         for name in ["CLAUDE.md", "commands", "skills", "history.jsonl"]:
             host_path = HOST_CLAUDE_DIR / name
@@ -198,21 +225,74 @@ class ClaudeAgent(Agent):
             vol_name = f"claude-{name.replace('.', '-').lower()}"
             hp_type = "Directory" if host_path.is_dir() else "File"
             volumes.append(hostpath_volume(vol_name, str(host_path), hp_type=hp_type))
-            mounts.append({
-                "name": vol_name,
-                "mountPath": f"{claude_dir}/{name}",
-                "readOnly": name != "history.jsonl",
-            })
+            mounts.append(
+                {
+                    "name": vol_name,
+                    "mountPath": f"{claude_dir}/{name}",
+                    "readOnly": name != "history.jsonl",
+                }
+            )
+
+        # /var/lib/docker: tmpfs emptyDir. Disk-backed emptyDir lands on
+        # kata's virtio-fs, which the kernel won't accept as an overlayfs
+        # upperdir (EINVAL). tmpfs supports overlay natively. Cost: image
+        # layers + container rootfs are held in pod memory (see memory()).
+        # /run: tmpfs for the docker socket + pidfile. RoFS stays on; these
+        # are the only writable paths dockerd touches.
+        volumes.append(tmpfs_volume("docker-lib", "2Gi"))
+        volumes.append(tmpfs_volume("run", "64Mi"))
+        mounts.append({"name": "docker-lib", "mountPath": "/var/lib/docker"})
+        mounts.append({"name": "run", "mountPath": "/run"})
 
         if debug_host_dir is not None:
             volumes.append(
-                hostpath_volume("claude-debug", str(debug_host_dir),
-                                hp_type="DirectoryOrCreate")
+                hostpath_volume(
+                    "claude-debug", str(debug_host_dir), hp_type="DirectoryOrCreate"
+                )
             )
             mounts.append({"name": "claude-debug", "mountPath": f"{claude_dir}/debug"})
 
         return volumes, mounts
 
-    def container_command(self, debug: bool) -> list[str]:
-        flag = "-d --dangerously-skip-permissions" if debug else "--dangerously-skip-permissions"
-        return ["bash", "-lc", f'cd "$WORKDIR" && exec claude {flag}']
+    def memory(self) -> str:
+        # tmpfs /var/lib/docker counts against this; default 1Gi can't hold
+        # even a small image alongside the agent process.
+        return "4Gi"
+
+    def container_security_context(self, uid: int, gid: int) -> dict:
+        # dockerd needs to manage iptables, cgroups, namespaces, mounts —
+        # privileged + root + unconfined seccomp is the minimum. PID 1 runs
+        # as root (image has no USER directive); the entrypoint launches
+        # dockerd then drops to ${USERNAME}. RoFS is preserved; everything
+        # dockerd writes to lives under emptyDir mounts added by
+        # volumes_and_mounts(). The grant is bounded by the Kata guest
+        # kernel — the host kernel is unaffected.
+        return {
+            "privileged": True,
+            "readOnlyRootFilesystem": True,
+            "allowPrivilegeEscalation": True,
+            "seccompProfile": {"type": "Unconfined"},
+        }
+
+    def container_init_command(self) -> list[str]:
+        return ["/usr/local/bin/dockerd-entrypoint.sh"]
+
+    def container_command(self, username: str, debug: bool) -> list[str]:
+        flag = (
+            "-d --dangerously-skip-permissions"
+            if debug
+            else "--dangerously-skip-permissions"
+        )
+        # PID 1 runs as root so it can start dockerd; drop to the agent user
+        # for the interactive session. runuser re-initialises HOME/USER/groups
+        # to the target user (including the `docker` group, so the socket is
+        # usable) without needing PAM.
+        return [
+            "runuser",
+            "-u",
+            username,
+            "--",
+            "bash",
+            "-lc",
+            f'cd "$WORKDIR" && exec claude {flag}',
+        ]

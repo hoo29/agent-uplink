@@ -1,0 +1,5 @@
+k8sDistribution: k3s
+shims:
+  disableAll: true
+  clh:
+    enabled: true
