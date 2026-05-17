@@ -21,7 +21,7 @@ flowchart LR
     end
 
     subgraph session_ns["agent-uplink-&lt;id&gt; (per-session)"]
-        subgraph agent_pod["Pod: agent (kata-qemu)"]
+        subgraph agent_pod["Pod: agent (kata-clh)"]
             agent["agent CLI"]
         end
         subgraph mitm_pod["Pod: mitm"]
