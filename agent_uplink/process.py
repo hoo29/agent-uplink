@@ -1,5 +1,4 @@
 import logging
-import socketserver
 import subprocess
 
 LOGGER = logging.getLogger("agent-uplink")
@@ -8,6 +7,7 @@ LOGGER = logging.getLogger("agent-uplink")
 def run_command(
     command: list[str],
     *,
+    stdin: bytes | None = None,
     stdout: int | None = subprocess.PIPE,
     stderr: int | None = subprocess.PIPE,
     raise_error: bool = True,
@@ -15,6 +15,7 @@ def run_command(
     LOGGER.debug(f"running {command}")
     res = subprocess.run(
         command,
+        input=stdin,
         stdout=stdout,
         stderr=stderr,
         check=False,
@@ -24,22 +25,14 @@ def run_command(
     if res.returncode != 0:
         if raise_error:
             raise OSError(
-                f"command failed with exit code {res.returncode}. Stderr: {stderr_d}"
+                f"command failed ({command[0]} exit={res.returncode}). stderr: {stderr_d}"
             )
         return ""
     return stdout_d
 
 
-def run_command_background(command: list[str]) -> subprocess.Popen:
-    LOGGER.debug(f"running {command} (background)")
-    return subprocess.Popen(
-        command,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def get_free_port() -> int:
-    with socketserver.TCPServer(("localhost", 0), None) as s:  # type: ignore
-        # something else could nab this port before we use it but see how we go
-        return s.server_address[1]
+def run_interactive(command: list[str]) -> int:
+    """Run a command attached to the parent's stdio (no piping). Returns exit code."""
+    LOGGER.debug(f"running interactive {command}")
+    res = subprocess.run(command, check=False)
+    return res.returncode

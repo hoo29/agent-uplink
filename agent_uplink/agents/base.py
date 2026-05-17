@@ -12,28 +12,29 @@ from ..session import Session
 
 
 class Agent(ABC):
-    """Base class for an agent that runs inside agent-uplink's container sandbox.
+    """Base class for an agent that runs inside agent-uplink's microVM sandbox.
 
     A concrete Agent owns:
-      - The container image (Dockerfile + entrypoint + default rules) under its
-        own package directory.
+      - The container image (Dockerfile + default rules) under its own
+        package directory.
       - Per-mode auth resolution and the host-side credential dance.
-      - The set of host files bind-mounted into its container.
-      - Any auth rules that need to be injected at the mitmproxy layer.
+      - The set of K8s Secrets, volumes, and volumeMounts the agent pod needs.
+      - Any auth rules the mitmproxy layer must inject.
 
-    Generic concerns (mitmproxy cert generation, AWS sigv4 sidecars, locked
-    secret allocation, the docker network, session lifecycle) live outside
-    subclasses and are wired together by `agent_uplink.cli`.
+    Generic concerns (mitmproxy lifecycle, aws-sigv4-proxy sidecars, registry
+    bootstrap, namespace lifecycle, NetworkPolicy) live outside subclasses and
+    are wired together by `agent_uplink.cli`.
 
     Lifecycle (called by the CLI in order):
-      1. add_cli_args(parser)              — classmethod, registers subparser flags
-      2. __init__(args)                    — capture parsed args
-      3. discover_aws_profiles()           — extra AWS profiles to spin sidecars for
-      4. resolve_auth(session)             — host-side auth (refresh OAuth, read keyring)
-      5. write_session_files(session, ...) — settings.json / dummy creds into session dir
-      6. auth_rules()                      — mitmproxy rules for this agent's API
-      7. build_mounts(...)                 — list of `-v` / `--tmpfs` flags
-      8. container_env(...)                — `-e` env vars
+      1. add_cli_args(parser)         — classmethod, registers subparser flags
+      2. __init__(args)               — capture parsed args
+      3. discover_aws_profiles()      — extra AWS profiles to spin sidecars for
+      4. prepare(session, profiles)   — host-side auth + in-memory config bytes
+      5. auth_rules()                 — mitm rules for this agent's API
+      6. secret_payloads()            — per-agent K8s Secrets {name: {file: bytes}}
+      7. volumes_and_mounts(...)      — pod volumes + volumeMounts
+      8. container_env(...)           — agent-specific env vars
+      9. container_command(debug)     — argv for `kubectl exec`
     """
 
     name: ClassVar[str]
@@ -48,19 +49,18 @@ class Agent(ABC):
 
     @classmethod
     def container_dir(cls) -> Path:
-        """Directory containing Dockerfile, entrypoint.sh, default_rules.yaml,
-        and any cert directory the agent's image build needs."""
+        """Directory containing Dockerfile, default_rules.yaml, etc."""
         return Path(inspect.getfile(cls)).resolve().parent
 
     @classmethod
-    def default_image(cls) -> str:
+    def default_image_repo(cls) -> str:
+        """Image *repo* (not the full localhost:5000/... ref). The orchestrator
+        prepends the registry endpoint and appends the tag."""
         return f"agent-uplink-{cls.name}"
 
     @property
-    def image(self) -> str:
-        """Image name; subclasses can override via an `--image` flag whose
-        parsed value lives at `args.image`."""
-        return getattr(self.args, "image", None) or self.default_image()
+    def image_repo(self) -> str:
+        return getattr(self.args, "image", None) or self.default_image_repo()
 
     @classmethod
     def default_rules(cls) -> list[dict]:
@@ -73,50 +73,44 @@ class Agent(ABC):
         return list(data.get("rules") or [])
 
     def memory(self) -> str:
-        """Memory limit for the agent container (docker --memory value)."""
-        return "1g"
+        return "1Gi"
 
     @abstractmethod
     def discover_aws_profiles(self) -> list[str]:
-        """AWS profiles the agent needs in addition to `--aws-profiles`.
-
-        Typically derived from the agent's own config (e.g. Claude reads
-        `env.AWS_PROFILE` from ~/.claude/settings.json in bedrock mode). Return
-        [] if none."""
+        """AWS profiles the agent needs in addition to `--aws-profiles`."""
 
     @abstractmethod
-    def resolve_auth(self, session: Session) -> None:
-        """Host-side auth: refresh tokens, read keyring, write any fake
-        credential files into `session.session_dir`. State produced here should
-        be stashed on `self` for the later hooks to consume."""
-
-    @abstractmethod
-    def write_session_files(
-        self,
-        session: Session,
-        aws_profile_names: list[str],
-    ) -> None:
-        """Write per-session config files (e.g. settings.json) into
-        `session.session_dir`. Called after `resolve_auth` and after AWS
-        profiles have been finalised, so settings can reference them."""
+    def prepare(self, session: Session, aws_profile_names: list[str]) -> None:
+        """Host-side prep: refresh OAuth, read keyring, produce in-memory
+        bytes for settings/credentials. Stash anything later methods need
+        on `self`."""
 
     @abstractmethod
     def auth_rules(self) -> list[dict]:
-        """mitmproxy rules that inject this agent's auth header(s). Typically
-        a single header-injection rule per provider endpoint."""
+        """mitm rules injecting this agent's auth header(s)."""
 
     @abstractmethod
-    def build_mounts(
+    def secret_payloads(self) -> dict[str, dict[str, bytes]]:
+        """K8s Secrets this agent needs, keyed by secret name. Values are
+        maps of filename → contents. The orchestrator creates these in the
+        session namespace before the pod starts."""
+
+    @abstractmethod
+    def volumes_and_mounts(
         self,
-        session: Session,
         cwd: Path,
         username: str,
-        aws_creds_dir: Path | None,
-        mitm_dir: Path,
+        aws_creds_secret_name: str | None,
         debug_host_dir: Path | None,
-    ) -> list[str]:
-        """`-v ...` / `--tmpfs ...` flags for the agent container."""
+    ) -> tuple[list[dict], list[dict]]:
+        """Pod-spec `volumes` and the container's `volumeMounts`."""
 
-    @abstractmethod
     def container_env(self, cwd: Path, debug: bool) -> dict[str, str]:
-        """Env vars to inject via `docker run -e KEY=VALUE`."""
+        """Agent-specific env vars. Universal vars (HTTPS_PROXY, WORKDIR,
+        USERNAME) are set by the orchestrator."""
+        return {}
+
+    def container_command(self, debug: bool) -> list[str]:
+        """Argv for `kubectl exec -it agent -- ...`. Override to launch your
+        CLI directly; default drops into an interactive bash."""
+        return ["bash", "-l"]

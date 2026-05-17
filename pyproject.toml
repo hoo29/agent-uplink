@@ -39,6 +39,5 @@ agent_uplink = ["default_rules.yaml"]
 "agent_uplink.agents.claude" = [
     "default_rules.yaml",
     "Dockerfile",
-    "entrypoint.sh",
     "certs/*",
 ]
