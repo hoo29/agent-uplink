@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-**agent-uplink** runs a coding agent in a Kata-containers microVM on a local k3s cluster with all outbound traffic intercepted by mitmproxy. The agent pod has its egress restricted by a `NetworkPolicy` to the mitmproxy service only; the microVM boundary (`runtimeClassName: kata-qemu`) gives defence in depth on top of the cluster network. Support pods (mitm, aws-sigv4-proxy) run with the cluster's default runtime under hardened security contexts.
+**agent-uplink** runs a coding agent in a Kata-containers microVM on a local k3s cluster with all outbound traffic intercepted by mitmproxy. The agent pod has its egress restricted by a `NetworkPolicy` to the mitmproxy service only; the microVM boundary (`runtimeClassName: kata-clh`) gives defence in depth on top of the cluster network. Support pods (mitm, aws-sigv4-proxy) run with the cluster's default runtime under hardened security contexts.
+
+The microVM also exists to make Docker-in-Docker viable: the agent container runs a nested `dockerd` so the agent can spin up testcontainers and other Docker workloads while debugging tests. The earlier "Claude in a plain Docker container" design couldn't host that. The cost is that the agent container itself runs `privileged`, root, `seccompProfile=Unconfined` *inside* the kata guest — the kata guest kernel is the trust boundary, not the in-container hardening that the support pods retain.
 
 It is **agent-agnostic by design** — agent-specific bits (image, auth, config files, default rules) live behind an `Agent` interface in `agent_uplink/agents/`. Currently only `claude` is implemented; new agents are added by dropping a directory in `agent_uplink/agents/<name>/` and registering it in `agent_uplink/agents/__init__.py`.
 
@@ -25,8 +27,8 @@ agent-uplink claude --anthropic --image my-image
 agent-uplink claude --anthropic --mitmproxy-image mitmproxy/mitmproxy:latest
 agent-uplink claude --anthropic --rules examples/rules/atlassian.yaml
 agent-uplink claude --anthropic --rules my.yaml --no-default-rules
-agent-uplink claude --anthropic --agent-runtime-class kata-fc   # override default kata-qemu
-agent-uplink claude --anthropic --mitm-runtime-class kata-qemu  # microVM mitm too (slower)
+agent-uplink claude --anthropic --agent-runtime-class kata-qemu  # override default kata-clh
+agent-uplink claude --anthropic --mitm-runtime-class kata-clh    # microVM mitm too (slower)
 agent-uplink claude --anthropic --debug
 
 # Tests (no tests exist yet, but the runner is)
@@ -36,7 +38,7 @@ pytest
 **Runtime requirements** (must be on PATH): `kubectl`, `docker` (for build + push). `aws` CLI is needed only when `--aws-profiles` is used or when an agent's own config resolves an additional AWS profile (e.g. `claude --bedrock` reads `env.AWS_PROFILE` from `settings.json`).
 
 **Cluster requirements**:
-- A reachable k3s (or compatible) cluster with the `kata-qemu` RuntimeClass installed (`kubectl get runtimeclass`).
+- A reachable k3s (or compatible) cluster with a kata RuntimeClass installed (default is `kata-clh`; `kata-qemu` and `kata-fc` work too — `kubectl get runtimeclass`).
 - A local registry pod (auto-deployed on first run to namespace `agent-uplink-system`) reachable from both the host and the cluster nodes at `localhost:5000`.
 - A one-time `/etc/rancher/k3s/registries.yaml` config that tells containerd `localhost:5000` is insecure. `agent-uplink` will print the exact `sudo` commands if missing.
 
@@ -60,7 +62,8 @@ Every run creates a namespace `agent-uplink-<id>` containing:
 ```
               ┌───────────── agent-uplink-<id> ─────────────┐
               │                                             │
-              │  Pod: agent (kata-qemu)                     │
+              │  Pod: agent (kata-clh, privileged for DinD) │
+              │    PID 1: dockerd-entrypoint.sh             │
               │    HTTPS_PROXY=http://mitm:8080             │
               │    NetworkPolicy: egress → mitm + kube-dns  │
               │                       │                     │
@@ -99,16 +102,16 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 12. `agent.secret_payloads()` — any agent-specific Secrets (`claude-settings`, `claude-fake-creds` in anthropic mode).
 13. Assemble the full manifest set: namespace, ConfigMap (mitm-addon), Secrets, NetworkPolicies (default-deny + agent-egress + mitm-policy + sigv4-policy), mitm Pod + Service, one sigv4 Pod + Service per profile, agent Pod.
 14. `kubectl apply -f -` for everything in one call.
-15. Wait for support pods Ready, then agent pod Ready (Kata cold start is the long pole).
-16. `kubectl exec -it agent -- <agent.container_command(debug)>` — usually `bash -lc 'cd "$WORKDIR" && exec claude ...'`.
+15. Wait for support pods Ready, then agent pod Ready (Kata cold start + nested `dockerd` warmup is the long pole).
+16. `kubectl exec -it agent -- <agent.container_command(debug)>` — for Claude: `runuser -u <username> -- bash -lc 'cd "$WORKDIR" && exec claude --dangerously-skip-permissions'`. PID 1 (`dockerd-entrypoint.sh`) is root so it can start the nested `dockerd` and chgrp the socket; `runuser` drops the interactive session to the host UID so hostPath writes land as the host user.
 17. On exit / SIGINT / SIGTERM: `kubectl delete ns <id> --wait=false` and `rmtree(session_dir)`. The cluster finishes the cascade in the background.
 
 ### Key constraints
 
 - **Working directory**: `agent-uplink` must be run from within `/home/<USER>/` (validated in Python).
 - **Image rebuild triggers**: rebuild + push whenever mitm certs are newly generated, `--force-rebuild` is passed, the image doesn't exist locally, or it's older than `AGENT_IMAGE_MAX_AGE_SECONDS` (24 h).
-- **Security posture (agent pod)**: `runtimeClassName: kata-qemu` (microVM isolation), `securityContext.capabilities.drop=[ALL]`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation=false`, `seccompProfile=RuntimeDefault`, `runAsNonRoot=true`, `runAsUser=<host uid>`, NetworkPolicy egress only to `mitm:8080` + `kube-dns`. Memory 1Gi, CPU 1.
-- **Security posture (mitm / sigv4 pods)**: same hardened container security context but cluster default runtime (faster cold start). Egress isolation enforced by NetworkPolicy. Memory 512Mi / 128Mi, CPU 1 / 0.5.
+- **Security posture (agent pod)**: `runtimeClassName: kata-clh` (microVM isolation; `kata-qemu` / `kata-fc` selectable via `--agent-runtime-class`). Container runs `privileged=true`, `allowPrivilegeEscalation=true`, `seccompProfile=Unconfined`, PID 1 as root — required so the nested `dockerd` can manage cgroups/namespaces/mounts/iptables inside the guest. `readOnlyRootFilesystem=true` is preserved; every path `dockerd` writes to is an explicit emptyDir mount (`/var/lib/docker` 2Gi tmpfs, `/run` 64Mi tmpfs, plus the usual `/tmp`, `~/.claude/`, `~/.local/share/applications/`). The interactive session drops to the host UID via `runuser` in `container_command`. NetworkPolicy egress restricted to `mitm:8080` + `kube-dns`. Memory 10Gi (drives tmpfs `/var/lib/docker` — disk-backed emptyDir would land on kata virtio-fs, which the kernel rejects as an overlay upperdir), CPU 1. Trust boundary is the kata guest kernel.
+- **Security posture (mitm / sigv4 pods)**: full hardened container security context (`drop=[ALL]`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation=false`, `runAsNonRoot=true`, `seccompProfile=RuntimeDefault`) under the cluster default runtime (faster cold start). Egress isolation enforced by NetworkPolicy. Memory 512Mi / 128Mi, CPU 1 / 0.5.
 
 ### Module layout
 
@@ -126,10 +129,11 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 | `agent_uplink/mitm_addon/filter.py` | mitmproxy addon — enforces allow-list, injects pre-resolved headers, reroutes AWS SigV4 requests to sidecar services by dummy AKIA (stdlib only) |
 | `agent_uplink/agents/__init__.py` | `AGENTS` registry keyed by agent name |
 | `agent_uplink/agents/base.py` | `Agent` ABC — interface every agent implements |
-| `agent_uplink/agents/claude/agent.py` | `ClaudeAgent`: per-mode auth, K8s volumes/mounts, container command |
+| `agent_uplink/agents/claude/agent.py` | `ClaudeAgent`: per-mode auth, K8s volumes/mounts, privileged-for-DinD security context, container command |
 | `agent_uplink/agents/claude/config.py` | Claude host-side helpers: OAuth refresh, fake-creds bytes, settings.json bytes |
 | `agent_uplink/agents/claude/default_rules.yaml` | Claude-specific allow rules (Datadog logs, changelog, downloads) |
-| `agent_uplink/agents/claude/Dockerfile` | Claude container image (Ubuntu 24.04, Claude CLI, AWS CLI v2, dev tools, baked mitm CA) |
+| `agent_uplink/agents/claude/Dockerfile` | Claude container image (Ubuntu 24.04, Claude CLI, AWS CLI v2, Docker engine for DinD, dev tools, baked mitm CA) |
+| `agent_uplink/agents/claude/dockerd-entrypoint.sh` | Agent pod PID 1: starts nested `dockerd`, chgrp's the socket, then drops to `sleep infinity` as the agent user |
 | `agent_uplink/agents/claude/certs/` | Runtime-generated mitm certs (gitignored, copied in at image build) |
 
 ## Adding a new agent

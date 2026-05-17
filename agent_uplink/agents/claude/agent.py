@@ -257,7 +257,7 @@ class ClaudeAgent(Agent):
     def memory(self) -> str:
         # tmpfs /var/lib/docker counts against this; default 1Gi can't hold
         # even a small image alongside the agent process.
-        return "10Gi"
+        return "4Gi"
 
     def container_security_context(self, uid: int, gid: int) -> dict:
         # dockerd needs to manage iptables, cgroups, namespaces, mounts —

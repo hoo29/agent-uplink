@@ -71,5 +71,3 @@ ENV NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/mitmproxy-ca-cert.crt
 ENV AWS_CA_BUNDLE=/usr/local/share/ca-certificates/mitmproxy-ca-cert.crt
 ENV PATH="$PATH:/home/${USERNAME}/.local/bin"
 ENV USERNAME=${USERNAME}
-
-CMD ["/usr/local/bin/dockerd-entrypoint.sh"]
