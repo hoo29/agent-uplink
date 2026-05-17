@@ -1,16 +1,14 @@
 """AWS profile helpers shared by all agents.
 
-Real AWS credentials live on the host and are passed to per-profile
-`aws-sigv4-proxy` sidecars via mlock'd `/dev/shm` files (see secret.py).
-The agent container only sees dummy values, deterministically derived per
-profile so the mitm addon can map a signed request back to a sidecar by
-the AKIA in its `Authorization` header.
+Real AWS credentials live on the host and ride into per-profile
+`aws-sigv4-proxy` sidecar pods as K8s Secrets mounted at
+`/aws/credentials`. The agent container only sees deterministic dummy
+values per profile, derived so the mitm addon can map a signed request
+back to a sidecar by the AKIA in its `Authorization` header.
 """
 
 import hashlib
 import logging
-import os
-from pathlib import Path
 
 from .process import run_command
 
@@ -29,13 +27,8 @@ def export_aws_profile_env(profile_name: str) -> dict[str, str]:
     export fails, then retries.
     """
     cmd = [
-        "aws",
-        "configure",
-        "export-credentials",
-        "--format",
-        "env-no-export",
-        "--profile",
-        profile_name,
+        "aws", "configure", "export-credentials",
+        "--format", "env-no-export", "--profile", profile_name,
     ]
     try:
         creds_raw = run_command(cmd)
@@ -54,10 +47,8 @@ def export_aws_profile_env(profile_name: str) -> dict[str, str]:
 def real_aws_credentials_ini(profile_name: str, env: dict[str, str]) -> bytes:
     """Build a shared-credentials-file (INI) blob for one profile.
 
-    Used to feed real creds to an aws-sigv4-proxy sidecar via a mlock'd
-    /dev/shm bind-mount instead of `docker run -e ...`. Env vars on a
-    container are readable by any host user with docker access via
-    `docker inspect` and stick around in /proc/<pid>/environ.
+    Wrapped in a K8s Secret and mounted into the matching aws-sigv4-proxy
+    sidecar at /aws/credentials.
     """
     key_map = {
         "AWS_ACCESS_KEY_ID": "aws_access_key_id",
@@ -82,18 +73,16 @@ def dummy_akia(profile_name: str) -> str:
     return f"AKIA{suffix}"
 
 
-def write_dummy_aws_credentials(
-    aws_profile_names: list[str], aws_dir: Path
-) -> tuple[Path | None, dict[str, str]]:
-    """Write fake AWS creds for an agent container; return (mount dir, profile→akia).
+def dummy_aws_credentials_ini(
+    aws_profile_names: list[str],
+) -> tuple[bytes, dict[str, str]]:
+    """Build the dummy `~/.aws/credentials` INI for the agent container.
 
-    The container uses these dummy values to sign requests; mitmproxy strips
-    the bogus signature and routes to an aws-sigv4-proxy sidecar that re-signs
-    with the real credentials kept on the host.
+    Returns (ini_bytes, profile_to_akia). When `aws_profile_names` is empty,
+    returns (b"", {}) so the caller can skip creating the Secret entirely.
     """
     if not aws_profile_names:
-        return None, {}
-    LOGGER.info("writing dummy aws credentials for container")
+        return b"", {}
     profile_to_akia: dict[str, str] = {}
     lines: list[str] = []
     for profile_name in aws_profile_names:
@@ -103,14 +92,12 @@ def write_dummy_aws_credentials(
         lines.append(f"aws_access_key_id = {akia}")
         lines.append(f"aws_secret_access_key = {_DUMMY_SECRET}")
         lines.append("")
-    path = aws_dir / "credentials"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write("\n".join(lines))
-    return aws_dir, profile_to_akia
+    return "\n".join(lines).encode(), profile_to_akia
 
 
-def sanitize_profile_for_container_name(profile: str) -> str:
-    """Container names allow [a-zA-Z0-9_.-]; AWS profile names allow more,
-    so sanitize defensively before using a profile name in a container name."""
-    return "".join(c if c.isalnum() or c in "._-" else "-" for c in profile)
+def sanitize_profile_for_k8s_name(profile: str) -> str:
+    """RFC 1123 label rules: [a-z0-9-], starts/ends alnum, max 63 chars.
+    Used in Secret/Pod/Service names."""
+    out = "".join(c.lower() if c.isalnum() else "-" for c in profile)
+    out = out.strip("-") or "default"
+    return out[:63]

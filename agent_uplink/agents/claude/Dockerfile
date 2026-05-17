@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
   coreutils \
   curl \
-  dnsutils \ 
+  dnsutils \
   file \
   fzf \
   git \
@@ -16,7 +16,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   net-tools \
   procps \
   python3 \
-  socat \
   unzip \
   util-linux \
   vim \
@@ -41,21 +40,15 @@ ARG CACHE_BUST=0
 RUN echo "cache-bust=${CACHE_BUST}" \
   && su - ${USERNAME} -c "curl -fsSL https://claude.ai/install.sh | bash"
 
-COPY certs/ /mnt/certs/
 COPY certs/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/mitmproxy-ca-cert.crt
 RUN update-ca-certificates
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 USER ${USERNAME}
 
 ENV SHELL=/bin/bash
 ENV EDITOR=vim
 ENV VISUAL=vim
-ENV HTTP_PROXY=http://localhost:8090
-ENV HTTPS_PROXY=http://localhost:8090
-ENV NO_PROXY=127.0.0.1,localhost
 ENV NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/mitmproxy-ca-cert.crt
 ENV AWS_CA_BUNDLE=/usr/local/share/ca-certificates/mitmproxy-ca-cert.crt
 ENV PATH="$PATH:/home/${USERNAME}/.local/bin"
 ENV USERNAME=${USERNAME}
-ENTRYPOINT ["entrypoint.sh"]

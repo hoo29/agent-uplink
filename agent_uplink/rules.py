@@ -1,3 +1,10 @@
+"""Layer + resolve the YAML rule files into the JSON blob the mitm addon reads.
+
+Pure functions; the caller wraps the returned bytes in a K8s Secret. Keyring
+placeholders (`{{keyring:service:user}}`) are looked up here on the host so
+the addon never touches the user's keyring or YAML at all.
+"""
+
 import json
 import logging
 import re
@@ -8,7 +15,6 @@ import keyring
 import yaml
 
 from .agents.base import Agent
-from .secret import LockedSecret
 
 LOGGER = logging.getLogger("agent-uplink")
 
@@ -16,18 +22,11 @@ GENERIC_DEFAULT_RULES_PATH = Path(__file__).resolve().parent / "default_rules.ya
 
 
 VALID_METHODS = {
-    "GET",
-    "POST",
-    "PUT",
-    "DELETE",
-    "PATCH",
-    "HEAD",
-    "OPTIONS",
-    "CONNECT",
-    "TRACE",
+    "GET", "POST", "PUT", "DELETE", "PATCH",
+    "HEAD", "OPTIONS", "CONNECT", "TRACE",
 }
 
-# {{keyring:SERVICE:USERNAME}} service can't contain ':' or '}',
+# {{keyring:SERVICE:USERNAME}} — service can't contain ':' or '}',
 # username can't contain '}' (so usernames with ':' are still allowed).
 _PLACEHOLDER_RE = re.compile(r"\{\{keyring:([^:}]+):([^}]+)\}\}")
 
@@ -79,8 +78,7 @@ def _validate_and_resolve_rule(rule: dict, idx: int) -> dict:
     paths = rule.get("paths")
     if paths is not None:
         if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
-            raise ValueError(
-                f"{name}: 'paths' must be a list of regex strings")
+            raise ValueError(f"{name}: 'paths' must be a list of regex strings")
         for p in paths:
             try:
                 re.compile(p)
@@ -114,8 +112,8 @@ def resolve(
     no_default_rules: bool,
     agent: Agent,
     aws_sigv4_routes: dict[str, dict[str, Any]] | None = None,
-) -> LockedSecret:
-    """Build resolved rules JSON in an anonymous, mlock'd memfd.
+) -> bytes:
+    """Build the resolved rules JSON.
 
     Layering when defaults are enabled:
       1. agent_uplink/default_rules.yaml          (generic baseline)
@@ -127,18 +125,14 @@ def resolve(
     skips layers 1-3 — the user becomes responsible for supplying any auth
     rule needed by the chosen mode.
 
-    `aws_sigv4_routes` maps dummy AKIA → {upstream_host, upstream_port} so the
-    addon can route AWS requests to the matching aws-sigv4-proxy sidecar.
-
-    Returned LockedSecret must be close()d after the mitmproxy container is
-    stopped; until then its bind_source can be passed as a docker `-v` source.
+    `aws_sigv4_routes` maps dummy AKIA → {upstream_host, upstream_port} so
+    the addon can route AWS requests to the matching aws-sigv4-proxy Service.
     """
     user_config: dict = {}
     if user_rules_path is not None:
         user_config = _load_yaml(user_rules_path)
 
-    use_defaults = not (no_default_rules or user_config.get(
-        "replace_defaults", False))
+    use_defaults = not (no_default_rules or user_config.get("replace_defaults", False))
     rules: list[dict] = []
     if use_defaults:
         rules.extend(_load_yaml(GENERIC_DEFAULT_RULES_PATH).get("rules") or [])
@@ -157,12 +151,8 @@ def resolve(
     out: dict[str, Any] = {"rules": resolved}
     if aws_sigv4_routes:
         out["aws_sigv4_routes"] = aws_sigv4_routes
-    payload = json.dumps(out, indent=2).encode("utf-8")
-
-    secret = LockedSecret("agent-uplink-rules", payload)
     LOGGER.info(
         f"resolved {len(resolved)} rules"
         + (f", {len(aws_sigv4_routes)} sigv4 routes" if aws_sigv4_routes else "")
-        + " into locked memfd"
     )
-    return secret
+    return json.dumps(out, indent=2).encode("utf-8")
