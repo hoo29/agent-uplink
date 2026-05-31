@@ -24,7 +24,7 @@ def run_command(
     stdout_d = res.stdout.decode("utf8") if res.stdout is not None else ""
     if res.returncode != 0:
         if raise_error:
-            raise OSError(
+            raise RuntimeError(
                 f"command failed ({command[0]} exit={res.returncode}). stderr: {stderr_d}"
             )
         return ""

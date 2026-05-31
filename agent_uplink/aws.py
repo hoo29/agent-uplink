@@ -9,6 +9,7 @@ back to a sidecar by the AKIA in its `Authorization` header.
 
 import hashlib
 import logging
+import re
 
 from .process import run_command
 
@@ -18,6 +19,19 @@ LOGGER = logging.getLogger("agent-uplink")
 # validate format. The container signs with these and the signature is
 # discarded by mitmproxy before re-signing in aws-sigv4-proxy.
 _DUMMY_SECRET = "DUMMYsecret0000000000000000000000000000A"
+
+# Profile names are interpolated into INI section headers and into k8s resource
+# names; restrict them to a safe charset so they can't inject INI sections or
+# break manifest names.
+_PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def validate_profile_name(profile_name: str) -> None:
+    if not _PROFILE_NAME_RE.fullmatch(profile_name):
+        raise ValueError(
+            f"invalid AWS profile name {profile_name!r}: only letters, digits, "
+            "'.', '_' and '-' are allowed"
+        )
 
 
 def export_aws_profile_env(profile_name: str) -> dict[str, str]:
@@ -50,6 +64,7 @@ def real_aws_credentials_ini(profile_name: str, env: dict[str, str]) -> bytes:
     Wrapped in a K8s Secret and mounted into the matching aws-sigv4-proxy
     sidecar at /aws/credentials.
     """
+    validate_profile_name(profile_name)
     key_map = {
         "AWS_ACCESS_KEY_ID": "aws_access_key_id",
         "AWS_SECRET_ACCESS_KEY": "aws_secret_access_key",
@@ -86,6 +101,7 @@ def dummy_aws_credentials_ini(
     profile_to_akia: dict[str, str] = {}
     lines: list[str] = []
     for profile_name in aws_profile_names:
+        validate_profile_name(profile_name)
         akia = dummy_akia(profile_name)
         profile_to_akia[profile_name] = akia
         lines.append(f"[{profile_name}]")

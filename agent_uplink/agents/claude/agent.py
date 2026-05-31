@@ -8,7 +8,7 @@ import keyring
 
 from ...k8s import hostpath_volume, secret_volume, tmpfs_volume
 from ...session import Session
-from ..base import Agent
+from ..base import Agent, PodBuildContext, PodContribution, PreparedAgent
 from .config import (
     HOST_CLAUDE_DIR,
     claude_settings_bytes,
@@ -21,7 +21,7 @@ from .config import (
 
 # Settings.json env injected per auth mode. anthropic mode steers the CLI via
 # a fake .credentials.json instead, so it has no entry here. Real credentials
-# are added by mitm header injection (see auth_rules) and never enter the
+# are added by mitm header injection (see prepare()) and never enter the
 # container.
 _AUTH_MODE_ENV: dict[str, dict[str, str]] = {
     "bedrock": {"AWS_BEARER_TOKEN_BEDROCK": "placeholder"},
@@ -49,10 +49,6 @@ class ClaudeAgent(Agent):
         super().__init__(args)
         self._auth_mode: str = args.auth_mode
         self._claude_config: dict | None = None
-        self._oauth_token: str | None = None
-        self._bedrock_token: str | None = None
-        self._fake_creds: bytes | None = None
-        self._settings: bytes | None = None
 
     @classmethod
     def add_cli_args(cls, parser: argparse.ArgumentParser) -> None:
@@ -90,11 +86,22 @@ class ClaudeAgent(Agent):
         profile = get_bedrock_aws_profile_name(self._config())
         return [profile] if profile else []
 
-    def prepare(self, session: Session, aws_profile_names: list[str]) -> None:
+    def prepare(self, session: Session, aws_profile_names: list[str]) -> PreparedAgent:
+        auth_rules: list[dict] = []
+        secret_payloads: dict[str, dict[str, bytes]] = {}
+
         if self._auth_mode == "anthropic":
             refresh_anthropic_oauth_if_expiring()
-            self._fake_creds, self._oauth_token = fake_oauth_credentials_bytes(
+            fake_creds, oauth_token = fake_oauth_credentials_bytes(
                 read_anthropic_oauth_credentials()
+            )
+            secret_payloads[_FAKE_CREDS_SECRET] = {".credentials.json": fake_creds}
+            auth_rules.append(
+                {
+                    "name": "anthropic-auth",
+                    "host": r"api\.anthropic\.com",
+                    "inject": {"headers": {"Authorization": f"Bearer {oauth_token}"}},
+                }
             )
         elif self._auth_mode == "bedrock":
             token = keyring.get_password("bedrock", "key")
@@ -103,55 +110,38 @@ class ClaudeAgent(Agent):
                     "bedrock bearer token not found in keyring; "
                     "run: keyring set bedrock key"
                 )
-            self._bedrock_token = token
-
-        auth_env = dict(_AUTH_MODE_ENV.get(self._auth_mode, {}))
-        self._settings = claude_settings_bytes(self._config(), auth_env)
-
-    def auth_rules(self) -> list[dict]:
-        if self._auth_mode == "anthropic":
-            if self._oauth_token is None:
-                raise RuntimeError("prepare() was not called")
-            return [
-                {
-                    "name": "anthropic-auth",
-                    "host": r"api\.anthropic\.com",
-                    "inject": {
-                        "headers": {"Authorization": f"Bearer {self._oauth_token}"}
-                    },
-                }
-            ]
-        if self._auth_mode == "bedrock":
-            if self._bedrock_token is None:
-                raise RuntimeError("prepare() was not called")
-            return [
+            auth_rules.append(
                 {
                     "name": "bedrock-auth",
                     "host": r"bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com",
-                    "inject": {
-                        "headers": {"Authorization": f"Bearer {self._bedrock_token}"}
-                    },
+                    "inject": {"headers": {"Authorization": f"Bearer {token}"}},
                 }
-            ]
-        return []
+            )
 
-    def secret_payloads(self) -> dict[str, dict[str, bytes]]:
-        if self._settings is None:
-            raise RuntimeError("prepare() was not called")
-        payloads: dict[str, dict[str, bytes]] = {
-            _SETTINGS_SECRET: {"settings.json": self._settings},
-        }
-        if self._fake_creds is not None:
-            payloads[_FAKE_CREDS_SECRET] = {".credentials.json": self._fake_creds}
-        return payloads
+        auth_env = dict(_AUTH_MODE_ENV.get(self._auth_mode, {}))
+        settings = claude_settings_bytes(self._config(), auth_env)
+        secret_payloads[_SETTINGS_SECRET] = {"settings.json": settings}
 
-    def volumes_and_mounts(
-        self,
-        cwd: Path,
-        username: str,
-        aws_creds_secret_name: str | None,
-        debug_host_dir: Path | None,
+        return PreparedAgent(auth_rules=auth_rules, secret_payloads=secret_payloads)
+
+    def pod_contribution(self, ctx: PodBuildContext) -> PodContribution:
+        volumes, mounts = self._volumes_and_mounts(ctx)
+        return PodContribution(
+            env=self._container_env(ctx.cwd),
+            volumes=volumes,
+            mounts=mounts,
+            security_context=self._container_security_context(),
+            init_command=["/usr/local/bin/dockerd-entrypoint.sh"],
+            command=self._container_command(ctx.username, ctx.debug),
+            # tmpfs /var/lib/docker counts against this; default 1Gi can't hold
+            # even a small image alongside the agent process.
+            memory="4Gi",
+        )
+
+    def _volumes_and_mounts(
+        self, ctx: PodBuildContext
     ) -> tuple[list[dict], list[dict]]:
+        cwd, username = ctx.cwd, ctx.username
         project_id = str(cwd).replace("/", "-")
         host_project_dir = HOST_CLAUDE_DIR / "projects" / project_id
         host_project_dir.mkdir(parents=True, exist_ok=True)
@@ -196,7 +186,8 @@ class ClaudeAgent(Agent):
             {"name": "claude-json-host", "mountPath": f"{container_home}/.claude.json"},
         ]
 
-        if self._fake_creds is not None:
+        # anthropic mode ships a fake .credentials.json (see prepare()); mount it.
+        if self._auth_mode == "anthropic":
             volumes.append(secret_volume("fake-creds", _FAKE_CREDS_SECRET))
             mounts.append(
                 {
@@ -207,8 +198,8 @@ class ClaudeAgent(Agent):
                 }
             )
 
-        if aws_creds_secret_name is not None:
-            volumes.append(secret_volume("aws-creds", aws_creds_secret_name))
+        if ctx.aws_creds_secret_name is not None:
+            volumes.append(secret_volume("aws-creds", ctx.aws_creds_secret_name))
             mounts.append(
                 {
                     "name": "aws-creds",
@@ -233,6 +224,38 @@ class ClaudeAgent(Agent):
                 }
             )
 
+        # Maven: settings.xml read-only, the local repository read-write so the
+        # agent writes downloaded artifacts straight into the host's real repo.
+        # Gated on the host paths existing, so non-Java sessions are unaffected.
+        m2_dir = Path.home() / ".m2"
+        m2_settings = m2_dir / "settings.xml"
+        if m2_settings.exists():
+            volumes.append(
+                hostpath_volume("m2-settings", str(m2_settings), hp_type="File")
+            )
+            mounts.append(
+                {
+                    "name": "m2-settings",
+                    "mountPath": f"{container_home}/.m2/settings.xml",
+                    "readOnly": True,
+                }
+            )
+        if m2_dir.is_dir():
+            volumes.append(
+                hostpath_volume(
+                    "m2-repo",
+                    str(m2_dir / "repository"),
+                    hp_type="DirectoryOrCreate",
+                )
+            )
+            mounts.append(
+                {"name": "m2-repo", "mountPath": f"{container_home}/.m2/repository"}
+            )
+
+        # Private registry auth (ECR, etc.) is handled by mitm rules injecting
+        # the Authorization header on registry hosts, so ~/.docker/config.json
+        # is deliberately not mounted — no registry credentials enter the pod.
+
         # /var/lib/docker: tmpfs emptyDir. Disk-backed emptyDir lands on
         # kata's virtio-fs, which the kernel won't accept as an overlayfs
         # upperdir (EINVAL). tmpfs supports overlay natively. Cost: image
@@ -244,28 +267,43 @@ class ClaudeAgent(Agent):
         mounts.append({"name": "docker-lib", "mountPath": "/var/lib/docker"})
         mounts.append({"name": "run", "mountPath": "/run"})
 
-        if debug_host_dir is not None:
+        if ctx.debug_host_dir is not None:
             volumes.append(
                 hostpath_volume(
-                    "claude-debug", str(debug_host_dir), hp_type="DirectoryOrCreate"
+                    "claude-debug",
+                    str(ctx.debug_host_dir),
+                    hp_type="DirectoryOrCreate",
                 )
             )
             mounts.append({"name": "claude-debug", "mountPath": f"{claude_dir}/debug"})
 
         return volumes, mounts
 
-    def memory(self) -> str:
-        # tmpfs /var/lib/docker counts against this; default 1Gi can't hold
-        # even a small image alongside the agent process.
-        return "4Gi"
+    def _container_env(self, cwd: Path) -> dict[str, str]:
+        # Only relevant when the host has a Maven setup; otherwise no-op.
+        if not (Path.home() / ".m2").is_dir():
+            return {}
+        # The Maven JVM does not read HTTPS_PROXY (unlike dockerd), and the pod
+        # can egress only to mitm. Point Maven's HTTP client at mitm explicitly.
+        # Host mitm:8080 mirrors cli.PROXY_PORT.
+        return {
+            "MAVEN_OPTS": (
+                "-Dhttp.proxyHost=mitm -Dhttp.proxyPort=8080 "
+                "-Dhttps.proxyHost=mitm -Dhttps.proxyPort=8080 "
+                "-Dhttp.nonProxyHosts=localhost|127.0.0.1"
+            ),
+            # Lets ${env.CODEARTIFACT_AUTH_TOKEN} in settings.xml expand cleanly;
+            # the value is irrelevant — mitm overwrites the Authorization header.
+            "CODEARTIFACT_AUTH_TOKEN": "placeholder",
+        }
 
-    def container_security_context(self, uid: int, gid: int) -> dict:
+    def _container_security_context(self) -> dict:
         # dockerd needs to manage iptables, cgroups, namespaces, mounts —
         # privileged + root + unconfined seccomp is the minimum. PID 1 runs
         # as root (image has no USER directive); the entrypoint launches
         # dockerd then drops to ${USERNAME}. RoFS is preserved; everything
         # dockerd writes to lives under emptyDir mounts added by
-        # volumes_and_mounts(). The grant is bounded by the Kata guest
+        # _volumes_and_mounts(). The grant is bounded by the Kata guest
         # kernel — the host kernel is unaffected.
         return {
             "privileged": True,
@@ -274,10 +312,7 @@ class ClaudeAgent(Agent):
             "seccompProfile": {"type": "Unconfined"},
         }
 
-    def container_init_command(self) -> list[str]:
-        return ["/usr/local/bin/dockerd-entrypoint.sh"]
-
-    def container_command(self, username: str, debug: bool) -> list[str]:
+    def _container_command(self, username: str, debug: bool) -> list[str]:
         flag = (
             "-d --dangerously-skip-permissions"
             if debug

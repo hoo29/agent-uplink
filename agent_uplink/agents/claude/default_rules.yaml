@@ -4,18 +4,12 @@
 # ClaudeAgent.auth_rules().
 
 rules:
+  # Only non-GET rules belong here: GET/OPTIONS/HEAD to any host is already
+  # permitted by the generic default rule, so the old GET-only claude-changelog
+  # (raw.githubusercontent.com) and claude-downloads (downloads.claude.ai) rules
+  # were redundant and have been removed.
   - name: claude-logs
     host: .*\.datadoghq\.com
     methods: ["POST"]
     paths:
       - /api/v2/logs
-
-  - name: claude-changelog
-    host: raw\.githubusercontent\.com
-    methods: ["GET"]
-    paths:
-      - /anthropics/claude-code/refs/heads/main/CHANGELOG\.md
-
-  - name: claude-downloads
-    host: downloads\.claude\.ai
-    methods: ["GET"]

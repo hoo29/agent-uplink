@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import pwd
 import signal
 from functools import partial
 from pathlib import Path
 
 from .agents import AGENTS, Agent
+from .agents.base import PodBuildContext, PodContribution
 from .aws import (
     dummy_aws_credentials_ini,
     export_aws_profile_env,
@@ -25,14 +27,20 @@ from .bootstrap import (
     get_image_age_seconds,
 )
 from .k8s import (
+    Resources,
+    Stdio,
     apply_manifests,
     configmap_manifest,
+    configmap_volume,
+    container_spec,
     exec_interactive,
     hardened_container_security_context,
     namespace_manifest,
     network_policy_manifest,
     pod_manifest,
+    pod_spec,
     secret_manifest,
+    secret_volume,
     service_manifest,
     tmpfs_volume,
     wait_for_pod_ready,
@@ -48,8 +56,9 @@ DEFAULT_MITM_IMAGE = "mitmproxy/mitmproxy:latest"
 DEFAULT_SIGV4_PROXY_IMAGE = "public.ecr.aws/aws-observability/aws-sigv4-proxy:latest"
 DEFAULT_AGENT_RUNTIME_CLASS = "kata-clh"
 
-MITM_PORT = 8080
-SIGV4_PORT = 8080
+PROXY_PORT = 8080  # mitm and aws-sigv4-proxy both listen on this port
+
+AGENT_CONTAINER_NAME = "main"
 
 ADDON_PATH = Path(__file__).resolve().parent / "mitm_addon" / "filter.py"
 
@@ -74,12 +83,13 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         help="AWS profiles to provide credentials for (one sigv4-proxy pod per profile)",
     )
     common.add_argument("--mitmproxy-image", default=DEFAULT_MITM_IMAGE)
-    common.add_argument("--sigv4-proxy-image", default=DEFAULT_SIGV4_PROXY_IMAGE)
+    common.add_argument("--sigv4-proxy-image",
+                        default=DEFAULT_SIGV4_PROXY_IMAGE)
     common.add_argument("--registry-image", default=REGISTRY_IMAGE_DEFAULT)
     common.add_argument(
         "--agent-runtime-class",
         default=DEFAULT_AGENT_RUNTIME_CLASS,
-        help="RuntimeClass for the agent pod (use kata-qemu for microVM isolation)",
+        help="RuntimeClass for the agent pod (default kata-clh; kata-qemu / kata-fc also work)",
     )
     common.add_argument(
         "--mitm-runtime-class",
@@ -111,6 +121,12 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         help="Don't merge built-in defaults (allow GET/OPTIONS everywhere)",
     )
     common.add_argument(
+        "--allow-exec",
+        action="store_true",
+        help="Permit {{exec:...}} placeholders in rules files to run host shell "
+        "commands at startup (off by default)",
+    )
+    common.add_argument(
         "-d",
         "--debug",
         action=argparse.BooleanOptionalAction,
@@ -124,7 +140,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="agent-uplink", description="Trust is a weakness"
     )
-    sub = parser.add_subparsers(dest="agent_name", required=True, metavar="AGENT")
+    sub = parser.add_subparsers(
+        dest="agent_name", required=True, metavar="AGENT")
     common = _common_arg_parser()
     for name, agent_cls in AGENTS.items():
         agent_parser = sub.add_parser(
@@ -140,7 +157,8 @@ def parse_args() -> argparse.Namespace:
 def validate_cwd(username: str, cwd: Path) -> None:
     home = Path(f"/home/{username}")
     if cwd != home and home not in cwd.parents:
-        raise ValueError(f"agent-uplink must be run from within {home}, got: {cwd}")
+        raise ValueError(
+            f"agent-uplink must be run from within {home}, got: {cwd}")
 
 
 # ---------------------------------------------------------------------------
@@ -159,19 +177,17 @@ def _mitm_manifests(
 ) -> list[dict]:
     labels = _label("mitm")
     # uid 1000 = the `mitmproxy` user baked into the upstream image. The certs
-    # Secret is mounted at the confdir path so the existing mitmproxy-ca.pem is
-    # picked up as the signing CA and CertStore.from_store() skips create_store
-    # (which would otherwise mkdir into a read-only FS).
+    # Secret is mounted at the confdir path so mitmproxy picks up the existing CA
+    # as its signing CA instead of trying to generate one (which would fail
+    # writing into the read-only root filesystem).
     confdir = "/mitm-confdir"
-    pod = pod_manifest(
+    container = container_spec(
         name="mitm",
-        namespace=ns,
-        labels=labels,
         image=image,
         command=["mitmdump"],
         args=[
             "--listen-host=0.0.0.0",
-            f"--listen-port={MITM_PORT}",
+            f"--listen-port={PROXY_PORT}",
             "--set",
             f"confdir={confdir}",
             "-s",
@@ -179,34 +195,28 @@ def _mitm_manifests(
             "--set",
             "rules_file=/rules/rules.json",
         ],
-        volumes=[
-            {"name": "addon", "configMap": {"name": "mitm-addon"}},
-            {"name": "rules", "secret": {"secretName": "rules-json"}},
-            {"name": "certs", "secret": {"secretName": "mitm-certs"}},
-            tmpfs_volume("tmp", "32Mi"),
-        ],
         volume_mounts=[
             {"name": "addon", "mountPath": "/addon", "readOnly": True},
             {"name": "rules", "mountPath": "/rules", "readOnly": True},
             {"name": "certs", "mountPath": confdir, "readOnly": True},
             {"name": "tmp", "mountPath": "/tmp"},
         ],
+        security_context=hardened_container_security_context(uid=1000, gid=1000),
+        resources=Resources(memory="512Mi", cpu="1"),
+        ports=[{"containerPort": PROXY_PORT, "protocol": "TCP"}],
+    )
+    spec = pod_spec(
+        container=container,
+        volumes=[
+            configmap_volume("addon", "mitm-addon"),
+            secret_volume("rules", "rules-json"),
+            secret_volume("certs", "mitm-certs"),
+            tmpfs_volume("tmp", "32Mi"),
+        ],
         runtime_class=runtime_class or None,
-        container_security_context=hardened_container_security_context(
-            uid=1000, gid=1000
-        ),
-        memory="512Mi",
-        cpu="1",
-        ports=[{"containerPort": MITM_PORT, "protocol": "TCP"}],
-        image_pull_policy="IfNotPresent",
     )
-    svc = service_manifest(
-        "mitm",
-        ns,
-        selector=labels,
-        port=MITM_PORT,
-        labels=labels,
-    )
+    pod = pod_manifest("mitm", ns, labels=labels, spec=spec)
+    svc = service_manifest("mitm", ns, selector=labels, port=PROXY_PORT, labels=labels)
     return [pod, svc]
 
 
@@ -219,10 +229,7 @@ def _sigv4_manifests(
 ) -> list[dict]:
     pod_name = f"sigv4-{safe_name}"
     labels = {"app": pod_name, "tier": "sigv4", "managed-by": "agent-uplink"}
-    pod = pod_manifest(
-        name=pod_name,
-        namespace=ns,
-        labels=labels,
+    container = container_spec(
         image=image,
         args=["--log-failed-requests", "--log-signing-process"],
         env={
@@ -230,77 +237,78 @@ def _sigv4_manifests(
             "AWS_PROFILE": profile,
             "AWS_SDK_LOAD_CONFIG": "true",
         },
-        volumes=[
-            {
-                "name": "creds",
-                "secret": {
-                    "secretName": f"aws-creds-{safe_name}",
-                },
-            },
-            tmpfs_volume("tmp", "16Mi"),
-        ],
         volume_mounts=[
             {"name": "creds", "mountPath": "/aws", "readOnly": True},
             {"name": "tmp", "mountPath": "/tmp"},
         ],
+        security_context=hardened_container_security_context(uid=1000, gid=1000),
+        resources=Resources(memory="128Mi", cpu="500m"),
+        ports=[{"containerPort": PROXY_PORT, "protocol": "TCP"}],
+    )
+    spec = pod_spec(
+        container=container,
+        volumes=[
+            secret_volume("creds", f"aws-creds-{safe_name}"),
+            tmpfs_volume("tmp", "16Mi"),
+        ],
         runtime_class=runtime_class or None,
-        container_security_context=hardened_container_security_context(
-            uid=1000, gid=1000
-        ),
-        memory="128Mi",
-        cpu="500m",
-        ports=[{"containerPort": SIGV4_PORT, "protocol": "TCP"}],
     )
-    svc = service_manifest(
-        pod_name, ns, selector=labels, port=SIGV4_PORT, labels=labels
-    )
+    pod = pod_manifest(pod_name, ns, labels=labels, spec=spec)
+    svc = service_manifest(pod_name, ns, selector=labels, port=PROXY_PORT, labels=labels)
     return [pod, svc]
+
+
+def _agent_env(cwd: Path, username: str) -> dict[str, str]:
+    """Universal env for the agent pod: force every client through mitm. Built
+    from a single proxy address so the upper/lower-case pairs can't drift."""
+    proxy = f"http://mitm:{PROXY_PORT}"
+    no_proxy = "localhost,127.0.0.1,::1,.local"
+    env: dict[str, str] = {
+        "WORKDIR": str(cwd),
+        "USERNAME": username,
+        # dockerd reads the upper-case DOCKER_* forms.
+        "DOCKER_HTTP_PROXY": proxy,
+        "DOCKER_HTTPS_PROXY": proxy,
+        # gcloud SDK uses its own proxy vars.
+        "CLOUDSDK_PROXY_TYPE": "http",
+        "CLOUDSDK_PROXY_ADDRESS": "mitm",
+        "CLOUDSDK_PROXY_PORT": str(PROXY_PORT),
+    }
+    for base in ("HTTP_PROXY", "HTTPS_PROXY"):
+        env[base] = env[base.lower()] = proxy
+    env["NO_PROXY"] = env["no_proxy"] = no_proxy
+    return env
 
 
 def _agent_pod_manifest(
     ns: str,
-    agent: Agent,
     full_image: str,
+    contribution: PodContribution,
     cwd: Path,
     username: str,
-    aws_creds_secret_name: str | None,
-    debug_host_dir: Path | None,
+    gid: int,
     runtime_class: str,
-    debug: bool,
 ) -> dict:
-    uid, gid = os.getuid(), os.getgid()
-    volumes, mounts = agent.volumes_and_mounts(
-        cwd,
-        username,
-        aws_creds_secret_name,
-        debug_host_dir,
-    )
-    env = {
-        "HTTPS_PROXY": f"http://mitm:{MITM_PORT}",
-        "HTTP_PROXY": f"http://mitm:{MITM_PORT}",
-        "NO_PROXY": "127.0.0.1,localhost",
-        "WORKDIR": str(cwd),
-        "USERNAME": username,
-    }
-    env.update(agent.container_env(cwd, debug))
-    return pod_manifest(
-        name="agent",
-        namespace=ns,
-        labels=_label("agent"),
+    env = _agent_env(cwd, username)
+    env.update(contribution.env)
+    container = container_spec(
+        name=AGENT_CONTAINER_NAME,
         image=full_image,
-        command=agent.container_init_command(),
+        command=contribution.init_command,
         env=env,
-        volumes=volumes,
-        volume_mounts=mounts,
-        runtime_class=runtime_class or None,
-        container_security_context=agent.container_security_context(uid, gid),
-        pod_security_context={"fsGroup": gid},
-        memory=agent.memory(),
-        cpu="1",
-        stdin_open=True,
-        tty=True,
+        volume_mounts=contribution.mounts,
+        security_context=contribution.security_context,
+        resources=Resources(memory=contribution.memory, cpu="1"),
+        stdio=Stdio(stdin=True, tty=True),
         image_pull_policy="Always",
     )
+    spec = pod_spec(
+        container=container,
+        volumes=contribution.volumes,
+        runtime_class=runtime_class or None,
+        pod_security_context={"fsGroup": gid},
+    )
+    return pod_manifest("agent", ns, labels=_label("agent"), spec=spec)
 
 
 def _network_policies(ns: str, has_sigv4: bool) -> list[dict]:
@@ -322,7 +330,7 @@ def _network_policies(ns: str, has_sigv4: bool) -> list[dict]:
             egress=[
                 {
                     "to": [{"podSelector": {"matchLabels": {"app": "mitm"}}}],
-                    "ports": [{"protocol": "TCP", "port": MITM_PORT}],
+                    "ports": [{"protocol": "TCP", "port": PROXY_PORT}],
                 },
                 {
                     "to": [
@@ -337,6 +345,7 @@ def _network_policies(ns: str, has_sigv4: bool) -> list[dict]:
                     ],
                     "ports": [
                         {"protocol": "UDP", "port": 53},
+                        {"protocol": "TCP", "port": 53},
                     ],
                 },
             ],
@@ -350,7 +359,7 @@ def _network_policies(ns: str, has_sigv4: bool) -> list[dict]:
             ingress=[
                 {
                     "from": [{"podSelector": {"matchLabels": {"app": "agent"}}}],
-                    "ports": [{"protocol": "TCP", "port": MITM_PORT}],
+                    "ports": [{"protocol": "TCP", "port": PROXY_PORT}],
                 }
             ],
             egress=[{}],
@@ -366,7 +375,7 @@ def _network_policies(ns: str, has_sigv4: bool) -> list[dict]:
                 ingress=[
                     {
                         "from": [{"podSelector": {"matchLabels": {"app": "mitm"}}}],
-                        "ports": [{"protocol": "TCP", "port": SIGV4_PORT}],
+                        "ports": [{"protocol": "TCP", "port": PROXY_PORT}],
                     }
                 ],
                 egress=[{}],
@@ -381,7 +390,7 @@ def _network_policies(ns: str, has_sigv4: bool) -> list[dict]:
 
 
 def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
-    username = os.environ["USER"]
+    username = os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
     cwd = Path.cwd()
     validate_cwd(username, cwd)
 
@@ -397,7 +406,7 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
     aws_profile_names.extend(agent.discover_aws_profiles())
     aws_profile_names = list(dict.fromkeys(aws_profile_names))
 
-    agent.prepare(session, aws_profile_names)
+    prepared = agent.prepare(session, aws_profile_names)
 
     # Image build/push — rebuild if certs changed, --force-rebuild, missing, or
     # older than the max age threshold.
@@ -417,10 +426,20 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
             force_rebuild=args.force_rebuild,
         )
 
-    # Per-profile sigv4 plumbing.
+    # Per-profile sigv4 plumbing. Guard against two profiles colliding to the
+    # same k8s-safe name (which would emit duplicate Pod/Service manifests).
     profile_safe: dict[str, str] = {
         p: sanitize_profile_for_k8s_name(p) for p in aws_profile_names
     }
+    seen_safe: dict[str, str] = {}
+    for profile, safe in profile_safe.items():
+        if safe in seen_safe:
+            raise ValueError(
+                f"AWS profiles {seen_safe[safe]!r} and {profile!r} both map to the "
+                f"k8s-safe name {safe!r}; rename one to disambiguate"
+            )
+        seen_safe[safe] = profile
+
     real_aws_secrets: list[dict] = []
     sigv4_routes: dict[str, dict] = {}
     for profile in aws_profile_names:
@@ -442,7 +461,7 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
     for profile, akia in profile_to_akia.items():
         sigv4_routes[akia] = {
             "upstream_host": f"sigv4-{profile_safe[profile]}",
-            "upstream_port": SIGV4_PORT,
+            "upstream_port": PROXY_PORT,
         }
 
     # Rules JSON (resolved + cred-substituted), addon ConfigMap, certs Secret.
@@ -450,7 +469,9 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
         args.rules,
         args.no_default_rules,
         agent,
-        sigv4_routes,
+        prepared.auth_rules,
+        allow_exec=args.allow_exec,
+        aws_sigv4_routes=sigv4_routes,
     )
 
     mitm_ca_cert = (mitm_dir / "mitmproxy-ca-cert.pem").read_bytes()
@@ -463,13 +484,27 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
         debug_host_dir.mkdir(parents=True, exist_ok=True)
         LOGGER.info(f"debug mode: agent logs → {debug_host_dir}")
 
+    uid, gid = os.getuid(), os.getgid()
+    contribution = agent.pod_contribution(
+        PodBuildContext(
+            cwd=cwd,
+            username=username,
+            uid=uid,
+            gid=gid,
+            aws_creds_secret_name=agent_aws_secret_name,
+            debug_host_dir=debug_host_dir,
+            debug=args.debug,
+        )
+    )
+
     # Build the full manifest set.
     manifests: list[dict] = [
         namespace_manifest(
             session.namespace,
             labels={
                 "managed-by": "agent-uplink",
-                "pod-security.kubernetes.io/enforce": "privileged",  # hostpaths mean can't use anything better
+                # hostpaths mean can't use anything better
+                "pod-security.kubernetes.io/enforce": "privileged",
             },
         ),
         configmap_manifest(
@@ -477,7 +512,8 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
             session.namespace,
             {"filter.py": ADDON_PATH.read_text(encoding="utf-8")},
         ),
-        secret_manifest("rules-json", session.namespace, {"rules.json": rules_bytes}),
+        secret_manifest("rules-json", session.namespace,
+                        {"rules.json": rules_bytes}),
         secret_manifest(
             "mitm-certs",
             session.namespace,
@@ -497,10 +533,11 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
                 {"credentials": dummy_ini},
             )
         )
-    for name, files in agent.secret_payloads().items():
+    for name, files in prepared.secret_payloads.items():
         manifests.append(secret_manifest(name, session.namespace, files))
 
-    manifests.extend(_network_policies(session.namespace, bool(aws_profile_names)))
+    manifests.extend(_network_policies(
+        session.namespace, bool(aws_profile_names)))
     manifests.extend(
         _mitm_manifests(
             session.namespace,
@@ -521,18 +558,17 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
     manifests.append(
         _agent_pod_manifest(
             session.namespace,
-            agent,
             full_image,
+            contribution,
             cwd,
             username,
-            agent_aws_secret_name,
-            debug_host_dir,
+            gid,
             args.agent_runtime_class,
-            args.debug,
         )
     )
 
-    LOGGER.info(f"applying {len(manifests)} manifests to ns/{session.namespace}")
+    LOGGER.info(
+        f"applying {len(manifests)} manifests to ns/{session.namespace}")
     apply_manifests(manifests)
 
     LOGGER.info("waiting for support pods")
@@ -550,8 +586,8 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
     return exec_interactive(
         session.namespace,
         "agent",
-        container="main",
-        command=agent.container_command(username, args.debug),
+        container=AGENT_CONTAINER_NAME,
+        command=contribution.command,
     )
 
 

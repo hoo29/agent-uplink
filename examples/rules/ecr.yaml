@@ -1,0 +1,24 @@
+# AWS ECR authenticated docker pulls.
+#
+# ECR's docker registry uses HTTP Basic auth (username `AWS`, password = a
+# short-lived token from `aws ecr get-login-password`). dockerd in the pod makes
+# anonymous requests; this rule makes mitm add the Authorization header on every
+# request to the ECR host, so the registry accepts the pull. The {{exec:...}}
+# placeholder runs on the HOST at startup (same trust + AWS credentials as your
+# shell) and the resulting Basic header is injected in the mitm pod, so the real
+# token never enters the agent container. The token is regenerated each session.
+#
+# No ~/.docker/config.json is involved — mitm injects auth unconditionally on
+# the registry host.
+#
+# Adjust the account id / region (and add --profile to the aws command if your
+# ECR credentials live in a specific profile) to match your setup. Blob
+# downloads redirect to presigned S3 URLs on a different host and stay allowed
+# by the default GET rules, so you don't need to list them here.
+
+rules:
+  - name: ecr-pulls
+    host: '123456789012\.dkr\.ecr\.eu-west-2\.amazonaws\.com'
+    inject:
+      headers:
+        Authorization: 'Basic {{exec:printf ''AWS:%s'' "$(aws ecr get-login-password --region eu-west-2)" | base64 -w0}}'
