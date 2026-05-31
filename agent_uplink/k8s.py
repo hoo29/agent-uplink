@@ -10,6 +10,7 @@ import base64
 import json
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import yaml
@@ -52,19 +53,6 @@ def delete_namespace(name: str, *, wait: bool = False) -> None:
     )
 
 
-def namespace_exists(name: str) -> bool:
-    out = kubectl(
-        "get",
-        "namespace",
-        name,
-        "--ignore-not-found",
-        "-o",
-        "name",
-        raise_error=False,
-    )
-    return bool(out.strip())
-
-
 def wait_for_pod_ready(namespace: str, pod_name: str, *, timeout: int = 180) -> None:
     kubectl(
         "wait",
@@ -81,8 +69,6 @@ def wait_for_pod_succeeded(
 ) -> None:
     """Block until a Pod with restartPolicy=Never reaches Succeeded.
     Raises if it ends up Failed or doesn't terminate in time."""
-    import time
-
     deadline = time.monotonic() + timeout
     last = "<none>"
     while time.monotonic() < deadline:
@@ -190,36 +176,44 @@ def service_manifest(
     }
 
 
-def pod_manifest(
-    name: str,
-    namespace: str,
+@dataclass
+class Resources:
+    """Container resource limits."""
+
+    memory: str = "256Mi"
+    cpu: str = "1"
+
+
+@dataclass
+class Stdio:
+    """Interactive stdio knobs (for `kubectl exec -it`)."""
+
+    stdin: bool = False
+    tty: bool = False
+
+
+def container_spec(
     *,
-    labels: dict[str, str],
     image: str,
+    name: str = "main",
     command: list[str] | None = None,
     args: list[str] | None = None,
     env: dict[str, str] | None = None,
-    volumes: list[dict] | None = None,
     volume_mounts: list[dict] | None = None,
-    runtime_class: str | None = None,
-    container_security_context: dict | None = None,
-    pod_security_context: dict | None = None,
+    security_context: dict | None = None,
     image_pull_policy: str = "IfNotPresent",
-    memory: str = "256Mi",
-    cpu: str = "1",
-    stdin_open: bool = False,
-    tty: bool = False,
-    container_name: str = "main",
-    restart_policy: str = "Always",
+    resources: Resources | None = None,
+    stdio: Stdio | None = None,
     ports: list[dict] | None = None,
     working_dir: str | None = None,
-    automount_service_account_token: bool = False,
 ) -> dict:
+    resources = resources or Resources()
+    stdio = stdio or Stdio()
     container: dict = {
-        "name": container_name,
+        "name": name,
         "image": image,
         "imagePullPolicy": image_pull_policy,
-        "resources": {"limits": {"memory": memory, "cpu": cpu}},
+        "resources": {"limits": {"memory": resources.memory, "cpu": resources.cpu}},
     }
     if command:
         container["command"] = command
@@ -229,17 +223,30 @@ def pod_manifest(
         container["env"] = [{"name": k, "value": v} for k, v in env.items()]
     if volume_mounts:
         container["volumeMounts"] = volume_mounts
-    if container_security_context:
-        container["securityContext"] = container_security_context
-    if stdin_open:
+    if security_context:
+        container["securityContext"] = security_context
+    if stdio.stdin:
         container["stdin"] = True
-    if tty:
+    if stdio.tty:
         container["tty"] = True
     if ports:
         container["ports"] = ports
     if working_dir:
         container["workingDir"] = working_dir
+    return container
 
+
+def pod_spec(
+    *,
+    container: dict,
+    volumes: list[dict] | None = None,
+    runtime_class: str | None = None,
+    pod_security_context: dict | None = None,
+    restart_policy: str = "Always",
+    host_network: bool = False,
+    dns_policy: str | None = None,
+    automount_service_account_token: bool = False,
+) -> dict:
     spec: dict = {
         "restartPolicy": restart_policy,
         "containers": [container],
@@ -251,15 +258,20 @@ def pod_manifest(
         spec["runtimeClassName"] = runtime_class
     if pod_security_context:
         spec["securityContext"] = pod_security_context
+    if host_network:
+        spec["hostNetwork"] = True
+    if dns_policy:
+        spec["dnsPolicy"] = dns_policy
+    return spec
 
+
+def pod_manifest(name: str, namespace: str, *, labels: dict[str, str], spec: dict) -> dict:
+    """Wrap a `pod_spec(...)` result in a Pod manifest. Build the spec with
+    `pod_spec(container=container_spec(...), ...)`."""
     return {
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {
-            "name": name,
-            "namespace": namespace,
-            "labels": labels,
-        },
+        "metadata": {"name": name, "namespace": namespace, "labels": labels},
         "spec": spec,
     }
 
@@ -325,21 +337,10 @@ def tmpfs_volume(name: str, size: str = "64Mi") -> dict:
     return {"name": name, "emptyDir": {"medium": "Memory", "sizeLimit": size}}
 
 
-def disk_emptydir_volume(name: str, size: str | None = None) -> dict:
-    ed: dict[str, Any] = {}
-    if size is not None:
-        ed["sizeLimit"] = size
-    return {"name": name, "emptyDir": ed}
-
-
-def secret_volume(name: str, secret_name: str, *, default_mode: int = 0o644) -> dict:
-    """Default mode 0o644 matches the K8s API default. With Secret volumes
-    owned by root:fsGroup, the pod's runAsUser needs world-read (0o644) or
-    group-read (0o440 + matching fsGroup) to actually read the file."""
-    return {
-        "name": name,
-        "secret": {"secretName": secret_name, "defaultMode": default_mode},
-    }
+def secret_volume(name: str, secret_name: str) -> dict:
+    """Secret volume fragment. Uses the K8s default mode (0o644, world-readable)
+    so the pod's runAsUser can read the file regardless of fsGroup."""
+    return {"name": name, "secret": {"secretName": secret_name}}
 
 
 def configmap_volume(name: str, configmap_name: str) -> dict:

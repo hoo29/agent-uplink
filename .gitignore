@@ -2,3 +2,5 @@ __pycache__
 agent_uplink/agents/*/certs
 *egg-info*
 .venv
+examples/rules/mine.yaml
+.claude/projects

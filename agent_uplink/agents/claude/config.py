@@ -79,11 +79,55 @@ def get_bedrock_aws_profile_name(claude_config: dict) -> str | None:
     return claude_config.get("env", {}).get("AWS_PROFILE")
 
 
+# settings.json is the user's own config for the CLI we run, but it can hold
+# secrets (env API keys, apiKeyHelper/awsCredentialExport commands), so we copy
+# an ALLOW-LIST of known-safe top-level keys into the pod rather than the whole
+# file minus a couple of keys. `env` is rebuilt separately (below) because it's
+# both needed and the most likely place for secrets. Extend these if the in-pod
+# CLI needs more — but never add `env`/`apiKeyHelper` here.
+_SETTINGS_KEY_ALLOWLIST = frozenset({
+    "model",
+    "theme",
+    "outputStyle",
+    "includeCoAuthoredBy",
+    "cleanupPeriodDays",
+    "permissions",
+    "statusLine",
+    "spinnerTipsEnabled",
+})
+
+# env var NAMES forwarded into the pod. Config-only (no secrets): the bedrock /
+# region routing the CLI needs, plus a few non-secret toggles. Anything not
+# listed (e.g. ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN) is dropped.
+_ENV_NAME_ALLOWLIST = frozenset({
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "DISABLE_TELEMETRY",
+    "DISABLE_AUTOUPDATER",
+    "DISABLE_ERROR_REPORTING",
+    "BASH_DEFAULT_TIMEOUT_MS",
+    "BASH_MAX_TIMEOUT_MS",
+    "MAX_THINKING_TOKENS",
+    "MCP_TIMEOUT",
+})
+
+
 def claude_settings_bytes(claude_config: dict, auth_env: dict[str, str]) -> bytes:
-    filtered = dict(claude_config)
-    for key in ["awsAuthRefresh", "sandbox"]:
-        filtered.pop(key, None)
+    """Build the in-pod settings.json from an allow-list of host settings keys
+    so host secrets never ride along. `auth_env` (our injected placeholders,
+    e.g. AWS_BEARER_TOKEN_BEDROCK) is always merged into env and wins."""
+    filtered = {
+        k: v for k, v in claude_config.items() if k in _SETTINGS_KEY_ALLOWLIST
+    }
+    host_env = claude_config.get("env") or {}
+    safe_env = {k: v for k, v in host_env.items() if k in _ENV_NAME_ALLOWLIST}
+    safe_env.update(auth_env)
+    if safe_env:
+        filtered["env"] = safe_env
     filtered["skipDangerousModePermissionPrompt"] = True
-    if auth_env:
-        filtered.setdefault("env", {}).update(auth_env)
     return json.dumps(filtered, indent=2).encode("utf-8")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import inspect
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
 
@@ -10,6 +11,49 @@ import yaml
 
 from ..k8s import hardened_container_security_context
 from ..session import Session
+
+
+@dataclass
+class PodBuildContext:
+    """Inputs the orchestrator hands an agent to build its pod contribution.
+    Everything an agent needs to assemble its volumes/env/commands lives here,
+    so the agent exposes a single build hook instead of many fine-grained ones."""
+
+    cwd: Path
+    username: str
+    uid: int
+    gid: int
+    aws_creds_secret_name: str | None
+    debug_host_dir: Path | None
+    debug: bool
+
+
+@dataclass
+class PodContribution:
+    """Agent-specific pieces the orchestrator merges into the agent pod spec.
+    Universal concerns (proxy env, namespace, NetworkPolicy) are added by the
+    orchestrator, not here."""
+
+    env: dict[str, str] = field(default_factory=dict)
+    volumes: list[dict] = field(default_factory=list)
+    mounts: list[dict] = field(default_factory=list)
+    security_context: dict | None = None
+    init_command: list[str] | None = None  # argv for the pod's PID 1
+    command: list[str] | None = None  # argv for `kubectl exec -it`
+    memory: str = "1Gi"
+
+
+@dataclass
+class PreparedAgent:
+    """Host-side products of prepare(). Returned (not stashed on the agent) so
+    there is no ordering landmine and no per-method 'prepare() not called' guard.
+
+    Real secrets live only in `auth_rules` (injected inside the mitm pod) and in
+    `secret_payloads` (K8s Secrets); neither ever reaches the agent container in
+    its real form."""
+
+    auth_rules: list[dict] = field(default_factory=list)
+    secret_payloads: dict[str, dict[str, bytes]] = field(default_factory=dict)
 
 
 class Agent(ABC):
@@ -27,15 +71,13 @@ class Agent(ABC):
     are wired together by `agent_uplink.cli`.
 
     Lifecycle (called by the CLI in order):
-      1. add_cli_args(parser)         — classmethod, registers subparser flags
-      2. __init__(args)               — capture parsed args
-      3. discover_aws_profiles()      — extra AWS profiles to spin sidecars for
-      4. prepare(session, profiles)   — host-side auth + in-memory config bytes
-      5. auth_rules()                 — mitm rules for this agent's API
-      6. secret_payloads()            — per-agent K8s Secrets {name: {file: bytes}}
-      7. volumes_and_mounts(...)      — pod volumes + volumeMounts
-      8. container_env(...)           — agent-specific env vars
-      9. container_command(debug)     — argv for `kubectl exec`
+      1. add_cli_args(parser)              — classmethod, registers subparser flags
+      2. __init__(args)                    — capture parsed args
+      3. discover_aws_profiles()           — extra AWS profiles to spin sidecars for
+      4. prepare(session, profiles)        — host-side auth → PreparedAgent
+                                             (auth_rules + secret_payloads)
+      5. pod_contribution(context)         — PodContribution: env, volumes, mounts,
+                                             securityContext, init/exec commands, memory
     """
 
     name: ClassVar[str]
@@ -73,58 +115,24 @@ class Agent(ABC):
         data = yaml.safe_load(path.read_text(encoding="utf8")) or {}
         return list(data.get("rules") or [])
 
-    def memory(self) -> str:
-        return "1Gi"
-
     @abstractmethod
     def discover_aws_profiles(self) -> list[str]:
         """AWS profiles the agent needs in addition to `--aws-profiles`."""
 
     @abstractmethod
-    def prepare(self, session: Session, aws_profile_names: list[str]) -> None:
-        """Host-side prep: refresh OAuth, read keyring, produce in-memory
-        bytes for settings/credentials. Stash anything later methods need
-        on `self`."""
+    def prepare(self, session: Session, aws_profile_names: list[str]) -> PreparedAgent:
+        """Host-side prep: refresh OAuth, read keyring, produce in-memory bytes
+        for settings/credentials, and return the agent's auth rules + Secret
+        payloads. Real secrets stay on the host / inside mitm."""
 
-    @abstractmethod
-    def auth_rules(self) -> list[dict]:
-        """mitm rules injecting this agent's auth header(s)."""
-
-    @abstractmethod
-    def secret_payloads(self) -> dict[str, dict[str, bytes]]:
-        """K8s Secrets this agent needs, keyed by secret name. Values are
-        maps of filename → contents. The orchestrator creates these in the
-        session namespace before the pod starts."""
-
-    @abstractmethod
-    def volumes_and_mounts(
-        self,
-        cwd: Path,
-        username: str,
-        aws_creds_secret_name: str | None,
-        debug_host_dir: Path | None,
-    ) -> tuple[list[dict], list[dict]]:
-        """Pod-spec `volumes` and the container's `volumeMounts`."""
-
-    def container_env(self, cwd: Path, debug: bool) -> dict[str, str]:
-        """Agent-specific env vars. Universal vars (HTTPS_PROXY, WORKDIR,
-        USERNAME) are set by the orchestrator."""
-        return {}
-
-    def container_security_context(self, uid: int, gid: int) -> dict:
-        """Container-level securityContext for the agent pod. Default is the
-        full hardened context (drop-ALL, RoFS, non-root, seccomp RuntimeDefault).
-        Agents that need nested workloads (e.g. docker-in-docker) override this
-        — only the agent container is affected; mitm/sigv4 are untouched."""
-        return hardened_container_security_context(uid=uid, gid=gid)
-
-    def container_init_command(self) -> list[str]:
-        """Argv for the pod's PID 1. Default is `sleep infinity` (the agent
-        process is launched later via `kubectl exec`). Override if PID 1 needs
-        to bring up background daemons before the agent is exec'd."""
-        return ["sleep", "infinity"]
-
-    def container_command(self, username: str, debug: bool) -> list[str]:
-        """Argv for `kubectl exec -it agent -- ...`. Override to launch your
-        CLI directly; default drops into an interactive bash."""
-        return ["bash", "-l"]
+    def pod_contribution(self, ctx: PodBuildContext) -> PodContribution:
+        """Agent-specific pod pieces. Default: drop into an interactive bash with
+        the full hardened security context and no extra volumes. Override to add
+        volumes/mounts/env, run a different PID 1, or relax hardening (e.g. DinD)."""
+        return PodContribution(
+            security_context=hardened_container_security_context(
+                uid=ctx.uid, gid=ctx.gid
+            ),
+            init_command=["sleep", "infinity"],
+            command=["bash", "-l"],
+        )

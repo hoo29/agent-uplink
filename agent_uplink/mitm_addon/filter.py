@@ -13,6 +13,9 @@ import re
 from mitmproxy import ctx, http
 from mitmproxy.addonmanager import Loader
 
+# This addon runs inside the mitmproxy container as its own process, so it logs
+# under the module name (not agent-uplink's host-side "agent-uplink" logger).
+# Messages keep an "agent-uplink" prefix so they're greppable in mitm's output.
 logger = logging.getLogger(__name__)
 
 # AWS SigV4 Authorization header:
@@ -63,53 +66,11 @@ class RuleEnforcer:
             f", {len(self._sigv4_routes)} sigv4 routes"
         )
 
-    def _try_sigv4_route(self, flow: http.HTTPFlow) -> bool:
-        """Reroute AWS-signed requests to the matching sigv4-proxy sidecar.
-
-        Returns True if the request was rerouted (caller should skip the
-        normal allow-list check).
+    def _match_rule(self, req: http.HTTPRequest):
+        """Return (name, inject_headers) for the first allow rule that matches,
+        else None. Matching is host (fullmatch) + optional method + optional
+        path. First match wins; rules are pre-ordered by the host (layer order).
         """
-        if not self._sigv4_routes:
-            return False
-        req = flow.request
-        if not req.host.endswith(".amazonaws.com"):
-            return False
-        auth = req.headers.get("Authorization", "")
-        m = _SIGV4_AKIA_RE.match(auth)
-        if not m:
-            return False
-        akia = m.group(1)
-        route = self._sigv4_routes.get(akia)
-        if route is None:
-            logger.warning(
-                f"agent-uplink DENY [sigv4-no-route] {req.method} "
-                f"{req.host}{req.path} akia={akia}"
-            )
-            flow.response = http.Response.make(
-                403,
-                b"agent-uplink: no sigv4-proxy route for this AKIA\n",
-                {"Content-Type": "text/plain"},
-            )
-            return True
-
-        original_host = req.host
-        for h in _SIGV4_HEADERS_TO_STRIP:
-            req.headers.pop(h, None)
-        req.scheme = "http"
-        req.host = route["upstream_host"]
-        req.port = int(route["upstream_port"])
-        # sigv4-proxy uses the Host header to pick the AWS service/region.
-        req.headers["Host"] = original_host
-        logger.info(
-            f"agent-uplink SIGV4 [{akia}] {req.method} "
-            f"{original_host}{req.path} → {route['upstream_host']}"
-        )
-        return True
-
-    def request(self, flow: http.HTTPFlow) -> None:
-        if self._try_sigv4_route(flow):
-            return
-        req = flow.request
         for host_re, methods, path_res, inject_headers, name in self._compiled:
             if not host_re.fullmatch(req.host):
                 continue
@@ -117,17 +78,69 @@ class RuleEnforcer:
                 continue
             if path_res and not any(p.fullmatch(req.path) for p in path_res):
                 continue
-            for k, v in inject_headers.items():
-                req.headers[k] = v
-            logger.info(
-                f"agent-uplink ALLOW [{name}] {req.method} {req.host}{req.path}")
-            return
-        logger.warning(f"agent-uplink DENY {req.method} {req.host}{req.path}")
-        flow.response = http.Response.make(
-            403,
-            b"agent-uplink: request not permitted by rules\n",
-            {"Content-Type": "text/plain"},
+            return name, inject_headers
+        return None
+
+    def _reroute_sigv4(self, req: http.HTTPRequest, rule_name: str) -> bool:
+        """If `req` is an AWS-signed request we have a sidecar route for, strip
+        its (bogus) signature and reroute it to the aws-sigv4-proxy sidecar to be
+        re-signed with the real credentials. Returns True if rerouted.
+
+        Only called *after* an allow rule has authorised the AWS host — the
+        allow-list, not the mere presence of an AWS signature, is what permits an
+        AWS request (so a profile's full IAM scope is not implicitly reachable).
+        """
+        if not self._sigv4_routes:
+            return False
+        if not req.host.endswith(".amazonaws.com"):
+            return False
+        m = _SIGV4_AKIA_RE.match(req.headers.get("Authorization", ""))
+        if not m:
+            return False
+        route = self._sigv4_routes.get(m.group(1))
+        if route is None:
+            # Authorised AWS host signed with an AKIA we have no sidecar for.
+            # Leave it unrerouted; it will fail at AWS with the dummy signature.
+            logger.warning(
+                f"agent-uplink sigv4 no route akia={m.group(1)} host={req.host}"
+            )
+            return False
+        original_host = req.host
+        for h in _SIGV4_HEADERS_TO_STRIP:
+            req.headers.pop(h, None)
+        # In-namespace, mitm→sidecar-only leg (NetworkPolicy), so plaintext HTTP.
+        req.scheme = "http"
+        req.host = route["upstream_host"]
+        req.port = int(route["upstream_port"])
+        # sigv4-proxy uses the Host header to pick the AWS service/region.
+        req.headers["Host"] = original_host
+        logger.info(
+            f"agent-uplink SIGV4 [{rule_name}/{m.group(1)}] {req.method} "
+            f"{original_host}{req.path} → {route['upstream_host']}"
         )
+        return True
+
+    def request(self, flow: http.HTTPFlow) -> None:
+        req = flow.request
+        matched = self._match_rule(req)
+        if matched is None:
+            logger.warning(f"agent-uplink DENY {req.method} {req.host}{req.path}")
+            flow.response = http.Response.make(
+                403,
+                b"agent-uplink: request not permitted by rules\n",
+                {"Content-Type": "text/plain"},
+            )
+            return
+        name, inject_headers = matched
+        # A matched AWS request signed with a dummy AKIA is rerouted to the
+        # re-signing sidecar. inject.headers and SigV4 rerouting are mutually
+        # exclusive on *.amazonaws.com: a rerouted request is re-signed by the
+        # sidecar, so any inject.headers on it would be discarded — we skip them.
+        if self._reroute_sigv4(req, name):
+            return
+        for k, v in inject_headers.items():
+            req.headers[k] = v
+        logger.info(f"agent-uplink ALLOW [{name}] {req.method} {req.host}{req.path}")
 
 
 addons = [RuleEnforcer()]

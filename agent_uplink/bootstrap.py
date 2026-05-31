@@ -17,17 +17,21 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .k8s import (
+    Resources,
     apply_manifests,
+    container_spec,
     deployment_manifest,
     hostpath_volume,
     kubectl,
-    namespace_exists,
     namespace_manifest,
     pod_manifest,
+    pod_spec,
     service_manifest,
     wait_for_deployment_ready,
     wait_for_pod_succeeded,
@@ -94,45 +98,38 @@ def check_registries_yaml() -> None:
 
 def _registry_manifests(image: str) -> list[dict]:
     labels = {"app": "registry"}
-    pod_spec: dict = {
-        "hostNetwork": True,
-        "dnsPolicy": "ClusterFirstWithHostNet",
-        "containers": [
-            {
-                "name": "registry",
-                "image": image,
-                "imagePullPolicy": "IfNotPresent",
-                "ports": [
-                    {
-                        "containerPort": 5000,
-                        "hostPort": REGISTRY_HOST_PORT,
-                        "protocol": "TCP",
-                    }
-                ],
-                "env": [
-                    {"name": "REGISTRY_HTTP_ADDR", "value": "0.0.0.0:5000"},
-                    {
-                        "name": "REGISTRY_STORAGE_DELETE_ENABLED",
-                        "value": "true",
-                    },
-                ],
-                "volumeMounts": [{"name": "data", "mountPath": "/var/lib/registry"}],
-                "resources": {"limits": {"memory": "256Mi", "cpu": "1"}},
-            }
+    container = container_spec(
+        name="registry",
+        image=image,
+        # Bind loopback only. With hostNetwork this still serves the host's
+        # `docker push localhost:5000` and the node's containerd pulls (both
+        # local to the node), without exposing the unauthenticated registry on
+        # the node's other interfaces / LAN.
+        env={
+            "REGISTRY_HTTP_ADDR": "127.0.0.1:5000",
+            "REGISTRY_STORAGE_DELETE_ENABLED": "true",
+        },
+        volume_mounts=[{"name": "data", "mountPath": "/var/lib/registry"}],
+        resources=Resources(memory="256Mi", cpu="1"),
+        ports=[
+            {"containerPort": 5000, "hostPort": REGISTRY_HOST_PORT, "protocol": "TCP"}
         ],
-        "volumes": [
-            hostpath_volume(
-                "data", REGISTRY_HOSTPATH, hp_type="DirectoryOrCreate"
-            )
+    )
+    spec = pod_spec(
+        container=container,
+        volumes=[
+            hostpath_volume("data", REGISTRY_HOSTPATH, hp_type="DirectoryOrCreate")
         ],
-    }
+        host_network=True,
+        dns_policy="ClusterFirstWithHostNet",
+    )
     return [
         namespace_manifest(REGISTRY_NAMESPACE),
         deployment_manifest(
             REGISTRY_DEPLOYMENT,
             REGISTRY_NAMESPACE,
             labels=labels,
-            pod_spec=pod_spec,
+            pod_spec=spec,
         ),
         service_manifest(
             REGISTRY_DEPLOYMENT,
@@ -166,7 +163,6 @@ def get_image_age_seconds(full_image: str) -> float | None:
     ).strip()
     if not out:
         return None
-    from datetime import datetime, timezone
     ts = out.rstrip("Z").split(".")[0]
     created = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - created).total_seconds()
@@ -180,10 +176,6 @@ def build_and_push_agent_image(
     the fully qualified image reference."""
     full_image = f"{REGISTRY_PUSH_ENDPOINT}/{image_repo}:latest"
 
-    # Copy mitm CA into the build context so the Dockerfile's COPY succeeds.
-    shutil.copytree(mitm_dir, container_dir / "certs", dirs_exist_ok=True)
-
-    LOGGER.info(f"building {full_image}")
     build_args = [
         "--build-arg", f"USERNAME={username}",
         "--build-arg", f"USER_UID={os.getuid()}",
@@ -191,10 +183,29 @@ def build_and_push_agent_image(
     ]
     if force_rebuild:
         build_args += ["--build-arg", f"CACHE_BUST={int(time.time())}"]
-    run_command(
-        ["docker", "build", *build_args, "-t", full_image, str(container_dir)],
-        stdout=None, stderr=None,
-    )
+
+    # Assemble the build context in a tempdir so we never mutate the source tree
+    # and only the PUBLIC mitm cert enters the context (the CA private key in
+    # mitm_dir must never reach a build layer or artifact).
+    with tempfile.TemporaryDirectory(prefix="agent-uplink-build-") as td:
+        ctx = Path(td)
+        shutil.copytree(
+            container_dir,
+            ctx,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("certs", "__pycache__", "*.pyc"),
+        )
+        certs = ctx / "certs"
+        certs.mkdir(exist_ok=True)
+        shutil.copy2(
+            mitm_dir / "mitmproxy-ca-cert.pem", certs / "mitmproxy-ca-cert.pem"
+        )
+        LOGGER.info(f"building {full_image}")
+        run_command(
+            ["docker", "build", *build_args, "-t", full_image, str(ctx)],
+            stdout=None, stderr=None,
+        )
+
     LOGGER.info(f"pushing {full_image}")
     run_command(["docker", "push", full_image], stdout=None, stderr=None)
     return full_image
@@ -216,19 +227,25 @@ def ensure_mitm_certs(mitm_dir: Path, mitmproxy_image: str) -> bool:
     LOGGER.info("generating mitmproxy CA via one-shot pod")
     uid, gid = os.getuid(), os.getgid()
     pod_name = f"agent-uplink-cert-gen-{os.getpid()}"
-    pod = pod_manifest(
-        name=pod_name,
-        namespace="default",
-        labels={"app": "agent-uplink-cert-gen"},
+    container = container_spec(
         image=mitmproxy_image,
         command=["sh", "-c"],
         args=["exec mitmdump --set confdir=/certs --no-server -r /dev/null"],
-        volumes=[hostpath_volume("certs", str(mitm_dir), hp_type="DirectoryOrCreate")],
         volume_mounts=[{"name": "certs", "mountPath": "/certs"}],
-        container_security_context={"runAsUser": uid, "runAsGroup": gid},
-        restart_policy="Never",
-        memory="256Mi",
-        cpu="500m",
+        security_context={"runAsUser": uid, "runAsGroup": gid},
+        resources=Resources(memory="256Mi", cpu="500m"),
+    )
+    pod = pod_manifest(
+        pod_name,
+        "default",
+        labels={"app": "agent-uplink-cert-gen"},
+        spec=pod_spec(
+            container=container,
+            volumes=[
+                hostpath_volume("certs", str(mitm_dir), hp_type="DirectoryOrCreate")
+            ],
+            restart_policy="Never",
+        ),
     )
     try:
         apply_manifests([pod])
@@ -243,15 +260,3 @@ def ensure_mitm_certs(mitm_dir: Path, mitmproxy_image: str) -> bool:
             f"mitm cert generation didn't produce {cert_file}; check pod logs"
         )
     return True
-
-
-# ---------------------------------------------------------------------------
-# Misc
-# ---------------------------------------------------------------------------
-
-
-def ensure_registry_namespace() -> None:
-    """Apply just the registry namespace (used early so the deployment apply
-    has somewhere to land)."""
-    if not namespace_exists(REGISTRY_NAMESPACE):
-        apply_manifests([namespace_manifest(REGISTRY_NAMESPACE)])

@@ -1,0 +1,21 @@
+# AWS CodeArtifact (Maven) auth.
+#
+# CodeArtifact's Maven endpoint uses HTTP Basic auth: username `aws`, password =
+# a short-lived token from `aws codeartifact get-authorization-token`. The
+# {{exec:...}} placeholder runs on the HOST at startup (same trust + AWS
+# credentials as your shell — this is your `acal` alias) and the resulting Basic
+# auth header is injected in the mitm pod, so the real token never enters the
+# agent container. The token is regenerated fresh each session.
+#
+# The endpoint host is <domain>-<domain-owner>.d.codeartifact.<region>.amazonaws.com.
+# Adjust domain / domain-owner / region below to match your CodeArtifact setup.
+#
+# Maven Central and other public GETs stay allowed by the default rules (user
+# rules are appended), so you don't need to list them here.
+
+rules:
+  - name: codeartifact-maven
+    host: 'ABC\.d\.codeartifact\.eu-west-2\.amazonaws\.com'
+    inject:
+      headers:
+        Authorization: 'Basic {{exec:printf ''aws:%s'' "$(aws codeartifact get-authorization-token --region eu-west-2 --domain-owner ACCOUNT_ID --domain DOMAIN --query authorizationToken --output text)" | base64 -w0}}'
