@@ -29,6 +29,7 @@ agent-uplink claude --anthropic --rules examples/rules/atlassian.yaml
 agent-uplink claude --anthropic --rules my.yaml --no-default-rules
 agent-uplink claude --anthropic --agent-runtime-class kata-qemu  # override default kata-clh
 agent-uplink claude --anthropic --mitm-runtime-class kata-clh    # microVM mitm too (slower)
+agent-uplink claude --anthropic --ssh-cidr 10.0.0.0/24 203.0.113.7 --ssh-key-dir ~/keys/agent  # SSH egress
 agent-uplink claude --anthropic --debug
 
 # Tests (no tests exist yet, but the runner is)
@@ -111,7 +112,7 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 
 - **Working directory**: `agent-uplink` must be run from within `/home/<USER>/` (validated in Python).
 - **Image rebuild triggers**: rebuild + push whenever mitm certs are newly generated, `--force-rebuild` is passed, the image doesn't exist locally, or it's older than `AGENT_IMAGE_MAX_AGE_SECONDS` (24 h).
-- **Security posture (agent pod)**: `runtimeClassName: kata-clh` (microVM isolation; `kata-qemu` / `kata-fc` selectable via `--agent-runtime-class`). Container runs `privileged=true`, `allowPrivilegeEscalation=true`, `seccompProfile=Unconfined`, PID 1 as root — required so the nested `dockerd` can manage cgroups/namespaces/mounts/iptables inside the guest. `readOnlyRootFilesystem=true` is preserved; every path `dockerd` writes to is an explicit emptyDir mount (`/var/lib/docker` 2Gi tmpfs, `/run` 64Mi tmpfs, plus the usual `/tmp`, `~/.claude/`, `~/.local/share/applications/`). The interactive session drops to the host UID via `runuser` in `container_command`. NetworkPolicy egress restricted to `mitm:8080` + `kube-dns`. Memory 10Gi (drives tmpfs `/var/lib/docker` — disk-backed emptyDir would land on kata virtio-fs, which the kernel rejects as an overlay upperdir), CPU 1. Trust boundary is the kata guest kernel.
+- **Security posture (agent pod)**: `runtimeClassName: kata-clh` (microVM isolation; `kata-qemu` / `kata-fc` selectable via `--agent-runtime-class`). Container runs `privileged=true`, `allowPrivilegeEscalation=true`, `seccompProfile=Unconfined`, PID 1 as root — required so the nested `dockerd` can manage cgroups/namespaces/mounts/iptables inside the guest. `readOnlyRootFilesystem=true` is preserved; every path `dockerd` writes to is an explicit emptyDir mount (`/var/lib/docker` 2Gi tmpfs, `/run` 64Mi tmpfs, plus the usual `/tmp`, `~/.claude/`, `~/.local/share/applications/`). The interactive session drops to the host UID via `runuser` in `container_command`. NetworkPolicy egress restricted to `mitm:8080` + `kube-dns` (plus TCP 22 to `--ssh-cidr` ranges if set — see SSH egress). Memory 10Gi (drives tmpfs `/var/lib/docker` — disk-backed emptyDir would land on kata virtio-fs, which the kernel rejects as an overlay upperdir), CPU 1. Trust boundary is the kata guest kernel.
 - **Security posture (mitm / sigv4 pods)**: full hardened container security context (`drop=[ALL]`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation=false`, `runAsNonRoot=true`, `seccompProfile=RuntimeDefault`) under the cluster default runtime (faster cold start). Egress isolation enforced by NetworkPolicy. Memory 512Mi / 128Mi, CPU 1 / 0.5.
 
 ### Module layout
@@ -243,6 +244,15 @@ Real AWS credentials are obtained on the host via `aws configure export-credenti
 | Policy | Selector | Effect |
 |---|---|---|
 | `default-deny` | all pods | Deny all ingress + egress unless another policy allows it |
-| `agent-egress` | `app=agent` | Egress only to `app=mitm` on TCP 8080 + `kube-system/kube-dns` on UDP/TCP 53 |
+| `agent-egress` | `app=agent` | Egress only to `app=mitm` on TCP 8080 + `kube-system/kube-dns` on UDP/TCP 53, plus TCP 22 to any `--ssh-cidr` ranges (see SSH egress) |
 | `mitm-policy` | `app=mitm` | Ingress from `app=agent` on TCP 8080; egress unrestricted (out to internet + sigv4 services) |
 | `sigv4-policy` | `tier=sigv4` | Ingress from `app=mitm` on TCP 8080; egress unrestricted (to AWS) |
+
+### SSH egress
+
+By default the agent pod can only reach `mitm` and `kube-dns`, so SSH is blocked. Two flags open a controlled SSH path that **bypasses mitm** (SSH is not HTTP — there is no allow-list, rule engine, or credential injection for it; it is a different, weaker trust model than the rest of agent-uplink):
+
+- `--ssh-cidr <CIDR> [<CIDR> ...]` — adds an `agent-egress` rule allowing **TCP 22 only** to those `ipBlock` CIDRs (a bare IP becomes `/32`; CIDRs are normalised to their network address). Everything else stays denied, and those CIDRs are reachable on no other port. This `ipBlock` set is the **sole** control on SSH egress, so scope it tightly. NetworkPolicy matches resolved IPs, not DNS names — `kube-dns` still resolves the target, but the returned IP must fall inside an allowed CIDR (mind DNS/CDN churn for hosts like GitHub).
+- `--ssh-key-dir <DIR>` — mounts a host directory of SSH private keys **read-only** at the agent user's `~/.ssh` (the directory need not be named `.ssh`). Read-only keeps the untrusted agent from tampering with the keys; the cost is that `known_hosts` can't be persisted (connections still succeed; pre-seed a `known_hosts` in the dir to avoid prompts). The container user shares the host UID (`USER_UID` build arg), so `0600` host-owned keys are readable.
+
+The two flags are independent but want each other: keys without a CIDR can't reach anything on 22, and a CIDR without keys opens egress with nothing to authenticate with — each case logs a warning. Implementation: `--ssh-cidr` flows into `_network_policies` (`cli.py`) and `--ssh-key-dir` into `_agent_pod_manifest` (`cli.py`); both are orchestrator-level (universal) concerns, so no `Agent` subclass is involved.
