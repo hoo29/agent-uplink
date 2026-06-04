@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import logging
 import os
 import pwd
@@ -35,6 +36,7 @@ from .k8s import (
     container_spec,
     exec_interactive,
     hardened_container_security_context,
+    hostpath_volume,
     namespace_manifest,
     network_policy_manifest,
     pod_manifest,
@@ -127,6 +129,25 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         "commands at startup (off by default)",
     )
     common.add_argument(
+        "--ssh-cidr",
+        type=str,
+        nargs="*",
+        action="extend",
+        default=[],
+        metavar="CIDR",
+        help="CIDR(s) the agent may reach over SSH (TCP 22 only). Repeatable; "
+        "a bare IP is treated as /32. Egress to anything else stays denied. "
+        "SSH bypasses mitm, so this ipBlock set is the only control on it.",
+    )
+    common.add_argument(
+        "--ssh-key-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Host directory of SSH private keys to mount read-only at the "
+        "agent's ~/.ssh (the directory need not be named .ssh)",
+    )
+    common.add_argument(
         "-d",
         "--debug",
         action=argparse.BooleanOptionalAction,
@@ -159,6 +180,44 @@ def validate_cwd(username: str, cwd: Path) -> None:
     if cwd != home and home not in cwd.parents:
         raise ValueError(
             f"agent-uplink must be run from within {home}, got: {cwd}")
+
+
+def validate_ssh_args(
+    ssh_cidr: list[str], ssh_key_dir: Path | None
+) -> tuple[list[str], Path | None]:
+    """Validate + normalise the SSH egress options. Returns (cidrs, key_dir).
+
+    CIDRs are normalised to their network address (a bare IP becomes /32) so the
+    ipBlock the NetworkPolicy emits is always canonical. A missing key dir or a
+    malformed CIDR aborts startup before any pod is launched."""
+    cidrs: list[str] = []
+    for raw in ssh_cidr:
+        try:
+            net = ipaddress.ip_network(raw, strict=False)
+        except ValueError as exc:
+            raise ValueError(f"--ssh-cidr {raw!r} is not a valid CIDR: {exc}") from exc
+        cidrs.append(str(net))
+
+    key_dir: Path | None = None
+    if ssh_key_dir is not None:
+        key_dir = ssh_key_dir.expanduser().resolve()
+        if not key_dir.is_dir():
+            raise ValueError(
+                f"--ssh-key-dir {key_dir} does not exist or is not a directory"
+            )
+
+    if key_dir is not None and not cidrs:
+        LOGGER.warning(
+            "--ssh-key-dir set without --ssh-cidr: SSH egress stays denied, so "
+            "the agent has keys but can reach nothing on TCP 22"
+        )
+    if cidrs and key_dir is None:
+        LOGGER.warning(
+            "--ssh-cidr set without --ssh-key-dir: TCP 22 egress to %s is open "
+            "but no SSH keys are mounted",
+            ", ".join(cidrs),
+        )
+    return cidrs, key_dir
 
 
 # ---------------------------------------------------------------------------
@@ -288,15 +347,34 @@ def _agent_pod_manifest(
     username: str,
     gid: int,
     runtime_class: str,
+    ssh_key_dir: Path | None = None,
 ) -> dict:
     env = _agent_env(cwd, username)
     env.update(contribution.env)
+    volumes = list(contribution.volumes)
+    mounts = list(contribution.mounts)
+    # SSH private keys: the host dir is mounted read-only at the agent user's
+    # ~/.ssh so `ssh` discovers them. Read-only keeps the untrusted agent from
+    # tampering with the host keys (cost: known_hosts can't be persisted back).
+    # The container user shares the host UID (Dockerfile USER_UID), so 0600 host
+    # keys are readable. Reachability is gated by the --ssh-cidr egress rule.
+    if ssh_key_dir is not None:
+        volumes.append(
+            hostpath_volume("ssh-keys", str(ssh_key_dir), hp_type="Directory")
+        )
+        mounts.append(
+            {
+                "name": "ssh-keys",
+                "mountPath": f"/home/{username}/.ssh",
+                "readOnly": True,
+            }
+        )
     container = container_spec(
         name=AGENT_CONTAINER_NAME,
         image=full_image,
         command=contribution.init_command,
         env=env,
-        volume_mounts=contribution.mounts,
+        volume_mounts=mounts,
         security_context=contribution.security_context,
         resources=Resources(memory=contribution.memory, cpu="1"),
         stdio=Stdio(stdin=True, tty=True),
@@ -304,15 +382,51 @@ def _agent_pod_manifest(
     )
     spec = pod_spec(
         container=container,
-        volumes=contribution.volumes,
+        volumes=volumes,
         runtime_class=runtime_class or None,
         pod_security_context={"fsGroup": gid},
     )
     return pod_manifest("agent", ns, labels=_label("agent"), spec=spec)
 
 
-def _network_policies(ns: str, has_sigv4: bool) -> list[dict]:
+def _network_policies(
+    ns: str, has_sigv4: bool, ssh_cidrs: list[str] | None = None
+) -> list[dict]:
     """Default-deny + agent-egress + mitm-ingress + sigv4-ingress."""
+    # Agent egress: mitm:8080 and kube-dns by default; optionally TCP 22 to an
+    # explicit CIDR set.
+    agent_egress: list[dict] = [
+        {
+            "to": [{"podSelector": {"matchLabels": {"app": "mitm"}}}],
+            "ports": [{"protocol": "TCP", "port": PROXY_PORT}],
+        },
+        {
+            "to": [
+                {
+                    "namespaceSelector": {
+                        "matchLabels": {
+                            "kubernetes.io/metadata.name": "kube-system"
+                        }
+                    },
+                    "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+                }
+            ],
+            "ports": [
+                {"protocol": "UDP", "port": 53},
+                {"protocol": "TCP", "port": 53},
+            ],
+        },
+    ]
+    # SSH egress: TCP 22 only, to the given CIDRs only. This bypasses mitm
+    # (SSH is not HTTP — no allow-list, no credential injection), so the ipBlock
+    # set is the sole control; kube-dns above still resolves the target name.
+    if ssh_cidrs:
+        agent_egress.append(
+            {
+                "to": [{"ipBlock": {"cidr": cidr}} for cidr in ssh_cidrs],
+                "ports": [{"protocol": "TCP", "port": 22}],
+            }
+        )
     policies = [
         # Deny everything by default in this namespace.
         network_policy_manifest(
@@ -322,33 +436,12 @@ def _network_policies(ns: str, has_sigv4: bool) -> list[dict]:
             ingress=[],
             egress=[],
         ),
-        # Agent: egress only to mitm:8080 and kube-dns.
+        # Agent: egress only to mitm:8080, kube-dns, and any --ssh-cidr ranges.
         network_policy_manifest(
             "agent-egress",
             ns,
             pod_selector={"matchLabels": {"app": "agent"}},
-            egress=[
-                {
-                    "to": [{"podSelector": {"matchLabels": {"app": "mitm"}}}],
-                    "ports": [{"protocol": "TCP", "port": PROXY_PORT}],
-                },
-                {
-                    "to": [
-                        {
-                            "namespaceSelector": {
-                                "matchLabels": {
-                                    "kubernetes.io/metadata.name": "kube-system"
-                                }
-                            },
-                            "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
-                        }
-                    ],
-                    "ports": [
-                        {"protocol": "UDP", "port": 53},
-                        {"protocol": "TCP", "port": 53},
-                    ],
-                },
-            ],
+            egress=agent_egress,
         ),
         # mitm: accepts ingress from agent on 8080; egress unrestricted (out to
         # the internet for normal requests, in to sigv4 services for AWS).
@@ -393,6 +486,7 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
     username = os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
     cwd = Path.cwd()
     validate_cwd(username, cwd)
+    ssh_cidrs, ssh_key_dir = validate_ssh_args(args.ssh_cidr, args.ssh_key_dir)
 
     mitm_dir = STATE_DIR / "mitm"
 
@@ -537,7 +631,7 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
         manifests.append(secret_manifest(name, session.namespace, files))
 
     manifests.extend(_network_policies(
-        session.namespace, bool(aws_profile_names)))
+        session.namespace, bool(aws_profile_names), ssh_cidrs))
     manifests.extend(
         _mitm_manifests(
             session.namespace,
@@ -564,6 +658,7 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
             username,
             gid,
             args.agent_runtime_class,
+            ssh_key_dir,
         )
     )
 
