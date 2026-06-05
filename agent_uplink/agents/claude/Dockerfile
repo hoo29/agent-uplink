@@ -17,8 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   maven \
   net-tools \
   openjdk-21-jdk \
+  openssh-client \
   procps \
   python3 \
+  python3-venv \
   unzip \
   util-linux \
   vim \
@@ -45,6 +47,20 @@ RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2
   && unzip awscliv2.zip \
   && ./aws/install \
   && rm -rf ./aws*
+
+RUN curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/$(dpkg --print-architecture)/kubectl" -o /usr/local/bin/kubectl \
+  && chmod 0755 /usr/local/bin/kubectl
+
+RUN install -m 0755 -d /etc/apt/keyrings \
+  && curl -fsSL https://get.opentofu.org/opentofu.gpg -o /etc/apt/keyrings/opentofu.gpg \
+  && curl -fsSL https://packages.opentofu.org/opentofu/tofu/gpgkey \
+    | gpg --no-tty --batch --dearmor -o /etc/apt/keyrings/opentofu-repo.gpg \
+  && chmod a+r /etc/apt/keyrings/opentofu.gpg /etc/apt/keyrings/opentofu-repo.gpg \
+  && printf "Types: deb\nURIs: https://packages.opentofu.org/opentofu/tofu/any/\nSuites: any\nComponents: main\nSigned-By: /etc/apt/keyrings/opentofu.gpg /etc/apt/keyrings/opentofu-repo.gpg\n" \
+  > /etc/apt/sources.list.d/opentofu.sources \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends tofu \
+  && rm -rf /var/lib/apt/lists/*
 
 ARG USER_UID=1000
 ARG USER_GID=1000

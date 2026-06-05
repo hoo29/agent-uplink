@@ -46,6 +46,7 @@ flowchart LR
     certs --> mitm
     creds --> sidecar
     agent -->|HTTPS_PROXY=http://mitm:8080| mitm
+    agent -.->|TCP 22 only, --ssh-cidr<br/>bypasses mitm| internet
     mitm -->|allowed + injected| internet
     mitm -->|SigV4 reroute by dummy AKIA| sidecar
     sidecar -->|re-signed| aws
@@ -70,6 +71,7 @@ agent-uplink claude --anthropic --rules examples/rules/atlassian.yaml
 agent-uplink claude --bedrock --aws-profiles profile1 profile2
 agent-uplink claude --anthropic --force-rebuild
 agent-uplink claude --anthropic --rules examples/rules/ecr.yaml         # authenticated docker pulls (ECR)
+agent-uplink claude --anthropic --ssh-cidr 10.0.0.0/24 --ssh-key-dir ~/keys/agent  # SSH egress
 ```
 
 `--anthropic` reads `~/.claude/.credentials.json` (run `claude login` first). `--bedrock` reads `keyring get bedrock key`.
@@ -79,6 +81,15 @@ Each run creates a session namespace `agent-uplink-<id>`, torn down on exit.
 ### Authenticated docker pulls
 
 `~/.docker/config.json` is never mounted into the pod. Private registry auth is handled the same way as everything else — a mitm rule injects the `Authorization` header on the registry host. The in-pod `dockerd` pulls anonymously; mitm adds the credential. `examples/rules/ecr.yaml` shows this for AWS ECR (Basic auth, token resolved on the host via `{{exec:...}}`, never entering the pod).
+
+### SSH egress
+
+By default the agent pod reaches only `mitm` and `kube-dns`, so SSH is blocked. Two flags open a controlled SSH path that **bypasses mitm** — SSH is not HTTP, so there is no allow-list, rule engine, or credential injection for it (a weaker trust model than the rest of agent-uplink):
+
+- `--ssh-cidr <CIDR> [<CIDR> ...]` — allows **TCP 22 only** to those CIDRs (a bare IP becomes `/32`). This is the sole control on SSH egress, so scope it tightly. NetworkPolicy matches resolved IPs, not DNS names, so mind DNS/CDN churn for hosts like GitHub.
+- `--ssh-key-dir <DIR>` — mounts a host directory of SSH private keys **read-only** at the agent user's `~/.ssh`. Read-only means `known_hosts` can't be persisted (pre-seed one in the dir to avoid prompts). The container user shares the host UID, so `0600` host-owned keys are readable.
+
+The flags are independent but want each other (each logs a warning if used alone).
 
 ## Rules
 
@@ -109,6 +120,7 @@ This is a fun side project that was nearly all written with claude, no guarantee
 - Default rules allow `GET`/`OPTIONS`/`HEAD` to any host, so with defaults on, anything the agent can read can be exfiltrated via GET query strings/headers. For untrusted workloads, run `--no-default-rules` with an explicit allow-list.
 - DNS to kube-dns is allowed (`^`) — a residual exfiltration channel the mitm allow-list never sees.
 - `--allow-exec` lets a `--rules` file run host shell commands at startup - only enable it for rules files you trust.
+- `--ssh-cidr` opens TCP 22 to the given CIDRs **bypassing mitm entirely** (no allow-list or rule engine for SSH) — scope the CIDRs tightly.
 - For the `claude` agent, only an allow-list of non-secret `~/.claude/settings.json` keys is copied into the pod (secret-bearing keys like `apiKeyHelper` and unknown `env` vars are dropped).
 
 ^ NetworkPolicies can't restrict traffic for pod <-> host where the pod is scheduled.
