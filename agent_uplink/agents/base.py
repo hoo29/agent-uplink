@@ -128,7 +128,8 @@ class Agent(ABC):
     def pod_contribution(self, ctx: PodBuildContext) -> PodContribution:
         """Agent-specific pod pieces. Default: drop into an interactive bash with
         the full hardened security context and no extra volumes. Override to add
-        volumes/mounts/env, run a different PID 1, or relax hardening (e.g. DinD)."""
+        volumes/mounts/env, run a different PID 1, or relax hardening (e.g. to
+        run an in-pod dockerd)."""
         return PodContribution(
             security_context=hardened_container_security_context(
                 uid=ctx.uid, gid=ctx.gid

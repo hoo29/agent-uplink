@@ -5,3 +5,4 @@ agent_uplink/agents/*/certs
 examples/rules/mine.yaml
 .claude/projects
 build
+.claude/*.lock

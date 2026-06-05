@@ -54,7 +54,7 @@ LOGGER = logging.getLogger("agent-uplink")
 
 STATE_DIR = Path.home() / ".agent_uplink"
 
-DEFAULT_MITM_IMAGE = "mitmproxy/mitmproxy:latest"
+DEFAULT_MITM_IMAGE = "mitmproxy/mitmproxy:12"
 DEFAULT_SIGV4_PROXY_IMAGE = "public.ecr.aws/aws-observability/aws-sigv4-proxy:latest"
 DEFAULT_AGENT_RUNTIME_CLASS = "kata-clh"
 
@@ -261,7 +261,9 @@ def _mitm_manifests(
             {"name": "tmp", "mountPath": "/tmp"},
         ],
         security_context=hardened_container_security_context(uid=1000, gid=1000),
-        resources=Resources(memory="512Mi", cpu="1"),
+        resources=Resources(
+            memory="512Mi", cpu="500m", memory_request="96Mi", cpu_request="50m"
+        ),
         ports=[{"containerPort": PROXY_PORT, "protocol": "TCP"}],
     )
     spec = pod_spec(
@@ -301,7 +303,9 @@ def _sigv4_manifests(
             {"name": "tmp", "mountPath": "/tmp"},
         ],
         security_context=hardened_container_security_context(uid=1000, gid=1000),
-        resources=Resources(memory="128Mi", cpu="500m"),
+        resources=Resources(
+            memory="128Mi", cpu="100m", memory_request="48Mi", cpu_request="25m"
+        ),
         ports=[{"containerPort": PROXY_PORT, "protocol": "TCP"}],
     )
     spec = pod_spec(
@@ -376,7 +380,12 @@ def _agent_pod_manifest(
         env=env,
         volume_mounts=mounts,
         security_context=contribution.security_context,
-        resources=Resources(memory=contribution.memory, cpu="1"),
+        # Reserve modestly so the pod schedules on small nodes; the limit is the
+        # real ceiling the in-pod dockerd needs (tmpfs /var/lib/docker counts
+        # against memory).
+        resources=Resources(
+            memory=contribution.memory, cpu="1", memory_request="1Gi", cpu_request="250m"
+        ),
         stdio=Stdio(stdin=True, tty=True),
         image_pull_policy="Always",
     )

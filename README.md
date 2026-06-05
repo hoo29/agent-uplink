@@ -121,6 +121,26 @@ This is a fun side project that was nearly all written with claude, no guarantee
 - DNS to kube-dns is allowed (`^`) — a residual exfiltration channel the mitm allow-list never sees.
 - `--allow-exec` lets a `--rules` file run host shell commands at startup - only enable it for rules files you trust.
 - `--ssh-cidr` opens TCP 22 to the given CIDRs **bypassing mitm entirely** (no allow-list or rule engine for SSH) — scope the CIDRs tightly.
-- For the `claude` agent, only an allow-list of non-secret `~/.claude/settings.json` keys is copied into the pod (secret-bearing keys like `apiKeyHelper` and unknown `env` vars are dropped).
+- For the `claude` agent, the host `~/.claude/settings.json` is currently copied into the pod **wholesale** (only the top-level `sandbox` key is dropped and `permissions` is replaced). Secret-bearing keys — `apiKeyHelper` and any secret `env` vars — therefore **do** reach the agent pod's `settings.json`, so keep secrets out of your host `settings.json`. An allow-list that drops these was intended but isn't implemented yet (tracked by an `xfail` test, `tests/unit/test_claude_config.py::test_settings_strips_secret_bearing_keys`).
 
 ^ NetworkPolicies can't restrict traffic for pod <-> host where the pod is scheduled.
+
+## Testing
+
+```bash
+pip install -e ".[tests]"
+pytest tests/unit          # fast, no cluster
+pytest tests/integration   # live k3s; deploys namespaces/pods/policies
+pytest tests               # everything
+```
+
+Unit tests need nothing. The integration suite runs against a live k3s cluster
+(reusing the same `kubectl` + `docker` + `localhost:5000` registry setup the tool
+itself needs) and focuses on the security posture: credentials never reaching the
+agent pod, the agent's egress being confined to mitm + kube-dns, and the
+allow-list / credential-injection / SigV4 reroute behaving as designed. **No real
+credentials are needed** — every secret is a dummy or a sentinel. Pods run
+privileged on the default runtime (no kata), so the suite runs on a bare k3s /
+GitHub runner; `.github/workflows/integration-tests.yml` does exactly that. If no
+cluster is reachable the integration suite skips itself. See
+[`tests/README.md`](tests/README.md) for the design and the findings it surfaced.

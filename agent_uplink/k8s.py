@@ -178,10 +178,18 @@ def service_manifest(
 
 @dataclass
 class Resources:
-    """Container resource limits."""
+    """Container resource requests + limits.
+
+    `memory`/`cpu` are the limits (the burst ceiling). `*_request` are the
+    scheduler reservation; when unset they default to the limit — matching
+    Kubernetes' own behaviour when `requests` is omitted — so callers that only
+    care about a cap are unchanged. Set a request below the limit to schedule on
+    smaller nodes while still allowing the pod to burst (Burstable QoS)."""
 
     memory: str = "256Mi"
     cpu: str = "1"
+    memory_request: str | None = None
+    cpu_request: str | None = None
 
 
 @dataclass
@@ -213,7 +221,13 @@ def container_spec(
         "name": name,
         "image": image,
         "imagePullPolicy": image_pull_policy,
-        "resources": {"limits": {"memory": resources.memory, "cpu": resources.cpu}},
+        "resources": {
+            "requests": {
+                "memory": resources.memory_request or resources.memory,
+                "cpu": resources.cpu_request or resources.cpu,
+            },
+            "limits": {"memory": resources.memory, "cpu": resources.cpu},
+        },
     }
     if command:
         container["command"] = command
