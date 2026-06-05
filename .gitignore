@@ -4,3 +4,4 @@ agent_uplink/agents/*/certs
 .venv
 examples/rules/mine.yaml
 .claude/projects
+build

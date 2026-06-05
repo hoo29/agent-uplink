@@ -11,6 +11,7 @@ from ...session import Session
 from ..base import Agent, PodBuildContext, PodContribution, PreparedAgent
 from .config import (
     HOST_CLAUDE_DIR,
+    claude_md_bytes,
     claude_settings_bytes,
     fake_oauth_credentials_bytes,
     get_bedrock_aws_profile_name,
@@ -29,6 +30,7 @@ _AUTH_MODE_ENV: dict[str, dict[str, str]] = {
 
 _SETTINGS_SECRET = "claude-settings"
 _FAKE_CREDS_SECRET = "claude-fake-creds"
+_CLAUDE_MD_SECRET = "claude-md"
 
 
 class ClaudeAgent(Agent):
@@ -122,6 +124,10 @@ class ClaudeAgent(Agent):
         settings = claude_settings_bytes(self._config(), auth_env)
         secret_payloads[_SETTINGS_SECRET] = {"settings.json": settings}
 
+        # CLAUDE.md = host's copy + appended sandbox guidance, shipped via Secret
+        # so the host file is left untouched (see _volumes_and_mounts).
+        secret_payloads[_CLAUDE_MD_SECRET] = {"CLAUDE.md": claude_md_bytes()}
+
         return PreparedAgent(auth_rules=auth_rules, secret_payloads=secret_payloads)
 
     def pod_contribution(self, ctx: PodBuildContext) -> PodContribution:
@@ -209,7 +215,19 @@ class ClaudeAgent(Agent):
                 }
             )
 
-        for name in ["CLAUDE.md", "commands", "skills", "history.jsonl"]:
+        # CLAUDE.md is shipped via Secret (host copy + sandbox guidance), not
+        # mounted from the host (see prepare()).
+        volumes.append(secret_volume("claude-md", _CLAUDE_MD_SECRET))
+        mounts.append(
+            {
+                "name": "claude-md",
+                "mountPath": f"{claude_dir}/CLAUDE.md",
+                "subPath": "CLAUDE.md",
+                "readOnly": True,
+            }
+        )
+
+        for name in ["commands", "skills", "plugins", "history.jsonl"]:
             host_path = HOST_CLAUDE_DIR / name
             if not host_path.exists():
                 continue

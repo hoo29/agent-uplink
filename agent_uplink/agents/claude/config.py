@@ -60,7 +60,8 @@ def fake_oauth_credentials_bytes(real_creds: dict) -> tuple[bytes, str]:
     """
     oauth = real_creds.get("claudeAiOauth")
     if not isinstance(oauth, dict):
-        raise ValueError("~/.claude/.credentials.json missing 'claudeAiOauth' object")
+        raise ValueError(
+            "~/.claude/.credentials.json missing 'claudeAiOauth' object")
     real_token = oauth.get("accessToken")
     if not isinstance(real_token, str) or not real_token:
         raise ValueError("~/.claude/.credentials.json has no 'accessToken'")
@@ -68,66 +69,50 @@ def fake_oauth_credentials_bytes(real_creds: dict) -> tuple[bytes, str]:
     fake_oauth = dict(oauth)
     fake_oauth["accessToken"] = f"sk-ant-oat01-agent-uplink-{uuid.uuid4().hex}"
     fake_oauth["refreshToken"] = f"sk-ant-ort01-agent-uplink-{uuid.uuid4().hex}"
-    fake_oauth["expiresAt"] = (int(time.time()) + _FAKE_OAUTH_TTL_SECONDS) * 1000
+    fake_oauth["expiresAt"] = (
+        int(time.time()) + _FAKE_OAUTH_TTL_SECONDS) * 1000
 
     fake = dict(real_creds)
     fake["claudeAiOauth"] = fake_oauth
     return json.dumps(fake, indent=2).encode("utf-8"), real_token
 
 
+# Appended to the container's CLAUDE.md so the agent knows it is sandboxed and
+# stops cheaply when it hits a limit it cannot work around.
+_SANDBOX_GUIDANCE = """
+## Sandbox
+
+- You are running in a microVM sandbox. All HTTPS egress goes through mitmproxy and is enforced against an allow-list.
+- A `403` with text 'request not permitted by rules' means the host is blocked by policy. Stop — do not retry or try to work around it.
+- If anything fails because of the sandbox (blocked network, missing access, readonly filesystem issues etc), stop and say so. Don't waste time or money trying to fix sandbox limitations.
+"""
+
+
+def claude_md_bytes() -> bytes:
+    """Container CLAUDE.md: the host's ~/.claude/CLAUDE.md (if any) with the
+    sandbox guidance appended. The host file is left untouched."""
+    path = HOST_CLAUDE_DIR / "CLAUDE.md"
+    base = path.read_text(encoding="utf8") if path.exists() else ""
+    if base and not base.endswith("\n"):
+        base += "\n"
+    return (base + _SANDBOX_GUIDANCE).encode("utf-8")
+
+
 def get_bedrock_aws_profile_name(claude_config: dict) -> str | None:
     return claude_config.get("env", {}).get("AWS_PROFILE")
 
 
-# settings.json is the user's own config for the CLI we run, but it can hold
-# secrets (env API keys, apiKeyHelper/awsCredentialExport commands), so we copy
-# an ALLOW-LIST of known-safe top-level keys into the pod rather than the whole
-# file minus a couple of keys. `env` is rebuilt separately (below) because it's
-# both needed and the most likely place for secrets. Extend these if the in-pod
-# CLI needs more — but never add `env`/`apiKeyHelper` here.
-_SETTINGS_KEY_ALLOWLIST = frozenset({
-    "model",
-    "theme",
-    "outputStyle",
-    "includeCoAuthoredBy",
-    "cleanupPeriodDays",
-    "permissions",
-    "statusLine",
-    "spinnerTipsEnabled",
-})
-
-# env var NAMES forwarded into the pod. Config-only (no secrets): the bedrock /
-# region routing the CLI needs, plus a few non-secret toggles. Anything not
-# listed (e.g. ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN) is dropped.
-_ENV_NAME_ALLOWLIST = frozenset({
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_SMALL_FAST_MODEL",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-    "AWS_PROFILE",
-    "DISABLE_TELEMETRY",
-    "DISABLE_AUTOUPDATER",
-    "DISABLE_ERROR_REPORTING",
-    "BASH_DEFAULT_TIMEOUT_MS",
-    "BASH_MAX_TIMEOUT_MS",
-    "MAX_THINKING_TOKENS",
-    "MCP_TIMEOUT",
-})
-
-
 def claude_settings_bytes(claude_config: dict, auth_env: dict[str, str]) -> bytes:
-    """Build the in-pod settings.json from an allow-list of host settings keys
-    so host secrets never ride along. `auth_env` (our injected placeholders,
-    e.g. AWS_BEARER_TOKEN_BEDROCK) is always merged into env and wins."""
-    filtered = {
-        k: v for k, v in claude_config.items() if k in _SETTINGS_KEY_ALLOWLIST
-    }
-    host_env = claude_config.get("env") or {}
-    safe_env = {k: v for k, v in host_env.items() if k in _ENV_NAME_ALLOWLIST}
-    safe_env.update(auth_env)
-    if safe_env:
-        filtered["env"] = safe_env
-    filtered["skipDangerousModePermissionPrompt"] = True
-    return json.dumps(filtered, indent=2).encode("utf-8")
+    """Build the in-pod settings.json by copying the host settings.json wholesale,
+    with two changes: the top-level `sandbox` key is dropped, and `permissions` is
+    replaced with just `{skipDangerousModePermissionPrompt: true}` (the agent runs
+    with --dangerously-skip-permissions, so host permission lists are irrelevant).
+    `auth_env` (our injected placeholders, e.g. AWS_BEARER_TOKEN_BEDROCK) is merged
+    into env and wins."""
+    settings = dict(claude_config)
+    settings.pop("sandbox", None)
+    if auth_env:
+        settings["env"] = {**(settings.get("env") or {}), **auth_env}
+    settings["permissions"] = {"skipDangerousModePermissionPrompt": True}
+    settings["skipDangerousModePermissionPrompt"] = True
+    return json.dumps(settings, indent=2).encode("utf-8")
