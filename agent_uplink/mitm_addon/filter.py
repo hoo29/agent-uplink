@@ -66,7 +66,7 @@ class RuleEnforcer:
             f", {len(self._sigv4_routes)} sigv4 routes"
         )
 
-    def _match_rule(self, req: http.HTTPRequest):
+    def _match_rule(self, req: http.Request):
         """Return (name, inject_headers) for the first allow rule that matches,
         else None. Matching is host (fullmatch) + optional method + optional
         path. First match wins; rules are pre-ordered by the host (layer order).
@@ -81,7 +81,7 @@ class RuleEnforcer:
             return name, inject_headers
         return None
 
-    def _reroute_sigv4(self, req: http.HTTPRequest, rule_name: str) -> bool:
+    def _reroute_sigv4(self, req: http.Request, rule_name: str) -> bool:
         """If `req` is an AWS-signed request we have a sidecar route for, strip
         its (bogus) signature and reroute it to the aws-sigv4-proxy sidecar to be
         re-signed with the real credentials. Returns True if rerouted.

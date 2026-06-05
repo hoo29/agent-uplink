@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **agent-uplink** runs a coding agent in a Kata-containers microVM on a local k3s cluster with all outbound traffic intercepted by mitmproxy. The agent pod has its egress restricted by a `NetworkPolicy` to the mitmproxy service only; the microVM boundary (`runtimeClassName: kata-clh`) gives defence in depth on top of the cluster network. Support pods (mitm, aws-sigv4-proxy) run with the cluster's default runtime under hardened security contexts.
 
-The microVM also exists to make Docker-in-Docker viable: the agent container runs a nested `dockerd` so the agent can spin up testcontainers and other Docker workloads while debugging tests. The earlier "Claude in a plain Docker container" design couldn't host that. The cost is that the agent container itself runs `privileged`, root, `seccompProfile=Unconfined` *inside* the kata guest — the kata guest kernel is the trust boundary, not the in-container hardening that the support pods retain.
+The microVM also exists to make running a Docker daemon inside the pod viable: the agent container runs its own `dockerd` so the agent can spin up testcontainers and other Docker workloads while debugging tests. (This is *not* Docker-in-Docker — the outer pod runtime is k3s's containerd plus the kata microVM, not a second Docker. There is exactly one `dockerd` in the stack, inside the agent container.) The earlier "Claude in a plain Docker container" design couldn't host that. The cost is that the agent container itself runs `privileged`, root, `seccompProfile=Unconfined` *inside* the kata guest — the kata guest kernel is the trust boundary, not the in-container hardening that the support pods retain.
 
 It is **agent-agnostic by design** — agent-specific bits (image, auth, config files, default rules) live behind an `Agent` interface in `agent_uplink/agents/`. Currently only `claude` is implemented; new agents are added by dropping a directory in `agent_uplink/agents/<name>/` and registering it in `agent_uplink/agents/__init__.py`.
 
@@ -24,7 +24,7 @@ agent-uplink claude --anthropic
 agent-uplink claude --bedrock --aws-profiles profile1 profile2
 agent-uplink claude --anthropic --force-rebuild
 agent-uplink claude --anthropic --image my-image
-agent-uplink claude --anthropic --mitmproxy-image mitmproxy/mitmproxy:latest
+agent-uplink claude --anthropic --mitmproxy-image mitmproxy/mitmproxy:12
 agent-uplink claude --anthropic --rules examples/rules/atlassian.yaml
 agent-uplink claude --anthropic --rules my.yaml --no-default-rules
 agent-uplink claude --anthropic --agent-runtime-class kata-qemu  # override default kata-clh
@@ -64,7 +64,7 @@ Every run creates a namespace `agent-uplink-<id>` containing:
 ```
               ┌───────────── agent-uplink-<id> ─────────────┐
               │                                             │
-              │  Pod: agent (kata-clh, privileged for DinD) │
+              │  Pod: agent (kata-clh, privileged, dockerd) │
               │    PID 1: dockerd-entrypoint.sh             │
               │    HTTPS_PROXY=http://mitm:8080             │
               │    NetworkPolicy: egress → mitm + kube-dns  │
@@ -112,8 +112,8 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 
 - **Working directory**: `agent-uplink` must be run from within `/home/<USER>/` (validated in Python).
 - **Image rebuild triggers**: rebuild + push whenever mitm certs are newly generated, `--force-rebuild` is passed, the image doesn't exist locally, or it's older than `AGENT_IMAGE_MAX_AGE_SECONDS` (24 h).
-- **Security posture (agent pod)**: `runtimeClassName: kata-clh` (microVM isolation; `kata-qemu` / `kata-fc` selectable via `--agent-runtime-class`). Container runs `privileged=true`, `allowPrivilegeEscalation=true`, `seccompProfile=Unconfined`, PID 1 as root — required so the nested `dockerd` can manage cgroups/namespaces/mounts/iptables inside the guest. `readOnlyRootFilesystem=true` is preserved; every path `dockerd` writes to is an explicit emptyDir mount (`/var/lib/docker` 2Gi tmpfs, `/run` 64Mi tmpfs, plus the usual `/tmp`, `~/.claude/`, `~/.local/share/applications/`). The interactive session drops to the host UID via `runuser` in `container_command`. NetworkPolicy egress restricted to `mitm:8080` + `kube-dns` (plus TCP 22 to `--ssh-cidr` ranges if set — see SSH egress). Memory 10Gi (drives tmpfs `/var/lib/docker` — disk-backed emptyDir would land on kata virtio-fs, which the kernel rejects as an overlay upperdir), CPU 1. Trust boundary is the kata guest kernel.
-- **Security posture (mitm / sigv4 pods)**: full hardened container security context (`drop=[ALL]`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation=false`, `runAsNonRoot=true`, `seccompProfile=RuntimeDefault`) under the cluster default runtime (faster cold start). Egress isolation enforced by NetworkPolicy. Memory 512Mi / 128Mi, CPU 1 / 0.5.
+- **Security posture (agent pod)**: `runtimeClassName: kata-clh` (microVM isolation; `kata-qemu` / `kata-fc` selectable via `--agent-runtime-class`). Container runs `privileged=true`, `allowPrivilegeEscalation=true`, `seccompProfile=Unconfined`, PID 1 as root — required so the nested `dockerd` can manage cgroups/namespaces/mounts/iptables inside the guest. `readOnlyRootFilesystem=true` is preserved; every path `dockerd` writes to is an explicit emptyDir mount (`/var/lib/docker` 2Gi tmpfs, `/run` 64Mi tmpfs, plus the usual `/tmp`, `~/.claude/`, `~/.local/share/applications/`). The interactive session drops to the host UID via `runuser` in `container_command`. NetworkPolicy egress restricted to `mitm:8080` + `kube-dns` (plus TCP 22 to `--ssh-cidr` ranges if set — see SSH egress). Memory limit 4Gi (drives tmpfs `/var/lib/docker` — disk-backed emptyDir would land on kata virtio-fs, which the kernel rejects as an overlay upperdir), CPU limit 1; requests are lower (1Gi / 250m) so the pod schedules on small nodes but can burst to the limit. Trust boundary is the kata guest kernel.
+- **Security posture (mitm / sigv4 pods)**: full hardened container security context (`drop=[ALL]`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation=false`, `runAsNonRoot=true`, `seccompProfile=RuntimeDefault`) under the cluster default runtime (faster cold start). Egress isolation enforced by NetworkPolicy. Memory limits 512Mi / 128Mi, CPU limits 500m / 100m (requests 96Mi·50m / 48Mi·25m).
 
 ### Module layout
 
@@ -131,10 +131,10 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 | `agent_uplink/mitm_addon/filter.py` | mitmproxy addon — enforces allow-list, injects pre-resolved headers, reroutes AWS SigV4 requests to sidecar services by dummy AKIA (stdlib only) |
 | `agent_uplink/agents/__init__.py` | `AGENTS` registry keyed by agent name |
 | `agent_uplink/agents/base.py` | `Agent` ABC — interface every agent implements |
-| `agent_uplink/agents/claude/agent.py` | `ClaudeAgent`: per-mode auth, K8s volumes/mounts, privileged-for-DinD security context, container command |
+| `agent_uplink/agents/claude/agent.py` | `ClaudeAgent`: per-mode auth, K8s volumes/mounts, privileged (in-pod `dockerd`) security context, container command |
 | `agent_uplink/agents/claude/config.py` | Claude host-side helpers: OAuth refresh, fake-creds bytes, settings.json bytes |
 | `agent_uplink/agents/claude/default_rules.yaml` | Claude-specific allow rules (Datadog log POSTs; GET-only hosts are covered by the generic rule) |
-| `agent_uplink/agents/claude/Dockerfile` | Claude container image (Ubuntu 24.04, Claude CLI, AWS CLI v2, Docker engine for DinD, dev tools, baked mitm CA) |
+| `agent_uplink/agents/claude/Dockerfile` | Claude container image (Ubuntu 24.04, Claude CLI, AWS CLI v2, Docker engine for the in-pod `dockerd`, dev tools, baked mitm CA) |
 | `agent_uplink/agents/claude/dockerd-entrypoint.sh` | Agent pod PID 1: starts nested `dockerd`, chgrp's the socket, then drops to `sleep infinity` as the agent user |
 | `agent_uplink/agents/claude/certs/` | Legacy path (gitignored, not packaged). Certs live in `~/.agent_uplink/mitm/`; the image build context is assembled in a tempdir with only the public cert, so this dir is no longer written to |
 
@@ -207,7 +207,7 @@ keyring get my-svc my-user           # verify
 - **`--anthropic`**: requires `~/.claude/.credentials.json` on the host (populated by `claude login`). The real OAuth `accessToken` is embedded directly into the mitm rules; the pod gets a *fake* `.credentials.json` (`sk-ant-oat01-agent-uplink-*` tokens, `expiresAt` pinned ~10 years out) so the Claude CLI takes the OAuth code path and shows the welcome banner. There are no fallback auth paths in this mode — if the credentials file is missing or unparseable, startup fails.
 - **`--bedrock`**: injects `AWS_BEARER_TOKEN_BEDROCK=placeholder` into the pod's settings.json. mitm swaps it for the real bearer (from `keyring get bedrock key`) on `bedrock-runtime.<region>.amazonaws.com`. If `settings.json` sets `env.AWS_PROFILE`, that profile is added to the sigv4-proxy pod list automatically (in addition to anything from `--aws-profiles`) — note that wires the agent to that profile's full IAM scope via the SigV4 hop (above), gated on your rules.
 
-Only an allow-list of non-secret `settings.json` keys is copied into the pod (`claude_settings_bytes`): top-level keys like `model`/`theme`/`permissions`, and within `env` only known config vars (e.g. `AWS_REGION`, `CLAUDE_CODE_USE_BEDROCK`) plus the mode's injected placeholder. Secret-bearing keys (`apiKeyHelper`, un-allow-listed `env` entries like API tokens) are dropped, so a secret sitting in your host settings.json doesn't leak into the agent container.
+**Known limitation — host settings.json is copied wholesale.** `claude_settings_bytes` currently copies the host `settings.json` into the pod *as-is*: it drops only the top-level `sandbox` key, replaces `permissions`, and merges the mode's injected placeholder into `env`. It does **not** implement an allow-list, so secret-bearing keys — `apiKeyHelper` and any secret `env` entries (e.g. API tokens) — in your host `settings.json` **do** reach the agent container's `~/.claude/settings.json`. Keep secrets out of your host `settings.json` for now. (`tests/unit/test_claude_config.py::test_settings_strips_secret_bearing_keys` is an `xfail` encoding the intended allow-list behaviour — implement the allow-list and it flips to passing.)
 
 ### Claude agent: Java / Maven
 

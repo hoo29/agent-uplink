@@ -1,0 +1,65 @@
+# Runs the agent-uplink test suite (unit + live-cluster integration) on a
+# GitHub-hosted runner. The runner gets its own single-node k3s; pods run
+# privileged on the default runtime (no kata needed), which is exactly how the
+# integration harness is designed to run.
+#
+# Starting point: triggered manually. To gate PRs on it, add `pull_request:` to
+# `on:` (note each run deploys several namespaces and takes a few minutes).
+name: Integration tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # k3s' containerd must be told the in-cluster registry at localhost:5000 is
+      # insecure (HTTP). This file has to exist before k3s starts.
+      - name: Configure local registry for k3s
+        run: |
+          sudo mkdir -p /etc/rancher/k3s
+          sudo tee /etc/rancher/k3s/registries.yaml >/dev/null <<'EOF'
+          mirrors:
+            "localhost:5000":
+              endpoint:
+                - "http://localhost:5000"
+          configs:
+            "localhost:5000":
+              tls:
+                insecure_skip_verify: true
+          EOF
+
+      - name: Install k3s
+        run: |
+          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644" sh -
+          mkdir -p "$HOME/.kube"
+          sudo cp /etc/rancher/k3s/k3s.yaml "$HOME/.kube/config"
+          sudo chown "$(id -u):$(id -g)" "$HOME/.kube/config"
+          echo "KUBECONFIG=$HOME/.kube/config" >> "$GITHUB_ENV"
+
+      - name: Wait for cluster ready
+        run: |
+          until kubectl get deploy/coredns -n kube-system >/dev/null 2>&1; do sleep 2; done
+          kubectl wait --for=condition=Ready node --all --timeout=180s
+          kubectl wait --for=condition=Available deploy/coredns -n kube-system --timeout=180s
+        timeout-minutes: 5
+
+      - name: Install package + test deps
+        # mitmproxy is only needed for the addon *unit* tests (they importorskip
+        # otherwise); installing it gives full coverage.
+        run: pip install -e ".[tests]" mitmproxy
+
+      - name: Run tests
+        run: pytest tests/ -v
