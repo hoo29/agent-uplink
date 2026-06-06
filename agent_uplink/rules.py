@@ -156,6 +156,7 @@ def resolve(
     *,
     allow_exec: bool = False,
     aws_sigv4_routes: dict[str, dict[str, Any]] | None = None,
+    kube_rules: list[dict] | None = None,
 ) -> bytes:
     """Build the resolved rules JSON.
 
@@ -163,21 +164,27 @@ def resolve(
     addon, so the order here is the precedence:
 
       1. user-supplied YAML        (the operator's intent wins)
-      2. agent auth rules          (per-mode auth header injection, from prepare())
-      3. agents/<name>/default_rules.yaml   (per-agent)
-      4. agent_uplink/default_rules.yaml    (generic catch-all, evaluated LAST)
+      2. kube rules                (auto-generated from --kube-context; always
+                                    included when kube is enabled, regardless of
+                                    --no-default-rules, so k8s traffic is allowed)
+      3. agent auth rules          (per-mode auth header injection, from prepare())
+      4. agents/<name>/default_rules.yaml   (per-agent)
+      5. agent_uplink/default_rules.yaml    (generic catch-all, evaluated LAST)
 
     Within a layer, declaration order is preserved. Ordering by layer (rather
     than the old sort-by-host-length heuristic) means the broad generic rule is
     always considered last and a user rule always beats a default.
 
     `--no-default-rules` (or `replace_defaults: true` in the user's YAML) keeps
-    only layer 1 and drops the auth rule too — the user becomes responsible for
+    only layers 1–2 and drops the auth rule too — the user becomes responsible for
     supplying any auth the chosen mode needs.
 
     `allow_exec` permits `{{exec:...}}` placeholders to run host shell commands.
     `aws_sigv4_routes` maps dummy AKIA → {upstream_host, upstream_port} so the
     addon can route AWS requests to the matching aws-sigv4-proxy Service.
+    `kube_rules` are synthetic rules produced by kube.resolve(); they are always
+    included when non-empty so that k8s traffic is allowed regardless of
+    --no-default-rules.
     """
     user_config: dict = {}
     if user_rules_path is not None:
@@ -186,6 +193,9 @@ def resolve(
     use_defaults = not (no_default_rules or user_config.get("replace_defaults", False))
 
     layered: list[dict] = list(user_config.get("rules") or [])
+    # Kube rules are always included when provided — dropping them via
+    # --no-default-rules would silently block all kubectl traffic.
+    layered.extend(kube_rules or [])
     if use_defaults:
         layered.extend(auth_rules)
         layered.extend(agent.default_rules())

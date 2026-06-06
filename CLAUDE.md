@@ -30,9 +30,11 @@ agent-uplink claude --anthropic --rules my.yaml --no-default-rules
 agent-uplink claude --anthropic --agent-runtime-class kata-qemu  # override default kata-clh
 agent-uplink claude --anthropic --mitm-runtime-class kata-clh    # microVM mitm too (slower)
 agent-uplink claude --anthropic --ssh-cidr 10.0.0.0/24 203.0.113.7 --ssh-key-dir ~/keys/agent  # SSH egress
+agent-uplink claude --anthropic --kube-context dev-cluster                                        # k8s cluster access
+agent-uplink claude --anthropic --kube-context ctx-a ctx-b --kubeconfig ~/.kube/extra.yaml        # multiple contexts
 agent-uplink claude --anthropic --debug
 
-# Tests (no tests exist yet, but the runner is)
+# Tests
 pytest
 ```
 
@@ -124,7 +126,8 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 | `agent_uplink/k8s.py` | Low-level `kubectl` wrappers + typed manifest builders (Pod/Secret/ConfigMap/Service/NetworkPolicy/Deployment) and reusable volume/securityContext fragments |
 | `agent_uplink/bootstrap.py` | One-time setup: local registry, k3s `registries.yaml` check, mitm CA generation, docker build+push |
 | `agent_uplink/aws.py` | AWS helpers: dummy AKIA, dummy + real shared-credentials INI as bytes, profile env export, k8s-safe name sanitiser |
-| `agent_uplink/rules.py` | Rule resolution: layers user YAML + agent auth rules + `agent.default_rules()` + generic defaults (in precedence order, generic last), resolves keyring/exec placeholders, returns JSON bytes |
+| `agent_uplink/kube.py` | Kubernetes context resolution: reads host kubeconfig via `kubectl config view`, validates auth method, produces sanitized pod kubeconfig + mitm wiring (allow rules, client certs, upstream CA bundle) |
+| `agent_uplink/rules.py` | Rule resolution: layers user YAML + kube rules + agent auth rules + `agent.default_rules()` + generic defaults (in precedence order, generic last), resolves keyring/exec placeholders, returns JSON bytes |
 | `agent_uplink/session.py` | `Session` dataclass: tracks namespace + session_dir; `cleanup()` is `kubectl delete ns --wait=false` + rmtree |
 | `agent_uplink/process.py` | `run_command` (piped) + `run_interactive` (stdio-attached) |
 | `agent_uplink/default_rules.yaml` | Generic baseline (allow `GET`/`OPTIONS`/`HEAD` everywhere) |
@@ -256,3 +259,25 @@ By default the agent pod can only reach `mitm` and `kube-dns`, so SSH is blocked
 - `--ssh-key-dir <DIR>` — mounts a host directory of SSH private keys **read-only** at the agent user's `~/.ssh` (the directory need not be named `.ssh`). Read-only keeps the untrusted agent from tampering with the keys; the cost is that `known_hosts` can't be persisted (connections still succeed; pre-seed a `known_hosts` in the dir to avoid prompts). The container user shares the host UID (`USER_UID` build arg), so `0600` host-owned keys are readable.
 
 The two flags are independent but want each other: keys without a CIDR can't reach anything on 22, and a CIDR without keys opens egress with nothing to authenticate with — each case logs a warning. Implementation: `--ssh-cidr` flows into `_network_policies` (`cli.py`) and `--ssh-key-dir` into `_agent_pod_manifest` (`cli.py`); both are orchestrator-level (universal) concerns, so no `Agent` subclass is involved.
+
+### Kubernetes cluster access
+
+`--kube-context <ctx> [<ctx> ...]` exposes one or more host kubeconfig contexts to the agent. Unlike SSH egress, k8s traffic flows through mitmproxy and is fully governed by the allow-list; no NetworkPolicy is modified.
+
+**Auth methods supported in v1:**
+- Static bearer token (`user.token` or `user.tokenFile`) — injected as an `Authorization: Bearer` header on the upstream leg.
+- Client certificate (`user.client-certificate-data` + `user.client-key-data`) — presented by mitmproxy during upstream TLS.
+
+`exec`/`auth-provider` contexts (EKS, GKE, AKS, OIDC) are rejected at startup with a clear error. `insecure-skip-tls-verify` is also refused; a cluster CA is required.
+
+**What is produced per context:**
+- A sanitized pod kubeconfig (real server URL, mitm CA for trust, real credential stripped — placeholder token for bearer, no cert/key fields for client cert).
+- A synthetic allow rule for the API server host; bearer rules carry the `Authorization` injection, cert rules carry none.
+- For client cert auth: a `<host>.pem` file (cert + key) mounted into mitm's `client_certs` directory.
+- All cluster serving CAs are combined into an upstream trust bundle (`ssl_verify_upstream_trusted_ca`) so mitmproxy can verify the API server's certificate.
+
+`--kubeconfig <path>` overrides the source file (default: `$KUBECONFIG` then `~/.kube/config`).
+
+Implementation lives in `agent_uplink/kube.py` (`resolve()`) and is an orchestrator-level concern wired in `cli.py`; no `Agent` subclass is involved.
+
+See `examples/kube/README.md` for worked examples.
