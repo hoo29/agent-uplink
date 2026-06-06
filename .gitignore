@@ -6,3 +6,4 @@ examples/rules/mine.yaml
 .claude/projects
 build
 .claude/*.lock
+.pytest_cache
