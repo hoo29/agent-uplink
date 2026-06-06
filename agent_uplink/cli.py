@@ -159,6 +159,18 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         "agent's ~/.ssh (the directory need not be named .ssh)",
     )
     common.add_argument(
+        "--add-dir",
+        type=Path,
+        nargs="*",
+        action="extend",
+        default=[],
+        metavar="DIR",
+        help="Additional host folder(s) to mount read-write into the agent at their "
+        "identical path, for cross-repo work. The working directory is always mounted; "
+        "these add to it. Each must be under /home/<user>/ and must not overlap "
+        "(be nested within) the working directory or another --add-dir folder.",
+    )
+    common.add_argument(
         "--kube-context",
         type=str,
         nargs="*",
@@ -206,11 +218,46 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def validate_cwd(username: str, cwd: Path) -> None:
+def _under_home(username: str, path: Path) -> bool:
     home = Path(f"/home/{username}")
-    if cwd != home and home not in cwd.parents:
+    return path == home or home in path.parents
+
+
+def validate_cwd(username: str, cwd: Path) -> None:
+    if not _under_home(username, cwd):
         raise ValueError(
-            f"agent-uplink must be run from within {home}, got: {cwd}")
+            f"agent-uplink must be run from within /home/{username}, got: {cwd}")
+
+
+def validate_extra_dirs(
+    username: str, cwd: Path, add_dir: list[Path]
+) -> list[Path]:
+    """Resolve, validate, and de-duplicate --add-dir folders.
+
+    Each must be an existing directory under /home/<user>/ and must not overlap
+    (be nested within, contain, or equal) the cwd or another extra dir. Returns
+    the resolved, de-duplicated list."""
+    resolved: list[Path] = []
+    for raw in add_dir:
+        d = raw.expanduser().resolve()
+        if not d.is_dir():
+            raise ValueError(f"--add-dir {d} does not exist or is not a directory")
+        if not _under_home(username, d):
+            raise ValueError(f"--add-dir {d} must be under /home/{username}")
+        if d not in resolved:
+            resolved.append(d)
+
+    all_dirs = [cwd, *resolved]
+    for i, a in enumerate(all_dirs):
+        for b in all_dirs[i + 1:]:
+            if a == b:
+                raise ValueError(
+                    f"--add-dir {b} is the working directory, already mounted")
+            if a in b.parents or b in a.parents:
+                raise ValueError(
+                    f"--add-dir paths overlap: {a} and {b} are nested; "
+                    "mount non-overlapping folders only")
+    return resolved
 
 
 def validate_ssh_args(
@@ -408,6 +455,7 @@ def _agent_pod_manifest(
     runtime_class: str,
     ssh_key_dir: Path | None = None,
     kube_config_secret: str | None = None,
+    extra_dirs: list[Path] | None = None,
 ) -> dict:
     env = _agent_env(cwd, username)
     env.update(contribution.env)
@@ -442,6 +490,10 @@ def _agent_pod_manifest(
             }
         )
         env["KUBECONFIG"] = "/etc/agent-uplink/kube/config"
+    for i, d in enumerate(extra_dirs or []):
+        name = f"add-dir-{i}"
+        volumes.append(hostpath_volume(name, str(d), hp_type="Directory"))
+        mounts.append({"name": name, "mountPath": str(d)})
     container = container_spec(
         name=AGENT_CONTAINER_NAME,
         image=full_image,
@@ -565,6 +617,7 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
     cwd = Path.cwd()
     validate_cwd(username, cwd)
     ssh_cidrs, ssh_key_dir = validate_ssh_args(args.ssh_cidr, args.ssh_key_dir)
+    extra_dirs = validate_extra_dirs(username, cwd, args.add_dir)
 
     mitm_dir = STATE_DIR / "mitm"
 
@@ -772,6 +825,7 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
             args.agent_runtime_class,
             ssh_key_dir,
             kube_config_secret,
+            extra_dirs=extra_dirs,
         )
     )
 

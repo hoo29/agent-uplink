@@ -162,6 +162,135 @@ def test_validate_cwd_must_be_under_home():
 
 
 # --------------------------------------------------------------------------- #
+# --add-dir validation
+# --------------------------------------------------------------------------- #
+
+
+def test_validate_extra_dirs_accepts_siblings(tmp_path, monkeypatch):
+    # Siblings of cwd and of each other are all valid.
+    base = tmp_path / "home" / "alice"
+    cwd = base / "code" / "repo-a"
+    d1 = base / "code" / "repo-b"
+    d2 = base / ".ansible"
+    for p in (cwd, d1, d2):
+        p.mkdir(parents=True)
+    monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
+    result = cli.validate_extra_dirs("alice", cwd, [d1, d2])
+    assert result == [d1, d2]
+
+
+def test_validate_extra_dirs_deduplicates(tmp_path, monkeypatch):
+    base = tmp_path / "home" / "alice"
+    cwd = base / "repo-a"
+    d = base / "repo-b"
+    for p in (cwd, d):
+        p.mkdir(parents=True)
+    monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
+    result = cli.validate_extra_dirs("alice", cwd, [d, d])
+    assert result == [d]
+
+
+def test_validate_extra_dirs_rejects_cwd_duplicate(tmp_path, monkeypatch):
+    base = tmp_path / "home" / "alice"
+    cwd = base / "repo-a"
+    cwd.mkdir(parents=True)
+    monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
+    with pytest.raises(ValueError, match="working directory"):
+        cli.validate_extra_dirs("alice", cwd, [cwd])
+
+
+def test_validate_extra_dirs_rejects_descendant_of_cwd(tmp_path, monkeypatch):
+    base = tmp_path / "home" / "alice"
+    cwd = base / "repo"
+    child = cwd / "subdir"
+    for p in (cwd, child):
+        p.mkdir(parents=True)
+    monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
+    with pytest.raises(ValueError, match="overlap"):
+        cli.validate_extra_dirs("alice", cwd, [child])
+
+
+def test_validate_extra_dirs_rejects_ancestor_of_cwd(tmp_path, monkeypatch):
+    base = tmp_path / "home" / "alice"
+    parent = base / "code"
+    cwd = parent / "repo"
+    for p in (parent, cwd):
+        p.mkdir(parents=True)
+    monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
+    with pytest.raises(ValueError, match="overlap"):
+        cli.validate_extra_dirs("alice", cwd, [parent])
+
+
+def test_validate_extra_dirs_rejects_nested_extras(tmp_path, monkeypatch):
+    base = tmp_path / "home" / "alice"
+    cwd = base / "cwd"
+    d1 = base / "extra"
+    d2 = d1 / "nested"
+    for p in (cwd, d1, d2):
+        p.mkdir(parents=True)
+    monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
+    with pytest.raises(ValueError, match="overlap"):
+        cli.validate_extra_dirs("alice", cwd, [d1, d2])
+
+
+def test_validate_extra_dirs_rejects_outside_home(tmp_path, monkeypatch):
+    cwd = tmp_path / "home" / "alice" / "repo"
+    outside = tmp_path / "srv" / "data"
+    for p in (cwd, outside):
+        p.mkdir(parents=True)
+    # _under_home returns False for anything outside the alice home subtree.
+    monkeypatch.setattr(cli, "_under_home",
+                        lambda u, p: str(p).startswith(str(tmp_path / "home" / "alice")))
+    with pytest.raises(ValueError, match="must be under /home"):
+        cli.validate_extra_dirs("alice", cwd, [outside])
+
+
+def test_validate_extra_dirs_rejects_nonexistent(tmp_path, monkeypatch):
+    base = tmp_path / "home" / "alice"
+    cwd = base / "repo"
+    cwd.mkdir(parents=True)
+    monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
+    with pytest.raises(ValueError, match="does not exist"):
+        cli.validate_extra_dirs("alice", cwd, [base / "ghost"])
+
+
+def test_agent_pod_manifest_extra_dirs_adds_volumes_and_mounts(tmp_path):
+    d1 = tmp_path / "home" / "alice" / "repo-b"
+    d2 = tmp_path / "home" / "alice" / ".ansible"
+    contribution = PodContribution(
+        env={},
+        volumes=[],
+        mounts=[],
+        security_context={"privileged": True},
+        init_command=["sleep", "infinity"],
+        command=["bash"],
+        memory="1Gi",
+    )
+    pod = cli._agent_pod_manifest(
+        "ns", "img", contribution, tmp_path / "home" / "alice" / "cwd",
+        "alice", 1000, "", extra_dirs=[d1, d2],
+    )
+    vol_names = [v["name"] for v in pod["spec"]["volumes"]]
+    mnt_paths = [m["mountPath"] for m in pod["spec"]["containers"][0]["volumeMounts"]]
+    assert "add-dir-0" in vol_names
+    assert "add-dir-1" in vol_names
+    assert str(d1) in mnt_paths
+    assert str(d2) in mnt_paths
+    # Verify hostPath values.
+    hp_map = {
+        v["name"]: v["hostPath"]["path"]
+        for v in pod["spec"]["volumes"]
+        if "hostPath" in v
+    }
+    assert hp_map["add-dir-0"] == str(d1)
+    assert hp_map["add-dir-1"] == str(d2)
+    # No readOnly key on extra-dir mounts.
+    for m in pod["spec"]["containers"][0]["volumeMounts"]:
+        if m["name"].startswith("add-dir-"):
+            assert not m.get("readOnly")
+
+
+# --------------------------------------------------------------------------- #
 # Deploy context selection
 # --------------------------------------------------------------------------- #
 
