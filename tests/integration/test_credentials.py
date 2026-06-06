@@ -49,14 +49,14 @@ def test_oauth_credentials_in_pod_are_fake(core_session):
 
 def test_rules_secret_not_mounted_in_agent_pod(core_session):
     # The resolved rules (which hold the real injected secret) live only in mitm.
-    rc, out, err = core_session.agent("ls /rules 2>&1; echo done")
+    _rc, out, _err = core_session.agent("ls /rules 2>&1; echo done")
     assert "done" in out
     assert "rules.json" not in out
 
 
 def test_no_real_secret_anywhere_on_agent_filesystem(core_session):
     # Scan the writable/mounted trees (not /proc, /sys) for either sentinel.
-    rc, out, err = core_session.agent(
+    _rc, out, _err = core_session.agent(
         f"grep -rIl -e '{harness.INJECT_SENTINEL}' -e '{harness.REAL_OAUTH_SENTINEL}' "
         "/home /etc /root /tmp /run 2>/dev/null; echo END",
         timeout=30,

@@ -1,0 +1,31 @@
+# Static analysis (pyright) over agent_uplink/ and tests/. The CLI equivalent of
+# the editor's Pylance checks: type errors plus unused imports/variables. Runs
+# without a cluster, so it's fast and gates every PR.
+name: Lint
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  pyright:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # Pyright resolves imports from installed packages, so the test/runtime
+      # deps (pytest, mitmproxy, ...) must be present or first-party test files
+      # would report missing imports. mitmproxy mirrors the integration workflow.
+      - name: Install package + lint deps
+        run: pip install -e ".[tests,lint]" mitmproxy
+
+      - name: Run pyright
+        run: pyright

@@ -56,19 +56,59 @@ flowchart LR
 
 ## Install
 
-```bash
-pip install -e .
+### k3s prequisites
+
+```sh
+# install k3s with local custom registry support
+sudo mkdir -p /etc/rancher/k3s
+sudo tee /etc/rancher/k3s/registries.yaml >/dev/null <<'EOF'
+mirrors:
+  "localhost:5000":
+    endpoint:
+      - "http://localhost:5000"
+configs:
+  "localhost:5000":
+    tls:
+      insecure_skip_verify: true
+EOF
+curl -sfL https://get.k3s.io | sh -
+
+# install kata containers
+export VERSION=$(curl -sSL https://api.github.com/repos/kata-containers/kata-containers/releases/latest | jq .tag_name | tr -d '"')
+export CHART="oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy"
+helm install kata-deploy "${CHART}" --version "${VERSION}" -n kata-containers --create-namespace \
+  --set k8sDistribution=k3s \
+  --set shims.disableAll=true \
+  --set shims.qemu.enabled=true \
+  --set shims.clh.enabled=true
+
+# Import the k3s context into ~/.kube/config as local-k8s-admin
+sudo sed \
+  -e '/server:/{n;s/^  name: default$/  name: local-k8s/}' \
+  -e 's/^    cluster: default$/    cluster: local-k8s/' \
+  -e 's/^    user: default$/    user: local-k8s-admin/' \
+  -e 's/^  name: default$/  name: local-k8s-admin/' \
+  -e 's/^- name: default$/- name: local-k8s-admin/' \
+  -e 's/^current-context: default$/current-context: local-k8s-admin/' \
+  /etc/rancher/k3s/k3s.yaml > /tmp/local-k8s.yaml
+KUBECONFIG="$HOME/.kube/config:/tmp/local-k8s.yaml" kubectl config view --flatten > /tmp/kubeconfig.merged
+install -m 600 /tmp/kubeconfig.merged "$HOME/.kube/config"
+rm /tmp/local-k8s.yaml /tmp/kubeconfig.merged
 ```
 
-Requires `kubectl`, `docker`, Python 3.10+, and a k3s cluster with a kata RuntimeClass (`kubectl get runtimeclass`). `aws` CLI
-is needed for `--aws-profiles`. Run from inside your home directory.
+### agent-uplink
+
+```bash
+pip install agent-uplink
+```
+
+Requires `kubectl`, `docker`, and Python 3.10+. `aws` CLI is needed for `--aws-profiles`.
+
+Run from inside your home directory.
 
 agent-uplink deploys the session into the kubeconfig context named by `--deploy-context` (default `local-k8s-admin`; pass `''`
 to use the current-context). This is the cluster it deploys *into*, distinct from `--kube-context`, which exposes clusters *to*
 the agent.
-
-On first run `agent-uplink` will print the one-time `/etc/rancher/k3s/registries.yaml` snippet needed so containerd can pull
-from the in-cluster registry at `localhost:5000`.
 
 ## Usage
 

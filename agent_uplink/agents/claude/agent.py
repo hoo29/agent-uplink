@@ -6,7 +6,7 @@ from typing import ClassVar
 
 import keyring
 
-from ...k8s import emptydir_volume, hostpath_volume, secret_volume, tmpfs_volume
+from ...k8s import hostpath_volume, secret_volume, tmpfs_volume
 from ...session import Session
 from ..base import Agent, PodBuildContext, PodContribution, PreparedAgent
 from .config import (
@@ -156,9 +156,6 @@ class ClaudeAgent(Agent):
         claude_dir = f"{container_home}/.claude"
 
         volumes: list[dict] = [
-            emptydir_volume("tmp", "1Gi"),
-            emptydir_volume("xdg-apps", "16Mi"),
-            emptydir_volume("claude-home", "512Mi"),
             secret_volume("settings", _SETTINGS_SECRET),
             hostpath_volume("workdir", str(cwd)),
             hostpath_volume(
@@ -172,12 +169,6 @@ class ClaudeAgent(Agent):
         ]
 
         mounts: list[dict] = [
-            {"name": "tmp", "mountPath": "/tmp"},
-            {
-                "name": "xdg-apps",
-                "mountPath": f"{container_home}/.local/share/applications",
-            },
-            {"name": "claude-home", "mountPath": claude_dir},
             {
                 "name": "settings",
                 "mountPath": f"{claude_dir}/settings.json",
@@ -274,16 +265,14 @@ class ClaudeAgent(Agent):
         # the Authorization header on registry hosts, so ~/.docker/config.json
         # is deliberately not mounted — no registry credentials enter the pod.
 
-        # These two stay memory-backed (tmpfs); the rest of the pod's writable
-        # paths are disk-backed emptyDir (see above) to keep them off the memory
-        # budget.
-        # /var/lib/docker: disk-backed emptyDir lands on kata's virtio-fs, which
-        # the kernel won't accept as an overlayfs upperdir (EINVAL). tmpfs
-        # supports overlay natively. Cost: image layers + container rootfs are
-        # held in pod memory (see memory()).
+        # These two need tmpfs regardless of the rootfs being writable; every
+        # other path the agent writes lands on the container rootfs directly.
+        # /var/lib/docker: the nested dockerd's overlayfs upperdir. A disk-backed
+        # emptyDir lands on kata's virtio-fs, which the kernel won't accept as an
+        # overlayfs upperdir (EINVAL); tmpfs supports overlay natively. Cost:
+        # image layers + container rootfs are held in pod memory (see memory()).
         # /run: holds the docker socket + pidfile; a unix socket on virtio-fs is
-        # unreliable, so tmpfs. RoFS stays on; these are the only writable paths
-        # dockerd touches.
+        # unreliable, so tmpfs.
         volumes.append(tmpfs_volume("docker-lib", "2Gi"))
         volumes.append(tmpfs_volume("run", "64Mi"))
         mounts.append({"name": "docker-lib", "mountPath": "/var/lib/docker"})
@@ -323,13 +312,19 @@ class ClaudeAgent(Agent):
         # dockerd needs to manage iptables, cgroups, namespaces, mounts —
         # privileged + root + unconfined seccomp is the minimum. PID 1 runs
         # as root (image has no USER directive); the entrypoint launches
-        # dockerd then drops to ${USERNAME}. RoFS is preserved; everything
-        # dockerd writes to lives under emptyDir mounts added by
-        # _volumes_and_mounts(). The grant is bounded by the Kata guest
-        # kernel — the host kernel is unaffected.
+        # dockerd then drops to ${USERNAME}. The grant is bounded by the Kata
+        # guest kernel — the host kernel is unaffected.
+        #
+        # readOnlyRootFilesystem is deliberately NOT set. On a privileged, root,
+        # seccomp-unconfined container it is not a boundary — the agent holds
+        # CAP_SYS_ADMIN and can remount the rootfs read-write at will — so it
+        # would only add friction (an explicit writable mount per path the agent
+        # or its tooling touches). The trust boundary is the Kata guest kernel
+        # plus the NetworkPolicy egress lock, not the in-container filesystem
+        # mode. The hardened support pods (mitm/sigv4), which are non-root and
+        # unprivileged, do keep readOnlyRootFilesystem.
         return {
             "privileged": True,
-            "readOnlyRootFilesystem": True,
             "allowPrivilegeEscalation": True,
             "seccompProfile": {"type": "Unconfined"},
         }

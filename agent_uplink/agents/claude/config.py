@@ -85,6 +85,7 @@ _SANDBOX_GUIDANCE = """
 - You are running in a microVM sandbox. All HTTPS egress goes through mitmproxy and is enforced against an allow-list.
 - A `403` with text 'request not permitted by rules' means the host is blocked by policy. Stop — do not retry or try to work around it.
 - If anything fails because of the sandbox (blocked network, missing access, readonly filesystem issues etc), stop and say so. Don't waste time or money trying to fix sandbox limitations.
+- A Python venv at `~/.venv`. Use it rather than any user-mounted venv in the current directory to avoid any ABI issues with the host OS and python version.
 """
 
 

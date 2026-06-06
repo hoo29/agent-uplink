@@ -2,7 +2,6 @@
 
 import base64
 import json
-from pathlib import Path
 from unittest import mock
 
 import pytest

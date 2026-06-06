@@ -18,6 +18,7 @@ AWS requests get an extra hop regardless of agent: the agent pod's `~/.aws/crede
 # Install (editable)
 pip install -e .
 pip install -e ".[tests]"   # includes pytest
+pip install -e ".[lint]"    # includes pyright
 
 # Run — pick an agent subcommand. For claude, one of --anthropic / --bedrock is required.
 agent-uplink claude --anthropic
@@ -38,6 +39,9 @@ agent-uplink claude --anthropic --debug
 
 # Tests
 pytest
+
+# Lint / type-check (CLI equivalent of the editor's Pylance checks; run by CI)
+pyright
 ```
 
 **Runtime requirements** (must be on PATH): `kubectl`, `docker` (for build + push). `aws` CLI is needed only when `--aws-profiles` is used or when an agent's own config resolves an additional AWS profile (e.g. `claude --bedrock` reads `env.AWS_PROFILE` from `settings.json`).
@@ -120,7 +124,7 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
   folders follow the same constraint and must not overlap (be nested within, contain, or equal) the working
   directory or each other; startup is refused otherwise. All are mounted read-write at their identical host paths.
 - **Image rebuild triggers**: rebuild + push whenever mitm certs are newly generated, `--force-rebuild` is passed, the image doesn't exist locally, or it's older than `AGENT_IMAGE_MAX_AGE_SECONDS` (24 h).
-- **Security posture (agent pod)**: `runtimeClassName: kata-clh` (microVM isolation; `kata-qemu` / `kata-fc` selectable via `--agent-runtime-class`). Container runs `privileged=true`, `allowPrivilegeEscalation=true`, `seccompProfile=Unconfined`, PID 1 as root — required so the nested `dockerd` can manage cgroups/namespaces/mounts/iptables inside the guest. `readOnlyRootFilesystem=true` is preserved; every writable path is an explicit emptyDir mount. Two are memory-backed (tmpfs), because tmpfs is required there: `/var/lib/docker` (2Gi — an overlayfs upperdir, which kata's virtio-fs rejects) and `/run` (64Mi — holds the `dockerd` unix socket, unreliable on virtio-fs). The rest are disk-backed emptyDir to keep them off the memory budget: `/tmp` (1Gi), `~/.claude/` (512Mi), `~/.local/share/applications/` (16Mi). The interactive session drops to the host UID via `runuser` in `container_command`. NetworkPolicy egress restricted to `mitm:8080` + `kube-dns` (plus TCP 22 to `--ssh-cidr` ranges if set — see SSH egress). Memory limit 4Gi (sized for the 2Gi tmpfs `/var/lib/docker` plus headroom for image layers and the agent process), CPU limit 1; requests are lower (1Gi / 250m) so the pod schedules on small nodes but can burst to the limit. Trust boundary is the kata guest kernel.
+- **Security posture (agent pod)**: `runtimeClassName: kata-clh` (microVM isolation; `kata-qemu` / `kata-fc` selectable via `--agent-runtime-class`). Container runs `privileged=true`, `allowPrivilegeEscalation=true`, `seccompProfile=Unconfined`, PID 1 as root — required so the nested `dockerd` can manage cgroups/namespaces/mounts/iptables inside the guest. `readOnlyRootFilesystem` is deliberately **off** here. On a privileged, root, seccomp-unconfined container it is not a boundary — the agent holds `CAP_SYS_ADMIN` and can remount the rootfs read-write at will — so it would only add friction (an explicit writable mount per path the agent touches). The container rootfs is writable; the trust boundary is the kata guest kernel plus the NetworkPolicy egress lock. Two paths are still memory-backed tmpfs because they require it regardless: `/var/lib/docker` (2Gi — the nested `dockerd`'s overlayfs upperdir, which kata's virtio-fs rejects) and `/run` (64Mi — holds the `dockerd` unix socket, unreliable on virtio-fs). The interactive session drops to the host UID via `runuser` in `container_command`. NetworkPolicy egress restricted to `mitm:8080` + `kube-dns` (plus TCP 22 to `--ssh-cidr` ranges if set — see SSH egress). Memory limit 4Gi (sized for the 2Gi tmpfs `/var/lib/docker` plus headroom for image layers and the agent process), CPU limit 1; requests are lower (1Gi / 250m) so the pod schedules on small nodes but can burst to the limit. Trust boundary is the kata guest kernel.
 - **Security posture (mitm / sigv4 pods)**: full hardened container security context (`drop=[ALL]`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation=false`, `runAsNonRoot=true`, `seccompProfile=RuntimeDefault`) under the cluster default runtime (faster cold start). Egress isolation enforced by NetworkPolicy. Memory limits 512Mi / 128Mi, CPU limits 500m / 100m (requests 96Mi·50m / 48Mi·25m).
 
 ### Module layout

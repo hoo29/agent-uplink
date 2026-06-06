@@ -845,6 +845,10 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
     wait_for_pod_ready(session.namespace, "agent", timeout=180)
 
     LOGGER.info("attaching to agent")
+    if contribution.command is None:
+        raise RuntimeError(
+            f"agent {args.agent_name!r} produced no interactive command"
+        )
     return exec_interactive(
         session.namespace,
         "agent",

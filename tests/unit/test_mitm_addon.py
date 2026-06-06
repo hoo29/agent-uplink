@@ -5,6 +5,7 @@ tests; here we pin the branch behaviour fast."""
 
 import json
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -187,7 +188,7 @@ def test_request_reroute_skips_header_injection(tmp_path, monkeypatch):
     r = req("s3.us-east-1.amazonaws.com",
             headers={"Authorization": _sigv4_auth("AKIATEST")})
     flow = SimpleNamespace(request=r, response=None)
-    e.request(flow)
+    e.request(cast(Any, flow))
     assert flow.response is None           # allowed
     assert r.host == "sidecar"             # rerouted
     assert r.headers.get("Authorization") is None  # stripped, NOT re-injected
@@ -198,6 +199,6 @@ def test_request_denies_unmatched_host(tmp_path, monkeypatch):
                        {"rules": [{"name": "only", "host": "allowed.example"}]})
     r = req("blocked.example", "POST", "/x")
     flow = SimpleNamespace(request=r, response=None)
-    e.request(flow)
+    e.request(cast(Any, flow))
     assert flow.response is not None
     assert flow.response.status_code == 403

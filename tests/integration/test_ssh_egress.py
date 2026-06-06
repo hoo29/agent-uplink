@@ -5,13 +5,11 @@ without the flag is shown by test_network_policy's bypass test.)"""
 
 import pytest
 
-from tests.integration import harness
-
 pytestmark = pytest.mark.integration
 
 
 def _nc(session, ip: str, port: int) -> int:
-    rc, out, err = session.agent(f"nc -z -w4 {ip} {port}; echo rc=$?", timeout=20)
+    _rc, out, err = session.agent(f"nc -z -w4 {ip} {port}; echo rc=$?", timeout=20)
     line = [l for l in out.splitlines() if l.startswith("rc=")]
     assert line, f"no rc line: {out!r} / {err!r}"
     return int(line[-1].split("=")[1])
