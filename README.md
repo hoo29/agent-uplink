@@ -72,6 +72,8 @@ agent-uplink claude --bedrock --aws-profiles profile1 profile2
 agent-uplink claude --anthropic --force-rebuild
 agent-uplink claude --anthropic --rules examples/rules/ecr.yaml         # authenticated docker pulls (ECR)
 agent-uplink claude --anthropic --ssh-cidr 10.0.0.0/24 --ssh-key-dir ~/keys/agent  # SSH egress
+agent-uplink claude --anthropic --kube-context dev-cluster                          # k8s cluster access
+agent-uplink claude --anthropic --kube-context ctx-a ctx-b --kubeconfig ~/.kube/extra.yaml
 ```
 
 `--anthropic` reads `~/.claude/.credentials.json` (run `claude login` first). `--bedrock` reads `keyring get bedrock key`.
@@ -90,6 +92,22 @@ By default the agent pod reaches only `mitm` and `kube-dns`, so SSH is blocked. 
 - `--ssh-key-dir <DIR>` — mounts a host directory of SSH private keys **read-only** at the agent user's `~/.ssh`. Read-only means `known_hosts` can't be persisted (pre-seed one in the dir to avoid prompts). The container user shares the host UID, so `0600` host-owned keys are readable.
 
 The flags are independent but want each other (each logs a warning if used alone).
+
+### Kubernetes cluster access
+
+`--kube-context <ctx> [<ctx> ...]` exposes one or more host kubeconfig contexts to the agent. Unlike SSH egress, k8s traffic flows through mitm and is fully governed by the allow-list — no NetworkPolicy is modified.
+
+For each context, agent-uplink reads the cluster CA, server URL, and credentials from the host kubeconfig (`kubectl config view --flatten --minify`), then:
+
+- Produces a sanitized pod kubeconfig: real server URL, mitm CA for trust, real credentials stripped.
+- Wires mitm to inject credentials on the upstream leg — bearer token as an `Authorization` header, or client certificate presented during TLS.
+- Adds each cluster's serving CA to mitm's upstream trust store.
+
+Real tokens and client keys never appear in the pod kubeconfig or the agent container.
+
+**Supported auth methods:** static bearer token (`user.token` / `user.tokenFile`) and client certificate (`user.client-certificate-data` + `user.client-key-data`). `exec`/`auth-provider` contexts (EKS, GKE, AKS, OIDC) and `insecure-skip-tls-verify` are refused at startup with a clear error.
+
+`--kubeconfig <path>` overrides the source file (default: `$KUBECONFIG` then `~/.kube/config`).
 
 ## Rules
 

@@ -47,6 +47,7 @@ from .k8s import (
     tmpfs_volume,
     wait_for_pod_ready,
 )
+from .kube import KubePlan, resolve as resolve_kube
 from .rules import resolve as resolve_rules
 from .session import Session, handle_signal
 
@@ -148,6 +149,26 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         "agent's ~/.ssh (the directory need not be named .ssh)",
     )
     common.add_argument(
+        "--kube-context",
+        type=str,
+        nargs="*",
+        action="extend",
+        default=[],
+        metavar="CONTEXT",
+        help="kubeconfig context(s) to expose to the agent. Supported auth: static "
+        "bearer token, client certificate. exec/auth-provider contexts are refused. "
+        "Traffic to each API server flows through mitm under the allow-list; the pod "
+        "kubeconfig trusts the mitm CA and carries no real credentials.",
+    )
+    common.add_argument(
+        "--kubeconfig",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="kubeconfig file to read contexts from (default: $KUBECONFIG then "
+        "~/.kube/config)",
+    )
+    common.add_argument(
         "-d",
         "--debug",
         action=argparse.BooleanOptionalAction,
@@ -233,6 +254,9 @@ def _mitm_manifests(
     ns: str,
     image: str,
     runtime_class: str,
+    *,
+    kube_client_certs_secret: str | None = None,
+    kube_upstream_ca_secret: str | None = None,
 ) -> list[dict]:
     labels = _label("mitm")
     # uid 1000 = the `mitmproxy` user baked into the upstream image. The certs
@@ -240,26 +264,52 @@ def _mitm_manifests(
     # as its signing CA instead of trying to generate one (which would fail
     # writing into the read-only root filesystem).
     confdir = "/mitm-confdir"
+
+    mitm_args = [
+        "--listen-host=0.0.0.0",
+        f"--listen-port={PROXY_PORT}",
+        "--set",
+        f"confdir={confdir}",
+        "-s",
+        "/addon/filter.py",
+        "--set",
+        "rules_file=/rules/rules.json",
+    ]
+    volume_mounts = [
+        {"name": "addon", "mountPath": "/addon", "readOnly": True},
+        {"name": "rules", "mountPath": "/rules", "readOnly": True},
+        {"name": "certs", "mountPath": confdir, "readOnly": True},
+        {"name": "tmp", "mountPath": "/tmp"},
+    ]
+    volumes = [
+        configmap_volume("addon", "mitm-addon"),
+        secret_volume("rules", "rules-json"),
+        secret_volume("certs", "mitm-certs"),
+        tmpfs_volume("tmp", "32Mi"),
+    ]
+
+    # When k8s contexts are configured, mount the client certs directory (one
+    # <host>.pem per cluster) and the combined upstream CA bundle so mitmproxy
+    # presents the right client cert and trusts each cluster's serving CA.
+    if kube_client_certs_secret:
+        volume_mounts.append(
+            {"name": "kube-client-certs", "mountPath": "/kube-client-certs", "readOnly": True}
+        )
+        volumes.append(secret_volume("kube-client-certs", kube_client_certs_secret))
+        mitm_args.extend(["--set", "client_certs=/kube-client-certs"])
+    if kube_upstream_ca_secret:
+        volume_mounts.append(
+            {"name": "kube-upstream-ca", "mountPath": "/kube-upstream-ca", "readOnly": True}
+        )
+        volumes.append(secret_volume("kube-upstream-ca", kube_upstream_ca_secret))
+        mitm_args.extend(["--set", "ssl_verify_upstream_trusted_ca=/kube-upstream-ca/bundle.pem"])
+
     container = container_spec(
         name="mitm",
         image=image,
         command=["mitmdump"],
-        args=[
-            "--listen-host=0.0.0.0",
-            f"--listen-port={PROXY_PORT}",
-            "--set",
-            f"confdir={confdir}",
-            "-s",
-            "/addon/filter.py",
-            "--set",
-            "rules_file=/rules/rules.json",
-        ],
-        volume_mounts=[
-            {"name": "addon", "mountPath": "/addon", "readOnly": True},
-            {"name": "rules", "mountPath": "/rules", "readOnly": True},
-            {"name": "certs", "mountPath": confdir, "readOnly": True},
-            {"name": "tmp", "mountPath": "/tmp"},
-        ],
+        args=mitm_args,
+        volume_mounts=volume_mounts,
         security_context=hardened_container_security_context(uid=1000, gid=1000),
         resources=Resources(
             memory="512Mi", cpu="500m", memory_request="96Mi", cpu_request="50m"
@@ -268,12 +318,7 @@ def _mitm_manifests(
     )
     spec = pod_spec(
         container=container,
-        volumes=[
-            configmap_volume("addon", "mitm-addon"),
-            secret_volume("rules", "rules-json"),
-            secret_volume("certs", "mitm-certs"),
-            tmpfs_volume("tmp", "32Mi"),
-        ],
+        volumes=volumes,
         runtime_class=runtime_class or None,
     )
     pod = pod_manifest("mitm", ns, labels=labels, spec=spec)
@@ -352,6 +397,7 @@ def _agent_pod_manifest(
     gid: int,
     runtime_class: str,
     ssh_key_dir: Path | None = None,
+    kube_config_secret: str | None = None,
 ) -> dict:
     env = _agent_env(cwd, username)
     env.update(contribution.env)
@@ -373,6 +419,19 @@ def _agent_pod_manifest(
                 "readOnly": True,
             }
         )
+    # Sanitized kubeconfig: trusts mitm CA, carries placeholder creds. Mounted
+    # outside the home dir so readOnlyRootFilesystem doesn't block the mount.
+    # kubectl's cache writes (~/.kube/cache) are non-fatal when they fail.
+    if kube_config_secret is not None:
+        volumes.append(secret_volume("kube-config", kube_config_secret))
+        mounts.append(
+            {
+                "name": "kube-config",
+                "mountPath": "/etc/agent-uplink/kube",
+                "readOnly": True,
+            }
+        )
+        env["KUBECONFIG"] = "/etc/agent-uplink/kube/config"
     container = container_spec(
         name=AGENT_CONTAINER_NAME,
         image=full_image,
@@ -567,6 +626,17 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
             "upstream_port": PROXY_PORT,
         }
 
+    mitm_ca_cert = (mitm_dir / "mitmproxy-ca-cert.pem").read_bytes()
+    mitm_ca_full = (mitm_dir / "mitmproxy-ca.pem").read_bytes()  # cert + key
+    mitm_dhparam = (mitm_dir / "mitmproxy-dhparam.pem").read_bytes()
+
+    # Kubernetes context resolution. Done before rule assembly so the synthetic
+    # kube rules (bearer injection / host allow) can be layered in.
+    kube_plan: KubePlan | None = None
+    if args.kube_context:
+        LOGGER.info(f"resolving kube contexts: {args.kube_context}")
+        kube_plan = resolve_kube(args.kubeconfig, args.kube_context, mitm_ca_cert)
+
     # Rules JSON (resolved + cred-substituted), addon ConfigMap, certs Secret.
     rules_bytes = resolve_rules(
         args.rules,
@@ -575,11 +645,8 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
         prepared.auth_rules,
         allow_exec=args.allow_exec,
         aws_sigv4_routes=sigv4_routes,
+        kube_rules=kube_plan.rules if kube_plan else None,
     )
-
-    mitm_ca_cert = (mitm_dir / "mitmproxy-ca-cert.pem").read_bytes()
-    mitm_ca_full = (mitm_dir / "mitmproxy-ca.pem").read_bytes()  # cert + key
-    mitm_dhparam = (mitm_dir / "mitmproxy-dhparam.pem").read_bytes()
 
     debug_host_dir: Path | None = None
     if args.debug:
@@ -639,6 +706,30 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
     for name, files in prepared.secret_payloads.items():
         manifests.append(secret_manifest(name, session.namespace, files))
 
+    # Kube secrets: sanitized kubeconfig for the agent pod, client certs and
+    # upstream CA bundle for the mitm pod. Only created when --kube-context is set.
+    kube_config_secret: str | None = None
+    kube_client_certs_secret: str | None = None
+    kube_upstream_ca_secret: str | None = None
+    if kube_plan is not None:
+        kube_config_secret = "kube-config"
+        manifests.append(
+            secret_manifest(kube_config_secret, session.namespace,
+                            {"config": kube_plan.pod_kubeconfig})
+        )
+        if kube_plan.client_certs:
+            kube_client_certs_secret = "kube-client-certs"
+            manifests.append(
+                secret_manifest(kube_client_certs_secret, session.namespace,
+                                kube_plan.client_certs)
+            )
+        if kube_plan.upstream_ca_bundle:
+            kube_upstream_ca_secret = "kube-upstream-ca"
+            manifests.append(
+                secret_manifest(kube_upstream_ca_secret, session.namespace,
+                                {"bundle.pem": kube_plan.upstream_ca_bundle})
+            )
+
     manifests.extend(_network_policies(
         session.namespace, bool(aws_profile_names), ssh_cidrs))
     manifests.extend(
@@ -646,6 +737,8 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
             session.namespace,
             args.mitmproxy_image,
             args.mitm_runtime_class,
+            kube_client_certs_secret=kube_client_certs_secret,
+            kube_upstream_ca_secret=kube_upstream_ca_secret,
         )
     )
     for profile in aws_profile_names:
@@ -668,6 +761,7 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
             gid,
             args.agent_runtime_class,
             ssh_key_dir,
+            kube_config_secret,
         )
     )
 
