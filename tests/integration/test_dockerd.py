@@ -6,8 +6,6 @@ what lets it execute on a bare GitHub runner."""
 
 import pytest
 
-from tests.integration import harness
-
 pytestmark = [pytest.mark.integration, pytest.mark.dockerd]
 
 
@@ -22,7 +20,7 @@ def test_in_pod_dockerd_is_running(dockerd_session):
 def test_in_pod_docker_daemon_is_usable(dockerd_session):
     # The daemon responds to a real (if trivial) API call — proving it's not just
     # the socket existing but a functioning engine under privileged + runc.
-    rc, out, err = dockerd_session.exec(
+    rc, _out, err = dockerd_session.exec(
         "dockerd", "docker ps --format '{{.ID}}'", timeout=30
     )
     assert rc == 0, f"docker ps failed: {err}"

@@ -51,7 +51,7 @@ def test_agent_cannot_reach_sidecar_directly(sigv4_session):
     # The re-signing sidecar runs with the real profile's IAM scope; the agent
     # must only reach it via mitm, never directly.
     sidecar_ip = sigv4_session.pod_ip("echo")
-    rc, out, err = sigv4_session.agent(
+    _rc, out, _err = sigv4_session.agent(
         f"nc -z -w4 {sidecar_ip} 8080; echo rc=$?", timeout=20
     )
     assert "rc=0" not in out, out

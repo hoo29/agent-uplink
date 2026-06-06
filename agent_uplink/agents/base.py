@@ -105,11 +105,13 @@ class Agent(ABC):
     def image_repo(self) -> str:
         return getattr(self.args, "image", None) or self.default_image_repo()
 
-    @classmethod
-    def default_rules(cls) -> list[dict]:
+    def default_rules(self) -> list[dict]:
         """Agent-specific allow-list rules, loaded from default_rules.yaml in
-        the agent's package directory. Returns [] if the file is absent."""
-        path = cls.container_dir() / "default_rules.yaml"
+        the agent's package directory. Returns [] if the file is absent.
+
+        An instance method (not a classmethod) so a subclass can derive rules
+        from instance state; the resolver always calls it on an instance."""
+        path = self.container_dir() / "default_rules.yaml"
         if not path.exists():
             return []
         data = yaml.safe_load(path.read_text(encoding="utf8")) or {}

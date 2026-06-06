@@ -3,8 +3,6 @@ OAuth token out of the container."""
 
 import json
 
-import pytest
-
 from agent_uplink.agents.claude import config
 from agent_uplink.agents.claude.agent import _AUTH_MODE_ENV
 

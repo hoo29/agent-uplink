@@ -7,7 +7,6 @@ helpers to assemble pods/secrets/etc and apply them via stdin to kubectl.
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import time
 from dataclasses import dataclass

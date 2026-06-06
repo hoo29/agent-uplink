@@ -12,7 +12,7 @@ pytestmark = pytest.mark.integration
 
 def _nc(session, host: str, port: int, *, wait: int = 4) -> int:
     """Return nc's exit code for a TCP connect probe (0 = connected)."""
-    rc, out, err = session.agent(
+    _rc, out, err = session.agent(
         f"nc -z -w{wait} {host} {port}; echo rc=$?", timeout=wait + 15
     )
     line = [l for l in out.splitlines() if l.startswith("rc=")]
@@ -33,7 +33,7 @@ def test_agent_dns_resolves(core_session):
          "-o", "jsonpath={.spec.clusterIP}"]
     )[1].strip()
     assert mitm_ip, "could not read mitm Service ClusterIP"
-    rc, out, err = core_session.agent("getent hosts mitm || nslookup mitm", timeout=20)
+    _rc, out, _err = core_session.agent("getent hosts mitm || nslookup mitm", timeout=20)
     assert mitm_ip in out, f"mitm did not resolve to {mitm_ip}: {out!r}"
 
 

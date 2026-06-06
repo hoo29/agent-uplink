@@ -35,7 +35,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = _respond
 
-    def log_message(self, *args):  # silence per-request stderr noise
+    def log_message(self, format, *args):  # silence per-request stderr noise
         pass
 
 

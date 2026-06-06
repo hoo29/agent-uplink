@@ -2,6 +2,7 @@
 layering precedence, schema validation, and the credential-placeholder
 resolution that the addon then relies on."""
 
+import argparse
 import json
 
 import pytest
@@ -16,7 +17,7 @@ class _Agent(Agent):
     name = "unit"
 
     def __init__(self, defaults=None):
-        super().__init__(args=None)
+        super().__init__(args=argparse.Namespace())
         self._defaults = defaults or []
 
     @classmethod

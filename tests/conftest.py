@@ -235,7 +235,7 @@ rules:
         _deploy(ns, manifests, ["mitm", "echo", "agent"])
 
         def _warm():
-            rc, out, err = harness.kexec_sh(
+            rc, out, _err = harness.kexec_sh(
                 ns,
                 "agent",
                 harness.aws_signed_curl(
@@ -284,7 +284,7 @@ def ssh_session(cluster, test_image, mitm_certs_dir):
         harness.wait_ready(ns, "agent", timeout=150)
 
         def _warm():
-            rc, out, err = harness.kexec_sh(
+            rc, out, _err = harness.kexec_sh(
                 ns, "agent", f"nc -z -w3 {target_ip} 22; echo rc=$?", timeout=20
             )
             return "rc=0" in out, f"rc={rc} out={out.strip()!r}"
@@ -307,7 +307,7 @@ def dockerd_session(cluster, test_image):
         _deploy(ns, harness.dockerd_pod(ns), ["dockerd"])
 
         def _warm():
-            rc, out, err = harness.kexec_sh(
+            rc, out, _err = harness.kexec_sh(
                 ns, "dockerd", "docker info --format '{{.ServerVersion}}'", timeout=20
             )
             return rc == 0 and out.strip() != "", f"rc={rc} out={out.strip()!r}"

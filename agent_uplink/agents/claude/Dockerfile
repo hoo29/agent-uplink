@@ -73,6 +73,10 @@ RUN if [ "${USER_GID}" != "1000" ]; then groupadd --gid "${USER_GID}" "${USERNAM
      fi \
   && usermod -aG docker "${USERNAME}"
 
+RUN su - ${USERNAME} -c "python3 -m venv ~/.venv \
+  && ~/.venv/bin/pip install --no-cache-dir --upgrade pip \
+  && ~/.venv/bin/pip install --no-cache-dir ansible ansible-lint little-timmy"
+
 ARG CACHE_BUST=0
 RUN echo "cache-bust=${CACHE_BUST}" \
   && su - ${USERNAME} -c "curl -fsSL https://claude.ai/install.sh | bash"

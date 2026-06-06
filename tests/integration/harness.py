@@ -19,6 +19,7 @@ dummy-credential derivation, the SigV4 reroute map) comes straight from
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import shutil
@@ -26,8 +27,6 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-
-import yaml
 
 from agent_uplink import aws, cli, k8s, rules
 from agent_uplink.agents.base import Agent, PreparedAgent
@@ -179,7 +178,7 @@ def warmup_denied(ns: str, host: str, port: int, *, desc: str) -> None:
     enforced before the negative assertions run."""
 
     def _probe():
-        rc, out, err = kexec_sh(
+        _, out, _ = kexec_sh(
             ns, "agent", f"nc -z -w4 {host} {port}; echo rc=$?", timeout=20
         )
         return "rc=0" not in out, f"out={out.strip()!r}"
@@ -240,8 +239,7 @@ class NullAgent(Agent):
     def add_cli_args(cls, parser) -> None:  # pragma: no cover - unused
         pass
 
-    @classmethod
-    def default_rules(cls) -> list[dict]:
+    def default_rules(self) -> list[dict]:
         return []
 
     def discover_aws_profiles(self) -> list[str]:
@@ -270,7 +268,7 @@ def resolve_rules(
     return rules.resolve(
         path,
         no_default_rules,
-        NullAgent(args=None), # type: ignore
+        NullAgent(args=argparse.Namespace()),
         auth_rules or [],
         allow_exec=False,
         aws_sigv4_routes=sigv4_routes,
@@ -525,8 +523,8 @@ def agent_probe(
     rules-json Secret (which holds the real injected secrets).
 
     Security-context delta vs the shipping agent pod (see ClaudeAgent
-    ._container_security_context): production keeps readOnlyRootFilesystem=true
-    and seccomp=Unconfined under kata; the probe runs plain privileged on runc.
+    ._container_security_context): production runs privileged + seccomp=Unconfined
+    under kata with a writable rootfs; the probe runs plain privileged on runc.
     The NetworkPolicy/credential/injection properties under test don't depend on
     that delta — the shipping mount/secret wiring is covered by the unit test
     against cli._agent_pod_manifest(ClaudeAgent.pod_contribution(...))."""

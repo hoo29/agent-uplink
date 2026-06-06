@@ -25,6 +25,7 @@ agent-uplink = "agent_uplink.__main__:main"
 [project.optional-dependencies]
 tests = ["pytest"]
 build = ["build"]
+lint = ["pyright"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -33,6 +34,15 @@ markers = [
     "integration: requires a live k3s cluster (deploys namespaces, pods, policies)",
     "dockerd: in-pod dockerd smoke test; privileged pod on the default runtime",
 ]
+
+[tool.pyright]
+
+include = ["agent_uplink", "tests"]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
+reportUnusedImport = "error"
+reportUnusedVariable = "error"
+
 
 [tool.setuptools]
 packages = [
