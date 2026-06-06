@@ -34,6 +34,7 @@ from .k8s import (
     configmap_manifest,
     configmap_volume,
     container_spec,
+    emptydir_volume,
     exec_interactive,
     hardened_container_security_context,
     hostpath_volume,
@@ -45,7 +46,6 @@ from .k8s import (
     secret_volume,
     service_manifest,
     set_kube_context,
-    tmpfs_volume,
     wait_for_pod_ready,
 )
 from .kube import KubePlan, resolve as resolve_kube
@@ -342,7 +342,7 @@ def _mitm_manifests(
         configmap_volume("addon", "mitm-addon"),
         secret_volume("rules", "rules-json"),
         secret_volume("certs", "mitm-certs"),
-        tmpfs_volume("tmp", "32Mi"),
+        emptydir_volume("tmp", "32Mi"),
     ]
 
     # When k8s contexts are configured, mount the client certs directory (one
@@ -414,7 +414,7 @@ def _sigv4_manifests(
         container=container,
         volumes=[
             secret_volume("creds", f"aws-creds-{safe_name}"),
-            tmpfs_volume("tmp", "16Mi"),
+            emptydir_volume("tmp", "16Mi"),
         ],
         runtime_class=runtime_class or None,
     )

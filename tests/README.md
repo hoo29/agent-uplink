@@ -77,17 +77,6 @@ A `warmup` poll gates each test on the full agent→mitm→upstream path being l
 because `kubectl wait Ready` returns before Service endpoints and NetworkPolicy
 rules are programmed.
 
-### Findings surfaced by the suite
-
-- **`claude_settings_bytes` does not implement the documented allow-list.**
-  CLAUDE.md states only an allow-list of non-secret `settings.json` keys is
-  copied into the pod, but `agent_uplink/agents/claude/config.py` copies the host
-  `settings.json` wholesale (dropping only `sandbox`, replacing `permissions`).
-  So `apiKeyHelper` and arbitrary secret `env` entries in the host file leak into
-  the agent pod's `~/.claude/settings.json`. `tests/unit/test_claude_config.py`
-  encodes the intended behaviour as an **xfail** (`test_settings_strips_secret_bearing_keys`):
-  implement the allow-list (or amend the docs) and it flips to passing.
-
 ### Note: mitmproxy version
 
 The mitm pod and the addon target mitmproxy 12.x (the image is pinned to

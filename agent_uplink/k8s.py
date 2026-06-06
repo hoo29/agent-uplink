@@ -317,19 +317,23 @@ def deployment_manifest(
     labels: dict[str, str],
     pod_spec: dict,
     replicas: int = 1,
+    strategy: str | None = None,
 ) -> dict:
+    spec: dict[str, Any] = {
+        "replicas": replicas,
+        "selector": {"matchLabels": labels},
+        "template": {
+            "metadata": {"labels": labels},
+            "spec": pod_spec,
+        },
+    }
+    if strategy is not None:
+        spec["strategy"] = {"type": strategy}
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
         "metadata": {"name": name, "namespace": namespace, "labels": labels},
-        "spec": {
-            "replicas": replicas,
-            "selector": {"matchLabels": labels},
-            "template": {
-                "metadata": {"labels": labels},
-                "spec": pod_spec,
-            },
-        },
+        "spec": spec,
     }
 
 
@@ -368,7 +372,18 @@ def network_policy_manifest(
 
 
 def tmpfs_volume(name: str, size: str = "64Mi") -> dict:
+    """Memory-backed emptyDir (tmpfs). Counts against the pod's memory limit, so
+    reserve it for paths that genuinely need tmpfs semantics: an overlayfs
+    upperdir (kata's virtio-fs rejects a disk-backed emptyDir as one) or a unix
+    socket (unreliable on virtio-fs). Use emptydir_volume for everything else."""
     return {"name": name, "emptyDir": {"medium": "Memory", "sizeLimit": size}}
+
+
+def emptydir_volume(name: str, size: str) -> dict:
+    """Disk-backed emptyDir. Backed by node ephemeral storage (shared into a kata
+    guest over virtio-fs) rather than memory, so it does not consume the pod's
+    memory budget. sizeLimit caps ephemeral-storage use."""
+    return {"name": name, "emptyDir": {"sizeLimit": size}}
 
 
 def secret_volume(name: str, secret_name: str) -> dict:

@@ -188,9 +188,7 @@ single-user tool, and the agent is assumed cooperative. Known limitations of the
 - `--ssh-cidr` opens TCP 22 to the given CIDRs **bypassing mitm entirely** (no allow-list or rule engine for SSH) — scope the CIDRs tightly.
 - For the `claude` agent, the host `~/.claude/settings.json` is currently copied into the pod **wholesale** (only the top-level
   `sandbox` key is dropped and `permissions` is replaced). Secret-bearing keys — `apiKeyHelper` and any secret `env` vars —
-  therefore **do** reach the agent pod's `settings.json`, so keep secrets out of your host `settings.json`. An allow-list that
-  drops these was intended but isn't implemented yet (tracked by an `xfail` test,
-  `tests/unit/test_claude_config.py::test_settings_strips_secret_bearing_keys`).
+  therefore **do** reach the agent pod's `settings.json`, so keep secrets out of your host `settings.json`.
 
 ^ NetworkPolicies can't restrict traffic for pod <-> host where the pod is scheduled.
 
