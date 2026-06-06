@@ -33,6 +33,7 @@ agent-uplink claude --anthropic --ssh-cidr 10.0.0.0/24 203.0.113.7 --ssh-key-dir
 agent-uplink claude --anthropic --kube-context dev-cluster                                        # k8s cluster access
 agent-uplink claude --anthropic --kube-context ctx-a ctx-b --kubeconfig ~/.kube/extra.yaml        # multiple contexts
 agent-uplink claude --anthropic --deploy-context my-cluster                                       # cluster to deploy into
+agent-uplink claude --anthropic --add-dir ~/code/repo-b ~/code/repo-c                            # mount extra repos
 agent-uplink claude --anthropic --debug
 
 # Tests
@@ -115,7 +116,9 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 
 ### Key constraints
 
-- **Working directory**: `agent-uplink` must be run from within `/home/<USER>/` (validated in Python).
+- **Working directory**: `agent-uplink` must be run from within `/home/<USER>/` (validated in Python). `--add-dir`
+  folders follow the same constraint and must not overlap (be nested within, contain, or equal) the working
+  directory or each other; startup is refused otherwise. All are mounted read-write at their identical host paths.
 - **Image rebuild triggers**: rebuild + push whenever mitm certs are newly generated, `--force-rebuild` is passed, the image doesn't exist locally, or it's older than `AGENT_IMAGE_MAX_AGE_SECONDS` (24 h).
 - **Security posture (agent pod)**: `runtimeClassName: kata-clh` (microVM isolation; `kata-qemu` / `kata-fc` selectable via `--agent-runtime-class`). Container runs `privileged=true`, `allowPrivilegeEscalation=true`, `seccompProfile=Unconfined`, PID 1 as root — required so the nested `dockerd` can manage cgroups/namespaces/mounts/iptables inside the guest. `readOnlyRootFilesystem=true` is preserved; every path `dockerd` writes to is an explicit emptyDir mount (`/var/lib/docker` 2Gi tmpfs, `/run` 64Mi tmpfs, plus the usual `/tmp`, `~/.claude/`, `~/.local/share/applications/`). The interactive session drops to the host UID via `runuser` in `container_command`. NetworkPolicy egress restricted to `mitm:8080` + `kube-dns` (plus TCP 22 to `--ssh-cidr` ranges if set — see SSH egress). Memory limit 4Gi (drives tmpfs `/var/lib/docker` — disk-backed emptyDir would land on kata virtio-fs, which the kernel rejects as an overlay upperdir), CPU limit 1; requests are lower (1Gi / 250m) so the pod schedules on small nodes but can burst to the limit. Trust boundary is the kata guest kernel.
 - **Security posture (mitm / sigv4 pods)**: full hardened container security context (`drop=[ALL]`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation=false`, `runAsNonRoot=true`, `seccompProfile=RuntimeDefault`) under the cluster default runtime (faster cold start). Egress isolation enforced by NetworkPolicy. Memory limits 512Mi / 128Mi, CPU limits 500m / 100m (requests 96Mi·50m / 48Mi·25m).

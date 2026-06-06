@@ -83,6 +83,7 @@ agent-uplink claude --anthropic --ssh-cidr 10.0.0.0/24 --ssh-key-dir ~/keys/agen
 agent-uplink claude --anthropic --kube-context dev-cluster                          # k8s cluster access
 agent-uplink claude --anthropic --kube-context ctx-a ctx-b --kubeconfig ~/.kube/extra.yaml
 agent-uplink claude --anthropic --deploy-context my-cluster                         # cluster to deploy into
+agent-uplink claude --anthropic --add-dir ~/code/repo-b ~/code/repo-c              # mount extra repos
 ```
 
 `--anthropic` reads `~/.claude/.credentials.json` (run `claude login` first). `--bedrock` reads `keyring get bedrock key`.
@@ -110,6 +111,24 @@ model than the rest of agent-uplink):
   so `0600` host-owned keys are readable.
 
 The flags are independent but want each other (each logs a warning if used alone).
+
+### Multiple working directories
+
+By default the agent sees only the current working directory, mounted read-write at its host path. `--add-dir` mounts
+additional host folders at their identical paths — useful when the agent needs to work across multiple repos at once:
+
+```bash
+agent-uplink claude --anthropic --add-dir ~/code/repo-b ~/code/repo-c
+```
+
+Constraints (startup is refused if any are violated):
+
+- Each folder must be under `/home/<user>/`, the same rule the working directory follows.
+- No folder may be an ancestor or descendant of the working directory or another `--add-dir` folder at any depth.
+  Siblings are fine (`~/.ansible` alongside `~/code/repo-a` and `~/code/repo-b`).
+
+All extra folders are read-write. The session still opens in the working directory (`cd "$WORKDIR"`); the extra paths
+are simply available alongside it.
 
 ### Kubernetes cluster access
 
