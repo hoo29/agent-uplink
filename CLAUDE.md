@@ -32,6 +32,7 @@ agent-uplink claude --anthropic --mitm-runtime-class kata-clh    # microVM mitm 
 agent-uplink claude --anthropic --ssh-cidr 10.0.0.0/24 203.0.113.7 --ssh-key-dir ~/keys/agent  # SSH egress
 agent-uplink claude --anthropic --kube-context dev-cluster                                        # k8s cluster access
 agent-uplink claude --anthropic --kube-context ctx-a ctx-b --kubeconfig ~/.kube/extra.yaml        # multiple contexts
+agent-uplink claude --anthropic --deploy-context my-cluster                                       # cluster to deploy into
 agent-uplink claude --anthropic --debug
 
 # Tests
@@ -43,6 +44,8 @@ pytest
 **Cluster requirements**:
 
 - A reachable k3s (or compatible) cluster with a kata RuntimeClass installed (default is `kata-clh`; `kata-qemu` and `kata-fc` work too — `kubectl get runtimeclass`).
+- agent-uplink deploys into the kubeconfig context named by `--deploy-context` (default `local-k8s-admin`;
+  pass `''` for the current-context). Distinct from `--kube-context`, which exposes clusters *to* the agent.
 - A local registry pod (auto-deployed on first run to namespace `agent-uplink-system`) reachable from both the host and the cluster nodes at `localhost:5000`.
 - A one-time `/etc/rancher/k3s/registries.yaml` config that tells containerd `localhost:5000` is insecure. `agent-uplink` will print the exact `sudo` commands if missing.
 

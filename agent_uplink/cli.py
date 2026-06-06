@@ -44,6 +44,7 @@ from .k8s import (
     secret_manifest,
     secret_volume,
     service_manifest,
+    set_kube_context,
     tmpfs_volume,
     wait_for_pod_ready,
 )
@@ -58,6 +59,7 @@ STATE_DIR = Path.home() / ".agent_uplink"
 DEFAULT_MITM_IMAGE = "mitmproxy/mitmproxy:12"
 DEFAULT_SIGV4_PROXY_IMAGE = "public.ecr.aws/aws-observability/aws-sigv4-proxy:latest"
 DEFAULT_AGENT_RUNTIME_CLASS = "kata-clh"
+DEFAULT_DEPLOY_CONTEXT = "local-k8s-admin"
 
 PROXY_PORT = 8080  # mitm and aws-sigv4-proxy both listen on this port
 
@@ -89,6 +91,14 @@ def _common_arg_parser() -> argparse.ArgumentParser:
     common.add_argument("--sigv4-proxy-image",
                         default=DEFAULT_SIGV4_PROXY_IMAGE)
     common.add_argument("--registry-image", default=REGISTRY_IMAGE_DEFAULT)
+    common.add_argument(
+        "--deploy-context",
+        default=DEFAULT_DEPLOY_CONTEXT,
+        metavar="CONTEXT",
+        help="kubeconfig context agent-uplink deploys the session into (registry, "
+        "mitm, sigv4, agent pods). Distinct from --kube-context, which exposes "
+        "clusters to the agent. Pass '' to use the kubeconfig's current-context.",
+    )
     common.add_argument(
         "--agent-runtime-class",
         default=DEFAULT_AGENT_RUNTIME_CLASS,
@@ -792,6 +802,10 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
+
+    # Target every deploy-side kubectl call (incl. signal-handler cleanup) at the
+    # chosen context before anything can shell out to kubectl.
+    set_kube_context(args.deploy_context)
 
     agent_cls = AGENTS[args.agent_name]
     agent = agent_cls(args)
