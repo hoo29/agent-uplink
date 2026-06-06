@@ -55,6 +55,7 @@ def serve_https(port: int) -> None:
         stderr=subprocess.DEVNULL,
     )
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain("/tmp/cert.pem", "/tmp/key.pem")
     httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler)
     httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
