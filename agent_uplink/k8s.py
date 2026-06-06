@@ -25,12 +25,32 @@ LOGGER = logging.getLogger("agent-uplink")
 # ---------------------------------------------------------------------------
 
 
+# kubeconfig context every deploy-side kubectl call targets. Set once at startup
+# via set_kube_context(); None means "use the kubeconfig's current-context".
+_KUBE_CONTEXT: str | None = None
+
+
+def set_kube_context(context: str | None) -> None:
+    """Select the kubeconfig context used for all deploy-side kubectl calls.
+
+    Call once at startup before any kubectl invocation. An empty/None value
+    falls back to the kubeconfig's current-context."""
+    global _KUBE_CONTEXT
+    _KUBE_CONTEXT = context or None
+
+
+def _context_args() -> list[str]:
+    return ["--context", _KUBE_CONTEXT] if _KUBE_CONTEXT else []
+
+
 def kubectl(
     *args: str,
     stdin: bytes | None = None,
     raise_error: bool = True,
 ) -> str:
-    return run_command(["kubectl", *args], stdin=stdin, raise_error=raise_error)
+    return run_command(
+        ["kubectl", *_context_args(), *args], stdin=stdin, raise_error=raise_error
+    )
 
 
 def apply_manifests(manifests: list[dict]) -> None:
@@ -106,7 +126,7 @@ def wait_for_deployment_ready(namespace: str, name: str, *, timeout: int = 180) 
 def exec_interactive(
     namespace: str, pod_name: str, *, container: str | None, command: list[str]
 ) -> int:
-    args = ["kubectl", "exec", "-it", pod_name, "-n", namespace]
+    args = ["kubectl", *_context_args(), "exec", "-it", pod_name, "-n", namespace]
     if container:
         args.extend(["-c", container])
     args.append("--")

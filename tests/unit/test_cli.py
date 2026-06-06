@@ -159,3 +159,46 @@ def test_validate_cwd_must_be_under_home():
         cli.validate_cwd("alice", Path("/tmp/elsewhere"))
     with pytest.raises(ValueError):
         cli.validate_cwd("alice", Path("/home/bob/project"))
+
+
+# --------------------------------------------------------------------------- #
+# Deploy context selection
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def _reset_kube_context():
+    """Keep the module-level deploy context from leaking between tests."""
+    k8s.set_kube_context(None)
+    yield
+    k8s.set_kube_context(None)
+
+
+def test_kubectl_injects_deploy_context(monkeypatch):
+    captured = []
+    monkeypatch.setattr(k8s, "run_command", lambda cmd, **kw: captured.append(cmd) or "")
+    k8s.set_kube_context("local-k8s-admin")
+    k8s.kubectl("get", "pods")
+    assert captured[0] == ["kubectl", "--context", "local-k8s-admin", "get", "pods"]
+
+
+def test_kubectl_omits_context_when_unset(monkeypatch):
+    captured = []
+    monkeypatch.setattr(k8s, "run_command", lambda cmd, **kw: captured.append(cmd) or "")
+    k8s.set_kube_context("")  # empty -> current-context, no --context flag
+    k8s.kubectl("get", "pods")
+    assert captured[0] == ["kubectl", "get", "pods"]
+
+
+def test_exec_interactive_injects_deploy_context(monkeypatch):
+    captured = []
+    monkeypatch.setattr(k8s, "run_interactive", lambda cmd: captured.append(cmd) or 0)
+    k8s.set_kube_context("dev")
+    k8s.exec_interactive("ns", "agent", container="main", command=["bash"])
+    assert captured[0][:3] == ["kubectl", "--context", "dev"]
+    assert captured[0][3:6] == ["exec", "-it", "agent"]
+
+
+def test_deploy_context_defaults_to_local_k8s_admin():
+    ns = cli._common_arg_parser().parse_args([])
+    assert ns.deploy_context == cli.DEFAULT_DEPLOY_CONTEXT == "local-k8s-admin"
