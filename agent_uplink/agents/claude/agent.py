@@ -6,7 +6,7 @@ from typing import ClassVar
 
 import keyring
 
-from ...k8s import hostpath_volume, secret_volume, tmpfs_volume
+from ...k8s import emptydir_volume, hostpath_volume, secret_volume, tmpfs_volume
 from ...session import Session
 from ..base import Agent, PodBuildContext, PodContribution, PreparedAgent
 from .config import (
@@ -156,9 +156,9 @@ class ClaudeAgent(Agent):
         claude_dir = f"{container_home}/.claude"
 
         volumes: list[dict] = [
-            tmpfs_volume("tmp", "200Mi"),
-            tmpfs_volume("xdg-apps", "16Mi"),
-            tmpfs_volume("claude-home", "200Mi"),
+            emptydir_volume("tmp", "1Gi"),
+            emptydir_volume("xdg-apps", "16Mi"),
+            emptydir_volume("claude-home", "512Mi"),
             secret_volume("settings", _SETTINGS_SECRET),
             hostpath_volume("workdir", str(cwd)),
             hostpath_volume(
@@ -274,12 +274,16 @@ class ClaudeAgent(Agent):
         # the Authorization header on registry hosts, so ~/.docker/config.json
         # is deliberately not mounted — no registry credentials enter the pod.
 
-        # /var/lib/docker: tmpfs emptyDir. Disk-backed emptyDir lands on
-        # kata's virtio-fs, which the kernel won't accept as an overlayfs
-        # upperdir (EINVAL). tmpfs supports overlay natively. Cost: image
-        # layers + container rootfs are held in pod memory (see memory()).
-        # /run: tmpfs for the docker socket + pidfile. RoFS stays on; these
-        # are the only writable paths dockerd touches.
+        # These two stay memory-backed (tmpfs); the rest of the pod's writable
+        # paths are disk-backed emptyDir (see above) to keep them off the memory
+        # budget.
+        # /var/lib/docker: disk-backed emptyDir lands on kata's virtio-fs, which
+        # the kernel won't accept as an overlayfs upperdir (EINVAL). tmpfs
+        # supports overlay natively. Cost: image layers + container rootfs are
+        # held in pod memory (see memory()).
+        # /run: holds the docker socket + pidfile; a unix socket on virtio-fs is
+        # unreliable, so tmpfs. RoFS stays on; these are the only writable paths
+        # dockerd touches.
         volumes.append(tmpfs_volume("docker-lib", "2Gi"))
         volumes.append(tmpfs_volume("run", "64Mi"))
         mounts.append({"name": "docker-lib", "mountPath": "/var/lib/docker"})

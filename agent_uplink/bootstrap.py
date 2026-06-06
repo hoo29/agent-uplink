@@ -130,6 +130,7 @@ def _registry_manifests(image: str) -> list[dict]:
             REGISTRY_NAMESPACE,
             labels=labels,
             pod_spec=spec,
+            strategy="Recreate",
         ),
         service_manifest(
             REGISTRY_DEPLOYMENT,

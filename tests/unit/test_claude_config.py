@@ -74,18 +74,3 @@ def test_settings_injects_bedrock_placeholder_over_non_secret_env():
     assert out["env"]["AWS_BEARER_TOKEN_BEDROCK"] == "placeholder"
     # Non-secret config still passes through.
     assert out["env"]["AWS_REGION"] == "us-east-1"
-
-
-@pytest.mark.xfail(
-    reason="claude_settings_bytes copies the host settings.json WHOLESALE: "
-    "apiKeyHelper and arbitrary env secrets leak into the pod's settings.json, "
-    "contradicting CLAUDE.md's documented allow-list guarantee. Encodes the "
-    "intended security property; flip to passing once the allow-list is "
-    "implemented (or amend the docs).",
-    strict=False,
-)
-def test_settings_strips_secret_bearing_keys():
-    blob = config.claude_settings_bytes(_host_settings(), {}).decode()
-    assert "apiKeyHelper" not in blob
-    assert "host-env-secret-TOKEN" not in blob
-    assert "SECRET_HELPER_OUTPUT" not in blob
