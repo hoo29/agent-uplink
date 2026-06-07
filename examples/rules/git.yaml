@@ -1,0 +1,56 @@
+# Git over HTTPS for github.com, gitlab.com, bitbucket.org.
+#
+# The agent image rewrites SSH git URLs (git@host:..., ssh://git@host/...) to
+# their HTTPS counterparts, so existing SSH remotes route through mitm. These
+# rules permit the git smart-HTTP transport and inject the credential host-side;
+# the token never enters the agent pod. Without them, git-over-HTTPS is denied:
+# the default allow-list only permits GET/OPTIONS/HEAD, but clone/fetch/push POST
+# to git-upload-pack / git-receive-pack.
+#
+# Paths cover the three smart-HTTP endpoints. info/refs is matched WITH its query
+# string (mitm matches the full request path, query included), and the auth
+# header is injected on it too: a private repo's info/refs returns 401 without
+# auth, so relying on the generic GET rule there would break private clones.
+#
+# Auth is HTTP Basic; the keyring value is the base64 of "<user>:<token>":
+#   - GitHub:    user oauth2, token = PAT (repo scope)
+#                  printf 'oauth2:%s' "$TOKEN" | base64 -w0 | keyring set github git-https
+#   - GitLab:    user oauth2, token = PAT (read_repository / write_repository)
+#                  printf 'oauth2:%s' "$TOKEN" | base64 -w0 | keyring set gitlab git-https
+#   - Bitbucket: user = username, token = app password
+#                  printf '%s:%s' "$USER" "$APP_PW" | base64 -w0 | keyring set bitbucket git-https
+#
+
+rules:
+  - name: github-git-https
+    host: 'github\.com'
+    methods: [GET, POST]
+    paths:
+      - '.*/info/refs(\?.*)?'
+      - ".*/git-upload-pack"
+      - ".*/git-receive-pack"
+    inject:
+      headers:
+        Authorization: "Basic {{keyring:github:git-https}}"
+
+  - name: gitlab-git-https
+    host: 'gitlab\.com'
+    methods: [GET, POST]
+    paths:
+      - '.*/info/refs(\?.*)?'
+      - ".*/git-upload-pack"
+      - ".*/git-receive-pack"
+    inject:
+      headers:
+        Authorization: "Basic {{keyring:gitlab:git-https}}"
+
+  - name: bitbucket-git-https
+    host: 'bitbucket\.org'
+    methods: [GET, POST]
+    paths:
+      - '.*/info/refs(\?.*)?'
+      - ".*/git-upload-pack"
+      - ".*/git-receive-pack"
+    inject:
+      headers:
+        Authorization: "Basic {{keyring:bitbucket:git-https}}"

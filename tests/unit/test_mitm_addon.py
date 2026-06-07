@@ -4,14 +4,20 @@ The full request()/403/inject path is covered end-to-end by the integration
 tests; here we pin the branch behaviour fast."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import yaml
 
 pytest.importorskip("mitmproxy.http")
 
 from agent_uplink.mitm_addon import filter as addon  # noqa: E402
+
+EXAMPLE_GIT_RULES = (
+    Path(__file__).resolve().parents[2] / "examples" / "rules" / "git.yaml"
+)
 
 
 class Headers:
@@ -202,3 +208,42 @@ def test_request_denies_unmatched_host(tmp_path, monkeypatch):
     e.request(cast(Any, flow))
     assert flow.response is not None
     assert flow.response.status_code == 403
+
+
+# --------------------------------------------------------------------------- #
+# Shipped git.yaml example matches real git smart-HTTP requests
+# --------------------------------------------------------------------------- #
+
+
+def _git_enforcer(tmp_path, monkeypatch):
+    data = yaml.safe_load(EXAMPLE_GIT_RULES.read_text())
+    data.setdefault("aws_sigv4_routes", {})
+    return _enforcer_from(tmp_path, monkeypatch, data)
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        # info/refs carries a query string; req.path is fullmatched WITH it, so
+        # the rule must allow the query — else private-repo discovery (which 401s
+        # without auth) would miss the auth-injecting rule.
+        ("GET", "/hoo29/test-little-timmy-gha.git/info/refs?service=git-upload-pack"),
+        ("GET", "/hoo29/test-little-timmy-gha.git/info/refs?service=git-receive-pack"),
+        ("POST", "/hoo29/test-little-timmy-gha.git/git-upload-pack"),
+        ("POST", "/hoo29/test-little-timmy-gha.git/git-receive-pack"),
+    ],
+)
+def test_git_example_matches_smart_http(tmp_path, monkeypatch, method, path):
+    e = _git_enforcer(tmp_path, monkeypatch)
+    matched = e._match_rule(cast(Any, req("github.com", method, path)))
+    assert matched is not None, (method, path)
+    name, inject = matched
+    assert name == "github-git-https"
+    assert "Authorization" in inject
+
+
+def test_git_example_does_not_blanket_allow_post(tmp_path, monkeypatch):
+    # The rule is scoped to the smart-HTTP paths, not all POSTs to the host.
+    e = _git_enforcer(tmp_path, monkeypatch)
+    r = cast(Any, req("github.com", "POST", "/hoo29/repo/issues"))
+    assert e._match_rule(r) is None

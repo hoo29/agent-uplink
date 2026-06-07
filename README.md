@@ -25,6 +25,7 @@ flowchart LR
     subgraph session_ns["agent-uplink-&lt;id&gt; (per-session)"]
         subgraph agent_pod["Pod: agent (kata-clh)"]
             agent["agent CLI"]
+            gitrw["git: SSH→HTTPS rewrite<br/>(baked /etc/gitconfig)"]
         end
         subgraph mitm_pod["Pod: mitm"]
             mitm["mitmproxy<br/>+ filter addon"]
@@ -48,6 +49,8 @@ flowchart LR
     certs --> mitm
     creds --> sidecar
     agent -->|HTTPS_PROXY=http://mitm:8080| mitm
+    agent -.->|git@host: / ssh://git@host| gitrw
+    gitrw -.->|cloned over HTTPS| mitm
     agent -.->|TCP 22 only, --ssh-cidr<br/>bypasses mitm| internet
     mitm -->|allowed + injected| internet
     mitm -->|SigV4 reroute by dummy AKIA| sidecar
@@ -120,6 +123,8 @@ agent-uplink claude --bedrock --aws-profiles profile1 profile2
 agent-uplink claude --anthropic --force-rebuild
 agent-uplink claude --anthropic --rules examples/rules/ecr.yaml         # authenticated docker pulls (ECR)
 agent-uplink claude --anthropic --ssh-cidr 10.0.0.0/24 --ssh-key-dir ~/keys/agent  # SSH egress
+agent-uplink claude --anthropic --rules examples/rules/git.yaml                     # git over HTTPS
+agent-uplink claude --anthropic --git-https-rewrite git.example.com                 # rewrite an extra host
 agent-uplink claude --anthropic --kube-context dev-cluster                          # k8s cluster access
 agent-uplink claude --anthropic --kube-context ctx-a ctx-b --kubeconfig ~/.kube/extra.yaml
 agent-uplink claude --anthropic --deploy-context my-cluster                         # cluster to deploy into
@@ -151,6 +156,21 @@ model than the rest of agent-uplink):
   so `0600` host-owned keys are readable.
 
 The flags are independent but want each other (each logs a warning if used alone).
+
+### Git over HTTPS
+
+SSH egress is for shelling into machines, not git. Git runs over **HTTPS**, through mitm, so the allow-list governs it
+and injects credentials host-side. The agent image bakes `insteadOf` rewrites for **github.com, gitlab.com,
+bitbucket.org** that turn SSH remotes (`git@host:owner/repo`, `ssh://git@host/...`) into HTTPS at operation time, so
+existing SSH remotes and submodules just work — `git clone git@github.com:owner/repo.git` becomes an HTTPS clone.
+
+- `--git-https-rewrite <HOST> [<HOST> ...]` — rewrite extra hosts (e.g. self-hosted GitLab) too.
+- `--no-git-identity` — by default the host's `user.name`/`user.email` are surfaced so commits are attributed; this
+  omits them. The injected config carries no secrets and leaves the agent's `~/.gitconfig` writable.
+
+Auth is **opt-in**: the default allow-list permits only `GET`/`OPTIONS`/`HEAD`, but git fetch/push POST to
+`git-upload-pack`/`git-receive-pack`. Pass `--rules examples/rules/git.yaml` to allow those endpoints and inject HTTP
+Basic auth (token resolved on the host, never entering the pod). Without it, even a public clone is denied.
 
 ### Multiple working directories
 

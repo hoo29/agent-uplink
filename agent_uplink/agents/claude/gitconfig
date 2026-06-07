@@ -1,0 +1,26 @@
+# System git config baked into the agent image. Rewrites SSH git URLs to their
+# HTTPS counterparts so existing SSH remotes and submodules route through mitm
+# (HTTPS_PROXY), where the allow-list and credential injection apply. SSH egress
+# (--ssh-cidr/--ssh-key-dir) bypasses mitm and is for shelling into machines,
+# not git.
+#
+# insteadOf is a multivar accumulated across all config files, so the runtime
+# overlay (agent-uplink.inc, written by --git-https-rewrite) adds to these
+# rather than replacing them.
+
+[url "https://github.com/"]
+	insteadOf = git@github.com:
+	insteadOf = ssh://git@github.com/
+
+[url "https://gitlab.com/"]
+	insteadOf = git@gitlab.com:
+	insteadOf = ssh://git@gitlab.com/
+
+[url "https://bitbucket.org/"]
+	insteadOf = git@bitbucket.org:
+	insteadOf = ssh://git@bitbucket.org/
+
+# Runtime overlay: host identity and extra --git-https-rewrite hosts. Mounted by
+# the orchestrator when non-empty; a missing include path is silently ignored.
+[include]
+	path = /etc/gitconfig.d/agent-uplink.inc
