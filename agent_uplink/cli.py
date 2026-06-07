@@ -6,16 +6,17 @@ import logging
 import os
 import pwd
 import signal
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
 from .agents import AGENTS, Agent
-from .agents.base import PodBuildContext, PodContribution
+from .agents.base import PodBuildContext, PodContribution, PreparedAgent
 from .aws import (
+    build_safe_name_map,
     dummy_aws_credentials_ini,
     export_aws_profile_env,
     real_aws_credentials_ini,
-    sanitize_profile_for_k8s_name,
 )
 from .bootstrap import (
     AGENT_IMAGE_MAX_AGE_SECONDS,
@@ -466,6 +467,18 @@ def _agent_env(cwd: Path, username: str) -> dict[str, str]:
     return env
 
 
+@dataclass
+class AgentMounts:
+    """Optional, orchestrator-level mounts layered onto the agent pod on top of
+    the agent's own PodContribution. Grouped so the manifest builder takes one
+    argument instead of a tail of nullable secret names."""
+
+    ssh_key_dir: Path | None = None
+    kube_config_secret: str | None = None
+    git_config_secret: str | None = None
+    extra_dirs: list[Path] = field(default_factory=list)
+
+
 def _agent_pod_manifest(
     ns: str,
     full_image: str,
@@ -474,11 +487,9 @@ def _agent_pod_manifest(
     username: str,
     gid: int,
     runtime_class: str,
-    ssh_key_dir: Path | None = None,
-    kube_config_secret: str | None = None,
-    git_config_secret: str | None = None,
-    extra_dirs: list[Path] | None = None,
+    pod_mounts: AgentMounts | None = None,
 ) -> dict:
+    pod_mounts = pod_mounts or AgentMounts()
     env = _agent_env(cwd, username)
     env.update(contribution.env)
     volumes = list(contribution.volumes)
@@ -488,9 +499,9 @@ def _agent_pod_manifest(
     # tampering with the host keys (cost: known_hosts can't be persisted back).
     # The container user shares the host UID (Dockerfile USER_UID), so 0600 host
     # keys are readable. Reachability is gated by the --ssh-cidr egress rule.
-    if ssh_key_dir is not None:
+    if pod_mounts.ssh_key_dir is not None:
         volumes.append(
-            hostpath_volume("ssh-keys", str(ssh_key_dir), hp_type="Directory")
+            hostpath_volume("ssh-keys", str(pod_mounts.ssh_key_dir), hp_type="Directory")
         )
         mounts.append(
             {
@@ -502,8 +513,8 @@ def _agent_pod_manifest(
     # Sanitized kubeconfig: trusts mitm CA, carries placeholder creds. Mounted
     # outside the home dir so readOnlyRootFilesystem doesn't block the mount.
     # kubectl's cache writes (~/.kube/cache) are non-fatal when they fail.
-    if kube_config_secret is not None:
-        volumes.append(secret_volume("kube-config", kube_config_secret))
+    if pod_mounts.kube_config_secret is not None:
+        volumes.append(secret_volume("kube-config", pod_mounts.kube_config_secret))
         mounts.append(
             {
                 "name": "kube-config",
@@ -516,8 +527,8 @@ def _agent_pod_manifest(
     # include.path in the baked /etc/gitconfig. Mounted read-only at that path;
     # carries no secrets, so it's safe in the agent pod. The agent's ~/.gitconfig
     # is untouched and stays writable.
-    if git_config_secret is not None:
-        volumes.append(secret_volume("git-config", git_config_secret))
+    if pod_mounts.git_config_secret is not None:
+        volumes.append(secret_volume("git-config", pod_mounts.git_config_secret))
         mounts.append(
             {
                 "name": "git-config",
@@ -526,7 +537,7 @@ def _agent_pod_manifest(
                 "readOnly": True,
             }
         )
-    for i, d in enumerate(extra_dirs or []):
+    for i, d in enumerate(pod_mounts.extra_dirs):
         name = f"add-dir-{i}"
         volumes.append(hostpath_volume(name, str(d), hp_type="Directory"))
         mounts.append({"name": name, "mountPath": str(d)})
@@ -648,29 +659,69 @@ def _network_policies(
 # ---------------------------------------------------------------------------
 
 
-def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
-    username = os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
-    cwd = Path.cwd()
-    validate_cwd(username, cwd)
-    ssh_cidrs, ssh_key_dir = validate_ssh_args(args.ssh_cidr, args.ssh_key_dir)
-    extra_dirs = validate_extra_dirs(username, cwd, args.add_dir)
+@dataclass
+class MitmCerts:
+    """The mitm CA material read off the host, ready to wrap in the mitm-certs
+    Secret."""
 
-    mitm_dir = STATE_DIR / "mitm"
+    ca_cert: bytes  # public cert only (also baked into the agent image)
+    ca_full: bytes  # cert + private key (the signing CA)
+    dhparam: bytes
 
+
+@dataclass
+class AwsPlan:
+    """Everything the AWS SigV4 hop contributes: the per-profile k8s-safe names,
+    the Secret manifests (real per-profile creds + the agent's dummy creds), the
+    dummy Secret's name for mounting, and the AKIA -> sidecar route map."""
+
+    profile_names: list[str]
+    profile_safe: dict[str, str]
+    secret_manifests: list[dict]
+    dummy_secret_name: str | None
+    sigv4_routes: dict[str, dict]
+
+    @property
+    def has_sigv4(self) -> bool:
+        return bool(self.profile_names)
+
+
+@dataclass
+class KubeSecrets:
+    """Secrets produced from --kube-context resolution plus the names the agent
+    and mitm pods mount them under (None when that piece is absent)."""
+
+    manifests: list[dict] = field(default_factory=list)
+    config_secret: str | None = None  # agent pod kubeconfig
+    client_certs_secret: str | None = None  # mitm client-certs dir
+    upstream_ca_secret: str | None = None  # mitm upstream trust bundle
+
+
+def _bootstrap_infra(args: argparse.Namespace, mitm_dir: Path) -> bool:
+    """Registry + registries.yaml check + mitm CA. Returns True if the CA was
+    just generated (which forces an agent image rebuild downstream)."""
     LOGGER.info("checking registry + k3s registries.yaml")
     check_registries_yaml()
     ensure_registry(args.registry_image)
+    return ensure_mitm_certs(mitm_dir, args.mitmproxy_image)
 
-    certs_generated = ensure_mitm_certs(mitm_dir, args.mitmproxy_image)
 
-    aws_profile_names = list(args.aws_profiles)
-    aws_profile_names.extend(agent.discover_aws_profiles())
-    aws_profile_names = list(dict.fromkeys(aws_profile_names))
+def _resolve_aws_profiles(args: argparse.Namespace, agent: Agent) -> list[str]:
+    """`--aws-profiles` plus any the agent discovers, de-duplicated in order."""
+    names = list(args.aws_profiles)
+    names.extend(agent.discover_aws_profiles())
+    return list(dict.fromkeys(names))
 
-    prepared = agent.prepare(session, aws_profile_names)
 
-    # Image build/push — rebuild if certs changed, --force-rebuild, missing, or
-    # older than the max age threshold.
+def _ensure_agent_image(
+    args: argparse.Namespace,
+    agent: Agent,
+    username: str,
+    mitm_dir: Path,
+    certs_generated: bool,
+) -> str:
+    """Return the agent image ref, rebuilding + pushing first when certs were
+    just generated, --force-rebuild is set, the image is missing, or it's stale."""
     full_image = f"{REGISTRY_PUSH_ENDPOINT}/{agent.image_repo}:latest"
     image_age = get_image_age_seconds(full_image)
     if (
@@ -686,88 +737,110 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
             mitm_dir,
             force_rebuild=args.force_rebuild,
         )
+    return full_image
 
-    # Per-profile sigv4 plumbing. Guard against two profiles colliding to the
-    # same k8s-safe name (which would emit duplicate Pod/Service manifests).
-    profile_safe: dict[str, str] = {
-        p: sanitize_profile_for_k8s_name(p) for p in aws_profile_names
-    }
-    seen_safe: dict[str, str] = {}
-    for profile, safe in profile_safe.items():
-        if safe in seen_safe:
-            raise ValueError(
-                f"AWS profiles {seen_safe[safe]!r} and {profile!r} both map to the "
-                f"k8s-safe name {safe!r}; rename one to disambiguate"
-            )
-        seen_safe[safe] = profile
 
-    real_aws_secrets: list[dict] = []
-    sigv4_routes: dict[str, dict] = {}
-    for profile in aws_profile_names:
+def _build_aws_plan(session: Session, profile_names: list[str]) -> AwsPlan:
+    """Resolve real per-profile credentials into Secrets, build the agent's dummy
+    credentials Secret, and map each profile's dummy AKIA to its sidecar route."""
+    profile_safe = build_safe_name_map(profile_names)
+
+    secret_manifests: list[dict] = []
+    for profile in profile_names:
         env = export_aws_profile_env(profile)
-        safe = profile_safe[profile]
-        real_aws_secrets.append(
+        secret_manifests.append(
             secret_manifest(
-                f"aws-creds-{safe}",
+                f"aws-creds-{profile_safe[profile]}",
                 session.namespace,
                 {"credentials": real_aws_credentials_ini(profile, env)},
             )
         )
 
-    dummy_ini, profile_to_akia = dummy_aws_credentials_ini(aws_profile_names)
-    agent_aws_secret_name: str | None = None
+    dummy_ini, profile_to_akia = dummy_aws_credentials_ini(profile_names)
+    dummy_secret_name: str | None = None
     if dummy_ini:
-        agent_aws_secret_name = "agent-aws-creds"
+        dummy_secret_name = "agent-aws-creds"
+        secret_manifests.append(
+            secret_manifest(
+                dummy_secret_name, session.namespace, {"credentials": dummy_ini}
+            )
+        )
 
-    for profile, akia in profile_to_akia.items():
-        sigv4_routes[akia] = {
+    sigv4_routes = {
+        akia: {
             "upstream_host": f"sigv4-{profile_safe[profile]}",
             "upstream_port": PROXY_PORT,
         }
-
-    mitm_ca_cert = (mitm_dir / "mitmproxy-ca-cert.pem").read_bytes()
-    mitm_ca_full = (mitm_dir / "mitmproxy-ca.pem").read_bytes()  # cert + key
-    mitm_dhparam = (mitm_dir / "mitmproxy-dhparam.pem").read_bytes()
-
-    # Kubernetes context resolution. Done before rule assembly so the synthetic
-    # kube rules (bearer injection / host allow) can be layered in.
-    kube_plan: KubePlan | None = None
-    if args.kube_context:
-        LOGGER.info(f"resolving kube contexts: {args.kube_context}")
-        kube_plan = resolve_kube(args.kubeconfig, args.kube_context, mitm_ca_cert)
-
-    # Rules JSON (resolved + cred-substituted), addon ConfigMap, certs Secret.
-    rules_bytes = resolve_rules(
-        args.rules,
-        args.no_default_rules,
-        agent,
-        prepared.auth_rules,
-        allow_exec=args.allow_exec,
-        aws_sigv4_routes=sigv4_routes,
-        kube_rules=kube_plan.rules if kube_plan else None,
+        for profile, akia in profile_to_akia.items()
+    }
+    return AwsPlan(
+        profile_names=profile_names,
+        profile_safe=profile_safe,
+        secret_manifests=secret_manifests,
+        dummy_secret_name=dummy_secret_name,
+        sigv4_routes=sigv4_routes,
     )
 
-    debug_host_dir: Path | None = None
-    if args.debug:
-        debug_host_dir = Path("/tmp/agent-uplink-debug") / session.id
-        debug_host_dir.mkdir(parents=True, exist_ok=True)
-        LOGGER.info(f"debug mode: agent logs → {debug_host_dir}")
 
-    uid, gid = os.getuid(), os.getgid()
-    contribution = agent.pod_contribution(
-        PodBuildContext(
-            cwd=cwd,
-            username=username,
-            uid=uid,
-            gid=gid,
-            aws_creds_secret_name=agent_aws_secret_name,
-            debug_host_dir=debug_host_dir,
-            debug=args.debug,
+def _read_mitm_certs(mitm_dir: Path) -> MitmCerts:
+    return MitmCerts(
+        ca_cert=(mitm_dir / "mitmproxy-ca-cert.pem").read_bytes(),
+        ca_full=(mitm_dir / "mitmproxy-ca.pem").read_bytes(),
+        dhparam=(mitm_dir / "mitmproxy-dhparam.pem").read_bytes(),
+    )
+
+
+def _kube_secrets(session: Session, kube_plan: KubePlan | None) -> KubeSecrets:
+    """Wrap the KubePlan's products as Secrets, recording the names the agent and
+    mitm pods mount them under. Empty KubeSecrets when --kube-context is unset."""
+    if kube_plan is None:
+        return KubeSecrets()
+    out = KubeSecrets(config_secret="kube-config")
+    out.manifests.append(
+        secret_manifest(
+            "kube-config", session.namespace, {"config": kube_plan.pod_kubeconfig}
         )
     )
+    if kube_plan.client_certs:
+        out.client_certs_secret = "kube-client-certs"
+        out.manifests.append(
+            secret_manifest(
+                "kube-client-certs", session.namespace, kube_plan.client_certs
+            )
+        )
+    if kube_plan.upstream_ca_bundle:
+        out.upstream_ca_secret = "kube-upstream-ca"
+        out.manifests.append(
+            secret_manifest(
+                "kube-upstream-ca",
+                session.namespace,
+                {"bundle.pem": kube_plan.upstream_ca_bundle},
+            )
+        )
+    return out
 
-    # Build the full manifest set.
-    manifests: list[dict] = [
+
+def _git_secret(
+    session: Session, args: argparse.Namespace
+) -> tuple[dict | None, str | None]:
+    """Build the git overlay Secret (host identity + extra SSH->HTTPS rewrites),
+    or (None, None) when the overlay would be empty."""
+    overlay = build_git_overlay(
+        args.git_https_rewrite, include_identity=not args.no_git_identity
+    )
+    if overlay is None:
+        return None, None
+    manifest = secret_manifest(
+        "git-config", session.namespace, {"agent-uplink.inc": overlay}
+    )
+    return manifest, "git-config"
+
+
+def _base_manifests(
+    session: Session, rules_bytes: bytes, mitm_certs: MitmCerts
+) -> list[dict]:
+    """Namespace + the always-present mitm inputs (addon, rules, CA)."""
+    return [
         namespace_manifest(
             session.namespace,
             labels={
@@ -781,84 +854,86 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
             session.namespace,
             {"filter.py": ADDON_PATH.read_text(encoding="utf-8")},
         ),
-        secret_manifest("rules-json", session.namespace,
-                        {"rules.json": rules_bytes}),
+        secret_manifest("rules-json", session.namespace, {"rules.json": rules_bytes}),
         secret_manifest(
             "mitm-certs",
             session.namespace,
             {
-                "mitmproxy-ca.pem": mitm_ca_full,
-                "mitmproxy-ca-cert.pem": mitm_ca_cert,
-                "mitmproxy-dhparam.pem": mitm_dhparam,
+                "mitmproxy-ca.pem": mitm_certs.ca_full,
+                "mitmproxy-ca-cert.pem": mitm_certs.ca_cert,
+                "mitmproxy-dhparam.pem": mitm_certs.dhparam,
             },
         ),
     ]
-    manifests.extend(real_aws_secrets)
-    if agent_aws_secret_name is not None:
-        manifests.append(
-            secret_manifest(
-                agent_aws_secret_name,
-                session.namespace,
-                {"credentials": dummy_ini},
-            )
+
+
+def _prepare_debug_dir(args: argparse.Namespace, session: Session) -> Path | None:
+    if not args.debug:
+        return None
+    debug_host_dir = Path("/tmp/agent-uplink-debug") / session.id
+    debug_host_dir.mkdir(parents=True, exist_ok=True)
+    LOGGER.info(f"debug mode: agent logs → {debug_host_dir}")
+    return debug_host_dir
+
+
+def _wait_for_pods(session: Session, aws_plan: AwsPlan) -> None:
+    LOGGER.info("waiting for support pods")
+    wait_for_pod_ready(session.namespace, "mitm", timeout=90)
+    for profile in aws_plan.profile_names:
+        wait_for_pod_ready(
+            session.namespace, f"sigv4-{aws_plan.profile_safe[profile]}", timeout=90
         )
+    LOGGER.info("waiting for agent pod (kata cold-start)")
+    wait_for_pod_ready(session.namespace, "agent", timeout=180)
+
+
+def _assemble_manifests(
+    session: Session,
+    args: argparse.Namespace,
+    *,
+    full_image: str,
+    contribution: PodContribution,
+    rules_bytes: bytes,
+    mitm_certs: MitmCerts,
+    aws_plan: AwsPlan,
+    prepared: PreparedAgent,
+    kube_secrets: KubeSecrets,
+    git_manifest: dict | None,
+    git_secret_name: str | None,
+    cwd: Path,
+    username: str,
+    gid: int,
+    ssh_cidrs: list[str],
+    ssh_key_dir: Path | None,
+    extra_dirs: list[Path],
+) -> list[dict]:
+    """The full manifest set in apply order: namespace + mitm inputs, all
+    Secrets, NetworkPolicies, support pods, then the agent pod."""
+    manifests = _base_manifests(session, rules_bytes, mitm_certs)
+    manifests.extend(aws_plan.secret_manifests)
     for name, files in prepared.secret_payloads.items():
         manifests.append(secret_manifest(name, session.namespace, files))
-
-    # Kube secrets: sanitized kubeconfig for the agent pod, client certs and
-    # upstream CA bundle for the mitm pod. Only created when --kube-context is set.
-    kube_config_secret: str | None = None
-    kube_client_certs_secret: str | None = None
-    kube_upstream_ca_secret: str | None = None
-    if kube_plan is not None:
-        kube_config_secret = "kube-config"
-        manifests.append(
-            secret_manifest(kube_config_secret, session.namespace,
-                            {"config": kube_plan.pod_kubeconfig})
-        )
-        if kube_plan.client_certs:
-            kube_client_certs_secret = "kube-client-certs"
-            manifests.append(
-                secret_manifest(kube_client_certs_secret, session.namespace,
-                                kube_plan.client_certs)
-            )
-        if kube_plan.upstream_ca_bundle:
-            kube_upstream_ca_secret = "kube-upstream-ca"
-            manifests.append(
-                secret_manifest(kube_upstream_ca_secret, session.namespace,
-                                {"bundle.pem": kube_plan.upstream_ca_bundle})
-            )
-
-    # git overlay: host identity + extra SSH->HTTPS rewrites, included by the
-    # baked /etc/gitconfig. Only created when it would be non-empty.
-    git_config_secret: str | None = None
-    git_overlay = build_git_overlay(
-        args.git_https_rewrite, include_identity=not args.no_git_identity
+    manifests.extend(kube_secrets.manifests)
+    if git_manifest is not None:
+        manifests.append(git_manifest)
+    manifests.extend(
+        _network_policies(session.namespace, aws_plan.has_sigv4, ssh_cidrs)
     )
-    if git_overlay is not None:
-        git_config_secret = "git-config"
-        manifests.append(
-            secret_manifest(git_config_secret, session.namespace,
-                            {"agent-uplink.inc": git_overlay})
-        )
-
-    manifests.extend(_network_policies(
-        session.namespace, bool(aws_profile_names), ssh_cidrs))
     manifests.extend(
         _mitm_manifests(
             session.namespace,
             args.mitmproxy_image,
             args.mitm_runtime_class,
-            kube_client_certs_secret=kube_client_certs_secret,
-            kube_upstream_ca_secret=kube_upstream_ca_secret,
+            kube_client_certs_secret=kube_secrets.client_certs_secret,
+            kube_upstream_ca_secret=kube_secrets.upstream_ca_secret,
         )
     )
-    for profile in aws_profile_names:
+    for profile in aws_plan.profile_names:
         manifests.extend(
             _sigv4_manifests(
                 session.namespace,
                 profile,
-                profile_safe[profile],
+                aws_plan.profile_safe[profile],
                 args.sigv4_proxy_image,
                 args.sigv4_runtime_class,
             )
@@ -872,27 +947,88 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
             username,
             gid,
             args.agent_runtime_class,
-            ssh_key_dir,
-            kube_config_secret,
-            git_config_secret,
-            extra_dirs=extra_dirs,
+            AgentMounts(
+                ssh_key_dir=ssh_key_dir,
+                kube_config_secret=kube_secrets.config_secret,
+                git_config_secret=git_secret_name,
+                extra_dirs=extra_dirs,
+            ),
+        )
+    )
+    return manifests
+
+
+def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
+    username = os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
+    cwd = Path.cwd()
+    validate_cwd(username, cwd)
+    ssh_cidrs, ssh_key_dir = validate_ssh_args(args.ssh_cidr, args.ssh_key_dir)
+    extra_dirs = validate_extra_dirs(username, cwd, args.add_dir)
+
+    mitm_dir = STATE_DIR / "mitm"
+    certs_generated = _bootstrap_infra(args, mitm_dir)
+
+    aws_profile_names = _resolve_aws_profiles(args, agent)
+    prepared = agent.prepare(session, aws_profile_names)
+    full_image = _ensure_agent_image(args, agent, username, mitm_dir, certs_generated)
+
+    aws_plan = _build_aws_plan(session, aws_profile_names)
+    mitm_certs = _read_mitm_certs(mitm_dir)
+
+    # Kube context resolution feeds the rule layer, so it precedes rule assembly.
+    kube_plan: KubePlan | None = None
+    if args.kube_context:
+        LOGGER.info(f"resolving kube contexts: {args.kube_context}")
+        kube_plan = resolve_kube(args.kubeconfig, args.kube_context, mitm_certs.ca_cert)
+
+    rules_bytes = resolve_rules(
+        args.rules,
+        args.no_default_rules,
+        agent,
+        prepared.auth_rules,
+        allow_exec=args.allow_exec,
+        aws_sigv4_routes=aws_plan.sigv4_routes,
+        kube_rules=kube_plan.rules if kube_plan else None,
+    )
+
+    contribution = agent.pod_contribution(
+        PodBuildContext(
+            cwd=cwd,
+            username=username,
+            uid=os.getuid(),
+            gid=os.getgid(),
+            aws_creds_secret_name=aws_plan.dummy_secret_name,
+            debug_host_dir=_prepare_debug_dir(args, session),
+            debug=args.debug,
         )
     )
 
-    LOGGER.info(
-        f"applying {len(manifests)} manifests to ns/{session.namespace}")
+    kube_secrets = _kube_secrets(session, kube_plan)
+    git_manifest, git_secret_name = _git_secret(session, args)
+    manifests = _assemble_manifests(
+        session,
+        args,
+        full_image=full_image,
+        contribution=contribution,
+        rules_bytes=rules_bytes,
+        mitm_certs=mitm_certs,
+        aws_plan=aws_plan,
+        prepared=prepared,
+        kube_secrets=kube_secrets,
+        git_manifest=git_manifest,
+        git_secret_name=git_secret_name,
+        cwd=cwd,
+        username=username,
+        gid=os.getgid(),
+        ssh_cidrs=ssh_cidrs,
+        ssh_key_dir=ssh_key_dir,
+        extra_dirs=extra_dirs,
+    )
+
+    LOGGER.info(f"applying {len(manifests)} manifests to ns/{session.namespace}")
     apply_manifests(manifests)
 
-    LOGGER.info("waiting for support pods")
-    wait_for_pod_ready(session.namespace, "mitm", timeout=90)
-    for profile in aws_profile_names:
-        wait_for_pod_ready(
-            session.namespace,
-            f"sigv4-{profile_safe[profile]}",
-            timeout=90,
-        )
-    LOGGER.info("waiting for agent pod (kata cold-start)")
-    wait_for_pod_ready(session.namespace, "agent", timeout=180)
+    _wait_for_pods(session, aws_plan)
 
     LOGGER.info("attaching to agent")
     if contribution.command is None:

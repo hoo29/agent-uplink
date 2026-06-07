@@ -117,3 +117,26 @@ def sanitize_profile_for_k8s_name(profile: str) -> str:
     out = "".join(c.lower() if c.isalnum() else "-" for c in profile)
     out = out.strip("-") or "default"
     return out[:63]
+
+
+def build_safe_name_map(profile_names: list[str]) -> dict[str, str]:
+    """Map each profile to its k8s-safe name, validating the name and rejecting
+    collisions in one place.
+
+    Two distinct profiles that sanitise to the same label would emit duplicate
+    Pod/Service manifests, so that case is an error the caller must resolve by
+    renaming a profile.
+    """
+    safe_map: dict[str, str] = {}
+    seen: dict[str, str] = {}
+    for profile in profile_names:
+        validate_profile_name(profile)
+        safe = sanitize_profile_for_k8s_name(profile)
+        if safe in seen:
+            raise ValueError(
+                f"AWS profiles {seen[safe]!r} and {profile!r} both map to the "
+                f"k8s-safe name {safe!r}; rename one to disambiguate"
+            )
+        seen[safe] = profile
+        safe_map[profile] = safe
+    return safe_map

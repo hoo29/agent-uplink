@@ -9,6 +9,7 @@ addon never touches the user's keyring or YAML.
 import json
 import logging
 import re
+from typing import NamedTuple
 
 from mitmproxy import ctx, http
 from mitmproxy.addonmanager import Loader
@@ -31,9 +32,20 @@ _SIGV4_HEADERS_TO_STRIP = (
 )
 
 
+class CompiledRule(NamedTuple):
+    """A rule with its regexes pre-compiled, kept as named fields so the match
+    loop reads by name instead of by tuple index."""
+
+    host: re.Pattern
+    methods: set
+    paths: list
+    inject_headers: dict
+    name: str
+
+
 class RuleEnforcer:
     def __init__(self) -> None:
-        self._compiled: list[tuple] = []
+        self._compiled: list[CompiledRule] = []
         self._sigv4_routes: dict[str, dict] = {}
 
     def load(self, loader: Loader) -> None:
@@ -51,12 +63,12 @@ class RuleEnforcer:
             data = json.load(f)
         rules = data["rules"]
         self._compiled = [
-            (
-                re.compile(r["host"]),
-                set(r.get("methods") or []),
-                [re.compile(p) for p in (r.get("paths") or [])],
-                r.get("inject", {}).get("headers", {}),
-                r.get("name", "<unnamed>"),
+            CompiledRule(
+                host=re.compile(r["host"]),
+                methods=set(r.get("methods") or []),
+                paths=[re.compile(p) for p in (r.get("paths") or [])],
+                inject_headers=r.get("inject", {}).get("headers", {}),
+                name=r.get("name", "<unnamed>"),
             )
             for r in rules
         ]
@@ -71,14 +83,14 @@ class RuleEnforcer:
         else None. Matching is host (fullmatch) + optional method + optional
         path. First match wins; rules are pre-ordered by the host (layer order).
         """
-        for host_re, methods, path_res, inject_headers, name in self._compiled:
-            if not host_re.fullmatch(req.host):
+        for rule in self._compiled:
+            if not rule.host.fullmatch(req.host):
                 continue
-            if methods and req.method not in methods:
+            if rule.methods and req.method not in rule.methods:
                 continue
-            if path_res and not any(p.fullmatch(req.path) for p in path_res):
+            if rule.paths and not any(p.fullmatch(req.path) for p in rule.paths):
                 continue
-            return name, inject_headers
+            return rule.name, rule.inject_headers
         return None
 
     def _reroute_sigv4(self, req: http.Request, rule_name: str) -> bool:

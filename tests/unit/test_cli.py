@@ -268,7 +268,7 @@ def test_agent_pod_manifest_extra_dirs_adds_volumes_and_mounts(tmp_path):
     )
     pod = cli._agent_pod_manifest(
         "ns", "img", contribution, tmp_path / "home" / "alice" / "cwd",
-        "alice", 1000, "", extra_dirs=[d1, d2],
+        "alice", 1000, "", cli.AgentMounts(extra_dirs=[d1, d2]),
     )
     vol_names = [v["name"] for v in pod["spec"]["volumes"]]
     mnt_paths = [m["mountPath"] for m in pod["spec"]["containers"][0]["volumeMounts"]]
