@@ -79,3 +79,22 @@ def test_validate_profile_name_accepts_normal():
 def test_real_credentials_ini_rejects_bad_profile_name():
     with pytest.raises(ValueError):
         aws.real_aws_credentials_ini("[evil]", {"AWS_ACCESS_KEY_ID": "x"})
+
+
+def test_build_safe_name_map_maps_each_profile():
+    assert aws.build_safe_name_map(["prod", "My.Profile"]) == {
+        "prod": "prod",
+        "My.Profile": "my-profile",
+    }
+
+
+def test_build_safe_name_map_rejects_safe_name_collision():
+    # Two distinct profiles that sanitise to the same k8s label would emit
+    # duplicate Pod/Service manifests; that must be rejected, not silently merged.
+    with pytest.raises(ValueError, match="map to the k8s-safe name"):
+        aws.build_safe_name_map(["My.Profile", "my-profile"])
+
+
+def test_build_safe_name_map_rejects_invalid_profile_name():
+    with pytest.raises(ValueError):
+        aws.build_safe_name_map(["[evil]"])

@@ -3,24 +3,24 @@
 import pytest
 
 from agent_uplink import git as git_mod
+from agent_uplink.process import CommandResult
 
 
 def _fake_git_config(values):
-    """Return a run_command stand-in answering `git config --global --get <key>`
-    from `values` (key -> string). Missing keys return '' like the real CLI with
-    raise_error=False."""
+    """Return a `run` stand-in answering `git config --global --get <key>` from
+    `values` (key -> string). Missing keys come back empty with exit 1, like the
+    real CLI for an unset key."""
 
-    def fake(command, *, raise_error=True):
+    def fake(command, **kwargs):
         key = command[-1]
-        return values.get(key, "")
+        value = values.get(key, "")
+        return CommandResult(0 if value else 1, value, "")
 
     return fake
 
 
 def _overlay(monkeypatch, extra_hosts, include_identity, values=None):
-    monkeypatch.setattr(
-        git_mod, "run_command", _fake_git_config(values or {})
-    )
+    monkeypatch.setattr(git_mod, "run", _fake_git_config(values or {}))
     out = git_mod.build_overlay(extra_hosts, include_identity=include_identity)
     return out.decode() if out is not None else None
 
@@ -83,15 +83,15 @@ def test_value_with_comment_char_is_quoted(monkeypatch):
 
 
 def test_git_absent_skips_identity(monkeypatch):
-    def boom(command, *, raise_error=True):
+    def boom(command, **kwargs):
         raise FileNotFoundError("git")
 
-    monkeypatch.setattr(git_mod, "run_command", boom)
+    monkeypatch.setattr(git_mod, "run", boom)
     # No identity available and no extra hosts -> nothing to ship.
     assert git_mod.build_overlay([], include_identity=True) is None
 
 
 def test_invalid_host_raises(monkeypatch):
-    monkeypatch.setattr(git_mod, "run_command", _fake_git_config({}))
+    monkeypatch.setattr(git_mod, "run", _fake_git_config({}))
     with pytest.raises(ValueError):
         git_mod.build_overlay(["bad host/with spaces"], include_identity=False)

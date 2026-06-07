@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import re
 
-from .process import run_command
+from .process import run
 
 LOGGER = logging.getLogger("agent-uplink")
 
@@ -38,13 +38,13 @@ def _git_global(key: str) -> str | None:
     """Return a host global git config value, or None if git is absent or the
     key is unset."""
     try:
-        value = run_command(
-            ["git", "config", "--global", "--get", key], raise_error=False
-        ).strip()
+        res = run(["git", "config", "--global", "--get", key])
     except FileNotFoundError:
         LOGGER.warning("git not found on host; skipping git identity")
         return None
-    return value or None
+    # `git config --get` exits 1 with empty output for an unset key; treat that
+    # the same as an empty value rather than an error worth surfacing.
+    return res.stdout.strip() or None
 
 
 def _rewrite_block(host: str) -> str:

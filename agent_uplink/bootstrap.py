@@ -36,7 +36,7 @@ from .k8s import (
     wait_for_deployment_ready,
     wait_for_pod_succeeded,
 )
-from .process import run_command
+from .process import run, run_command
 
 LOGGER = logging.getLogger("agent-uplink")
 
@@ -158,11 +158,12 @@ AGENT_IMAGE_MAX_AGE_SECONDS = 86_400
 
 
 def get_image_age_seconds(full_image: str) -> float | None:
-    out = run_command(
-        ["docker", "image", "inspect", "-f", "{{.Created}}", full_image],
-        raise_error=False,
-    ).strip()
-    if not out:
+    # A missing image makes `docker image inspect` exit non-zero and print to
+    # stderr; branch on the exit code (via run) so that expected absence stays
+    # silent instead of logging the "No such image" stderr as a warning.
+    res = run(["docker", "image", "inspect", "-f", "{{.Created}}", full_image])
+    out = res.stdout.strip()
+    if not res.ok or not out:
         return None
     ts = out.rstrip("Z").split(".")[0]
     created = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
