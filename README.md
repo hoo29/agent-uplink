@@ -49,7 +49,7 @@ flowchart LR
     certs --> mitm
     creds --> sidecar
     agent -->|HTTPS_PROXY=http://mitm:8080| mitm
-    agent -.->|git@host: / ssh://git@host| gitrw
+    agent -.->|"git@host: / ssh://git@host"| gitrw
     gitrw -.->|cloned over HTTPS| mitm
     agent -.->|TCP 22 only, --ssh-cidr<br/>bypasses mitm| internet
     mitm -->|allowed + injected| internet
