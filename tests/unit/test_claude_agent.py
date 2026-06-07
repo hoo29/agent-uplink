@@ -20,6 +20,8 @@ SAFE_SECRET_NAMES = {
     "claude-fake-creds",
     "claude-md",
     "agent-aws-creds",
+    # git overlay: host identity + SSH->HTTPS rewrites, no secrets — see git.py.
+    "git-config",
 }
 
 
@@ -27,7 +29,10 @@ def _agent(auth_mode):
     return ClaudeAgent(argparse.Namespace(auth_mode=auth_mode, image="agent-uplink-claude"))
 
 
-def _build_pod(tmp_path, monkeypatch, auth_mode, *, aws_secret="agent-aws-creds"):
+def _build_pod(
+    tmp_path, monkeypatch, auth_mode, *, aws_secret="agent-aws-creds",
+    git_config_secret=None,
+):
     # Point the agent's host-probing at a tmp dir so pod_contribution is hermetic
     # (it mkdir's a per-project dir and conditionally mounts ~/.claude/* and ~/.m2).
     monkeypatch.setattr(claude_agent_mod, "HOST_CLAUDE_DIR", tmp_path / ".claude")
@@ -37,7 +42,8 @@ def _build_pod(tmp_path, monkeypatch, auth_mode, *, aws_secret="agent-aws-creds"
     )
     contribution = _agent(auth_mode).pod_contribution(ctx)
     return cli._agent_pod_manifest(
-        "ns", "img", contribution, Path("/home/u/proj"), "u", 1000, ""
+        "ns", "img", contribution, Path("/home/u/proj"), "u", 1000, "",
+        git_config_secret=git_config_secret,
     )
 
 
@@ -70,3 +76,23 @@ def test_bedrock_mode_has_no_fake_oauth_creds(tmp_path, monkeypatch):
 def test_agent_pod_is_labelled_for_egress_policy(tmp_path, monkeypatch):
     pod = _build_pod(tmp_path, monkeypatch, "anthropic")
     assert pod["metadata"]["labels"]["app"] == "agent"
+
+
+def test_git_config_overlay_not_mounted_by_default(tmp_path, monkeypatch):
+    names = _secret_names(_build_pod(tmp_path, monkeypatch, "anthropic"))
+    assert "git-config" not in names
+
+
+def test_git_config_overlay_mounts_at_include_path(tmp_path, monkeypatch):
+    pod = _build_pod(
+        tmp_path, monkeypatch, "anthropic", git_config_secret="git-config"
+    )
+    assert "git-config" in _secret_names(pod)
+    # And it lands at the include.path baked into /etc/gitconfig, read-only.
+    container = pod["spec"]["containers"][0]
+    mount = next(
+        m for m in container["volumeMounts"] if m["name"] == "git-config"
+    )
+    assert mount["mountPath"] == "/etc/gitconfig.d/agent-uplink.inc"
+    assert mount["subPath"] == "agent-uplink.inc"
+    assert mount["readOnly"] is True

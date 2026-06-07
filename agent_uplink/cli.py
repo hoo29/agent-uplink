@@ -27,6 +27,7 @@ from .bootstrap import (
     ensure_registry,
     get_image_age_seconds,
 )
+from .git import build_overlay as build_git_overlay
 from .k8s import (
     Resources,
     Stdio,
@@ -157,6 +158,23 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="Host directory of SSH private keys to mount read-only at the "
         "agent's ~/.ssh (the directory need not be named .ssh)",
+    )
+    common.add_argument(
+        "--git-https-rewrite",
+        type=str,
+        nargs="*",
+        action="extend",
+        default=[],
+        metavar="HOST",
+        help="Extra git host(s) whose SSH URLs are rewritten to HTTPS so they "
+        "route through mitm, in addition to the baked-in github.com, gitlab.com, "
+        "bitbucket.org. Auth still requires a matching --rules entry.",
+    )
+    common.add_argument(
+        "--no-git-identity",
+        action="store_true",
+        help="Don't surface the host's git identity (user.name/user.email) into "
+        "the agent; commits are then unattributed unless set in-repo",
     )
     common.add_argument(
         "--add-dir",
@@ -431,6 +449,9 @@ def _agent_env(cwd: Path, username: str) -> dict[str, str]:
     env: dict[str, str] = {
         "WORKDIR": str(cwd),
         "USERNAME": username,
+        # mitm injects git auth, so a credential prompt is never useful; fail
+        # fast on unconfigured/denied auth instead of hanging the agent.
+        "GIT_TERMINAL_PROMPT": "0",
         # dockerd reads the upper-case DOCKER_* forms.
         "DOCKER_HTTP_PROXY": proxy,
         "DOCKER_HTTPS_PROXY": proxy,
@@ -455,6 +476,7 @@ def _agent_pod_manifest(
     runtime_class: str,
     ssh_key_dir: Path | None = None,
     kube_config_secret: str | None = None,
+    git_config_secret: str | None = None,
     extra_dirs: list[Path] | None = None,
 ) -> dict:
     env = _agent_env(cwd, username)
@@ -490,6 +512,20 @@ def _agent_pod_manifest(
             }
         )
         env["KUBECONFIG"] = "/etc/agent-uplink/kube/config"
+    # git overlay (host identity + --git-https-rewrite hosts): pulled in by the
+    # include.path in the baked /etc/gitconfig. Mounted read-only at that path;
+    # carries no secrets, so it's safe in the agent pod. The agent's ~/.gitconfig
+    # is untouched and stays writable.
+    if git_config_secret is not None:
+        volumes.append(secret_volume("git-config", git_config_secret))
+        mounts.append(
+            {
+                "name": "git-config",
+                "mountPath": "/etc/gitconfig.d/agent-uplink.inc",
+                "subPath": "agent-uplink.inc",
+                "readOnly": True,
+            }
+        )
     for i, d in enumerate(extra_dirs or []):
         name = f"add-dir-{i}"
         volumes.append(hostpath_volume(name, str(d), hp_type="Directory"))
@@ -793,6 +829,19 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
                                 {"bundle.pem": kube_plan.upstream_ca_bundle})
             )
 
+    # git overlay: host identity + extra SSH->HTTPS rewrites, included by the
+    # baked /etc/gitconfig. Only created when it would be non-empty.
+    git_config_secret: str | None = None
+    git_overlay = build_git_overlay(
+        args.git_https_rewrite, include_identity=not args.no_git_identity
+    )
+    if git_overlay is not None:
+        git_config_secret = "git-config"
+        manifests.append(
+            secret_manifest(git_config_secret, session.namespace,
+                            {"agent-uplink.inc": git_overlay})
+        )
+
     manifests.extend(_network_policies(
         session.namespace, bool(aws_profile_names), ssh_cidrs))
     manifests.extend(
@@ -825,6 +874,7 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
             args.agent_runtime_class,
             ssh_key_dir,
             kube_config_secret,
+            git_config_secret,
             extra_dirs=extra_dirs,
         )
     )

@@ -31,6 +31,8 @@ agent-uplink claude --anthropic --rules my.yaml --no-default-rules
 agent-uplink claude --anthropic --agent-runtime-class kata-qemu  # override default kata-clh
 agent-uplink claude --anthropic --mitm-runtime-class kata-clh    # microVM mitm too (slower)
 agent-uplink claude --anthropic --ssh-cidr 10.0.0.0/24 203.0.113.7 --ssh-key-dir ~/keys/agent  # SSH egress
+agent-uplink claude --anthropic --rules examples/rules/git.yaml                                   # git over HTTPS
+agent-uplink claude --anthropic --git-https-rewrite git.example.com --no-git-identity             # extra host, no identity
 agent-uplink claude --anthropic --kube-context dev-cluster                                        # k8s cluster access
 agent-uplink claude --anthropic --kube-context ctx-a ctx-b --kubeconfig ~/.kube/extra.yaml        # multiple contexts
 agent-uplink claude --anthropic --deploy-context my-cluster                                       # cluster to deploy into
@@ -269,6 +271,36 @@ By default the agent pod can only reach `mitm` and `kube-dns`, so SSH is blocked
 - `--ssh-key-dir <DIR>` — mounts a host directory of SSH private keys **read-only** at the agent user's `~/.ssh` (the directory need not be named `.ssh`). Read-only keeps the untrusted agent from tampering with the keys; the cost is that `known_hosts` can't be persisted (connections still succeed; pre-seed a `known_hosts` in the dir to avoid prompts). The container user shares the host UID (`USER_UID` build arg), so `0600` host-owned keys are readable.
 
 The two flags are independent but want each other: keys without a CIDR can't reach anything on 22, and a CIDR without keys opens egress with nothing to authenticate with — each case logs a warning. Implementation: `--ssh-cidr` flows into `_network_policies` (`cli.py`) and `--ssh-key-dir` into `_agent_pod_manifest` (`cli.py`); both are orchestrator-level (universal) concerns, so no `Agent` subclass is involved.
+
+### Git over HTTPS
+
+SSH egress (above) is for shelling into machines, not git: it bypasses mitm, so it has no allow-list or
+credential injection. Git instead runs over **HTTPS**, through mitm, so the same rule engine governs it and
+injects credentials host-side.
+
+To avoid editing existing SSH remotes, the agent image bakes `/etc/gitconfig` with git `insteadOf` rules that
+rewrite SSH URLs to their HTTPS form at operation time for **github.com, gitlab.com, bitbucket.org** (both
+`git@host:owner/repo` and `ssh://git@host/owner/repo`). So `git clone git@github.com:owner/repo.git` transparently
+becomes an HTTPS clone routed through mitm. Submodules with SSH URLs are rewritten the same way.
+
+Two orchestrator-level flags layer a runtime overlay on top of the baked defaults (wired in `cli.py` via
+`agent_uplink/git.py`; no `Agent` subclass involved):
+
+- `--git-https-rewrite <HOST> [<HOST> ...]` — additional hosts (e.g. self-hosted GitLab) to rewrite SSH→HTTPS.
+  Auth for them still needs a matching `--rules` entry.
+- `--no-git-identity` — by default the host's `user.name`/`user.email` (read via `git config --global`) are
+  surfaced so commits are attributed; this flag omits them.
+
+The overlay is shipped as the `git-config` Secret and mounted read-only at `/etc/gitconfig.d/agent-uplink.inc`,
+which the baked `/etc/gitconfig` pulls in via `include.path` (a missing file is silently ignored). It carries only
+name/email + host rewrites — **no secrets** — so it is safe in the agent pod; the agent's `~/.gitconfig` is left
+writable. `GIT_TERMINAL_PROMPT=0` is set so denied/unconfigured auth fails fast instead of hanging.
+
+**Auth is opt-in.** The default allow-list only permits `GET`/`OPTIONS`/`HEAD`, but git transport POSTs to
+`git-upload-pack` (fetch) and `git-receive-pack` (push). Pass `--rules examples/rules/git.yaml` to allow those
+endpoints and inject HTTP Basic auth (keyring value = `base64("<user>:<token>")`; the token never enters the pod).
+The rule injects auth on `info/refs` too, since a private repo's discovery `GET` returns `401` otherwise. Without
+such a rule, even a public clone is denied at `git-upload-pack`.
 
 ### Kubernetes cluster access
 

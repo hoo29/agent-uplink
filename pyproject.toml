@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-uplink"
-version = "0.1.0"
+version = "0.2.0"
 description = "Agent Sandbox"
 readme = "README.md"
 authors = [{ name = "Huw" }]
@@ -58,4 +58,5 @@ agent_uplink = ["default_rules.yaml"]
     "default_rules.yaml",
     "Dockerfile",
     "dockerd-entrypoint.sh",
+    "gitconfig",
 ]

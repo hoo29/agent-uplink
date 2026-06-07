@@ -7,3 +7,4 @@ examples/rules/mine.yaml
 build
 .claude/*.lock
 .pytest_cache
+token
