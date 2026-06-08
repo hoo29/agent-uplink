@@ -261,6 +261,21 @@ class ClaudeAgent(Agent):
                 {"name": "m2-repo", "mountPath": f"{container_home}/.m2/repository"}
             )
 
+        # Ansible: ~/.ansible.cfg read-only when the host has one, so the in-pod
+        # ansible picks up the user's defaults. Gated on existence, like Maven.
+        ansible_cfg = Path.home() / ".ansible.cfg"
+        if ansible_cfg.is_file():
+            volumes.append(
+                hostpath_volume("ansible-cfg", str(ansible_cfg), hp_type="File")
+            )
+            mounts.append(
+                {
+                    "name": "ansible-cfg",
+                    "mountPath": f"{container_home}/.ansible.cfg",
+                    "readOnly": True,
+                }
+            )
+
         # Private registry auth (ECR, etc.) is handled by mitm rules injecting
         # the Authorization header on registry hosts, so ~/.docker/config.json
         # is deliberately not mounted — no registry credentials enter the pod.

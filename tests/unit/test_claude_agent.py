@@ -96,3 +96,25 @@ def test_git_config_overlay_mounts_at_include_path(tmp_path, monkeypatch):
     assert mount["mountPath"] == "/etc/gitconfig.d/agent-uplink.inc"
     assert mount["subPath"] == "agent-uplink.inc"
     assert mount["readOnly"] is True
+
+
+def _mount(pod, name):
+    container = pod["spec"]["containers"][0]
+    return next((m for m in container["volumeMounts"] if m["name"] == name), None)
+
+
+def test_ansible_cfg_not_mounted_when_absent(tmp_path, monkeypatch):
+    # HOME drives Path.home(); a tmp home with no ~/.ansible.cfg => no mount.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    pod = _build_pod(tmp_path, monkeypatch, "anthropic")
+    assert _mount(pod, "ansible-cfg") is None
+
+
+def test_ansible_cfg_mounts_read_only_when_present(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".ansible.cfg").write_text("[defaults]\n")
+    pod = _build_pod(tmp_path, monkeypatch, "anthropic")
+    mount = _mount(pod, "ansible-cfg")
+    assert mount is not None
+    assert mount["mountPath"] == "/home/u/.ansible.cfg"
+    assert mount["readOnly"] is True

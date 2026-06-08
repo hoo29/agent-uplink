@@ -234,6 +234,13 @@ The image bundles OpenJDK 21 + Maven. When `~/.m2` exists on the host, the agent
 
 The mitm CA is added to the JVM truststore at image build (the JDK pulls in `ca-certificates-java`, which `update-ca-certificates` feeds from the system store), so Maven trusts mitm's TLS interception of HTTPS dependency downloads.
 
+### Claude agent: Ansible
+
+The image bundles `ansible` (in a venv). When `~/.ansible.cfg` exists on the host it is mounted **read-only** at the
+agent user's `~/.ansible.cfg` (no flag needed, gated on existence like Maven), so the in-pod ansible picks up the
+user's defaults. Unlike credentials, the file's contents enter the pod verbatim — it bypasses mitm — so keep inline
+secrets (or `vault_password_file` references) out of it.
+
 ### Claude agent: private docker registry auth
 
 `~/.docker/config.json` is **not** mounted into the pod. Private registry pulls (ECR, etc.) are handled purely by mitm rules, the same mechanism as every other credential — there is no docker-specific code path. The in-pod `dockerd` makes anonymous registry requests; a rule matching the registry host injects the `Authorization` header (header injection adds it even when the request had none), so the registry accepts the pull. The credential is resolved on the host and never enters the pod.
