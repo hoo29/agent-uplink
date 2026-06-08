@@ -59,4 +59,5 @@ agent_uplink = ["default_rules.yaml"]
     "Dockerfile",
     "dockerd-entrypoint.sh",
     "gitconfig",
+    "ssh_config",
 ]

@@ -151,9 +151,9 @@ model than the rest of agent-uplink):
 - `--ssh-cidr <CIDR> [<CIDR> ...]` — allows **TCP 22 only** to those CIDRs (a bare IP becomes `/32`). This is the sole control
   on SSH egress, so scope it tightly. NetworkPolicy matches resolved IPs, not DNS names, so mind DNS/CDN churn for hosts like
   GitHub.
-- `--ssh-key-dir <DIR>` — mounts a host directory of SSH private keys **read-only** at the agent user's `~/.ssh`. Read-only
-  means `known_hosts` can't be persisted (pre-seed one in the dir to avoid prompts). The container user shares the host UID,
-  so `0600` host-owned keys are readable.
+- `--ssh-key-dir <DIR>` — mounts a host directory of SSH private keys **read-only** at the agent user's `~/.sshclaude`. Key
+  names are arbitrary: tell the agent which key to use (`ssh -i ~/.sshclaude/<key>`) or ship a `config` in the dir. `~/.ssh`
+  stays writable so ssh can create `known_hosts` itself. The container user shares the host UID, so `0600` host keys are readable.
 
 The flags are independent but want each other (each logs a warning if used alone).
 
