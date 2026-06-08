@@ -85,6 +85,10 @@ COPY --chmod=0755 dockerd-entrypoint.sh /usr/local/bin/dockerd-entrypoint.sh
 # is mounted by the orchestrator (see agent_uplink/git.py).
 COPY gitconfig /etc/gitconfig
 
+# Point ssh at keys mounted read-only at ~/.sshclaude (--ssh-key-dir) so ~/.ssh
+# stays writable for known_hosts. Ubuntu's /etc/ssh/ssh_config includes this dir.
+COPY ssh_config /etc/ssh/ssh_config.d/agent-uplink.conf
+
 ENV SHELL=/bin/bash
 ENV EDITOR=vim
 ENV VISUAL=vim

@@ -158,7 +158,8 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="DIR",
         help="Host directory of SSH private keys to mount read-only at the "
-        "agent's ~/.ssh (the directory need not be named .ssh)",
+        "agent's ~/.sshclaude (keys keep their names; use ssh -i, or ship a "
+        "config in the dir). ~/.ssh stays writable so known_hosts can be created",
     )
     common.add_argument(
         "--git-https-rewrite",
@@ -495,10 +496,13 @@ def _agent_pod_manifest(
     volumes = list(contribution.volumes)
     mounts = list(contribution.mounts)
     # SSH private keys: the host dir is mounted read-only at the agent user's
-    # ~/.ssh so `ssh` discovers them. Read-only keeps the untrusted agent from
-    # tampering with the host keys (cost: known_hosts can't be persisted back).
-    # The container user shares the host UID (Dockerfile USER_UID), so 0600 host
-    # keys are readable. Reachability is gated by the --ssh-cidr egress rule.
+    # ~/.sshclaude (not ~/.ssh). Key filenames are arbitrary, so the agent is
+    # told which key to use (ssh -i ~/.sshclaude/<key>) or a `config` shipped in
+    # the dir maps hosts to keys (the image's ssh_config includes it). Keeping
+    # keys out of ~/.ssh leaves that dir writable so ssh can create known_hosts
+    # itself; read-only keeps the untrusted agent from tampering with the host
+    # keys. The container user shares the host UID (Dockerfile USER_UID), so
+    # 0600 host keys are readable. Reachability is gated by the --ssh-cidr rule.
     if pod_mounts.ssh_key_dir is not None:
         volumes.append(
             hostpath_volume("ssh-keys", str(pod_mounts.ssh_key_dir), hp_type="Directory")
@@ -506,7 +510,7 @@ def _agent_pod_manifest(
         mounts.append(
             {
                 "name": "ssh-keys",
-                "mountPath": f"/home/{username}/.ssh",
+                "mountPath": f"/home/{username}/.sshclaude",
                 "readOnly": True,
             }
         )

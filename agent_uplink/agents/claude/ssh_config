@@ -1,0 +1,7 @@
+# agent-uplink: SSH private keys are mounted read-only at ~/.sshclaude (via
+# --ssh-key-dir), keeping them out of ~/.ssh so that directory stays writable
+# and ssh can create known_hosts itself. Key filenames are arbitrary, so no
+# IdentityFile is assumed here: either pass the key explicitly
+# (ssh -i ~/.sshclaude/<key> ...) or ship a `config` in the key dir mapping
+# hosts to keys, which this includes.
+Include ~/.sshclaude/config
