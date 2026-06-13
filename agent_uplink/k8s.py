@@ -7,6 +7,7 @@ helpers to assemble pods/secrets/etc and apply them via stdin to kubectl.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -57,6 +58,20 @@ def apply_manifests(manifests: list[dict]) -> None:
     docs = [yaml.safe_dump(m, sort_keys=False) for m in manifests]
     payload = ("---\n" + "---\n".join(docs)).encode("utf-8")
     kubectl("apply", "-f", "-", stdin=payload)
+
+
+def list_namespaces(label_selector: str) -> list[dict]:
+    """Return namespace objects matching a label selector (the raw items from
+    `kubectl get -o json`). Empty list if none match or the query fails."""
+    out = kubectl(
+        "get", "namespace", "-l", label_selector, "-o", "json", raise_error=False
+    )
+    if not out.strip():
+        return []
+    try:
+        return json.loads(out).get("items", [])
+    except json.JSONDecodeError:
+        return []
 
 
 def delete_namespace(name: str, *, wait: bool = False) -> None:

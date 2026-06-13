@@ -85,3 +85,27 @@ def test_wait_for_pod_succeeded_times_out_with_last_phase(monkeypatch):
     # The last observed phase is surfaced in the timeout message for debugging.
     with pytest.raises(TimeoutError, match="Pending"):
         k8s.wait_for_pod_succeeded("ns", "pod", timeout=1)
+
+
+# --------------------------------------------------------------------------- #
+# list_namespaces
+# --------------------------------------------------------------------------- #
+
+
+def test_list_namespaces_parses_items(monkeypatch):
+    monkeypatch.setattr(
+        k8s, "kubectl", lambda *a, **k: '{"items": [{"metadata": {"name": "a"}}]}'
+    )
+    items = k8s.list_namespaces("managed-by=agent-uplink")
+    assert items == [{"metadata": {"name": "a"}}]
+
+
+def test_list_namespaces_empty_output_returns_empty_list(monkeypatch):
+    # No matches: kubectl prints nothing (raise_error=False), not valid JSON.
+    monkeypatch.setattr(k8s, "kubectl", lambda *a, **k: "")
+    assert k8s.list_namespaces("managed-by=agent-uplink") == []
+
+
+def test_list_namespaces_malformed_json_returns_empty_list(monkeypatch):
+    monkeypatch.setattr(k8s, "kubectl", lambda *a, **k: "not json")
+    assert k8s.list_namespaces("managed-by=agent-uplink") == []

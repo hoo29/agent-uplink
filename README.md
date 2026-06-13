@@ -129,11 +129,33 @@ agent-uplink claude --anthropic --kube-context dev-cluster                      
 agent-uplink claude --anthropic --kube-context ctx-a ctx-b --kubeconfig ~/.kube/extra.yaml
 agent-uplink claude --anthropic --deploy-context my-cluster                         # cluster to deploy into
 agent-uplink claude --anthropic --add-dir ~/code/repo-b ~/code/repo-c              # mount extra repos
+agent-uplink claude --anthropic -- --resume <session-id>             # extra args forwarded to `claude`
+agent-uplink claude --anthropic -- -p "summarise the build failure"
 ```
 
 `--anthropic` reads `~/.claude/.credentials.json` (run `claude login` first). `--bedrock` reads `keyring get bedrock key`.
 
+Anything after a `--` separator is forwarded verbatim to the in-pod `claude` CLI (e.g. `--resume <id>`, `-c`, `-p
+"<prompt>"`). `--dangerously-skip-permissions` is always added, so it need not be repeated.
+
 Each run creates a session namespace `agent-uplink-<id>`, torn down on exit.
+
+### Managing sessions
+
+Teardown rides on the run's signal handlers, so a `kill -9`, a host crash, or a closed laptop lid can leave a session namespace
+(and its pods/microVM) behind. Two subcommands manage the leftovers — both operate on `--deploy-context` like a run does:
+
+```bash
+agent-uplink list                          # show session namespaces with status and age
+agent-uplink clean <id> [<id> ...]         # delete specific sessions (id or full namespace)
+agent-uplink clean --older-than 2h         # delete sessions older than a duration (s/m/h/d)
+agent-uplink clean --all                   # delete every session namespace
+agent-uplink clean --all --yes             # skip the confirmation prompt (for scripts)
+```
+
+`clean` lists what it will delete and prompts before acting (override with `-y`/`--yes`); pass `--wait` to block until each
+namespace is gone. The long-lived registry namespace (`agent-uplink-system`) is never a target. A bare `clean` with no
+selector is refused, so it can't wipe everything by accident.
 
 ### Authenticated docker pulls
 
