@@ -728,18 +728,14 @@ def _ensure_agent_image(
     just generated, --force-rebuild is set, the image is missing, or it's stale."""
     full_image = f"{REGISTRY_PUSH_ENDPOINT}/{agent.image_repo}:latest"
     image_age = get_image_age_seconds(full_image)
-    if (
-        certs_generated
-        or args.force_rebuild
-        or image_age is None
-        or image_age > AGENT_IMAGE_MAX_AGE_SECONDS
-    ):
+    stale = image_age is not None and image_age > AGENT_IMAGE_MAX_AGE_SECONDS
+    if certs_generated or args.force_rebuild or image_age is None or stale:
         full_image = build_and_push_agent_image(
             agent.image_repo,
             agent.container_dir(),
             username,
             mitm_dir,
-            force_rebuild=args.force_rebuild,
+            bust_cache=args.force_rebuild or stale,
         )
     return full_image
 
