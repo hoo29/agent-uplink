@@ -172,7 +172,7 @@ def get_image_age_seconds(full_image: str) -> float | None:
 
 def build_and_push_agent_image(
     image_repo: str, container_dir: Path, username: str, mitm_dir: Path,
-    *, force_rebuild: bool = False,
+    *, bust_cache: bool = False,
 ) -> str:
     """Build the agent image via docker, push to the local registry, return
     the fully qualified image reference."""
@@ -183,7 +183,7 @@ def build_and_push_agent_image(
         "--build-arg", f"USER_UID={os.getuid()}",
         "--build-arg", f"USER_GID={os.getgid()}",
     ]
-    if force_rebuild:
+    if bust_cache:
         build_args += ["--build-arg", f"CACHE_BUST={int(time.time())}"]
 
     # Assemble the build context in a tempdir so we never mutate the source tree

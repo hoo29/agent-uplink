@@ -606,20 +606,25 @@ def _ensure_image(monkeypatch, *, certs_generated, force_rebuild, age):
 
 
 @pytest.mark.parametrize(
-    "certs_generated,force_rebuild,age",
+    "certs_generated,force_rebuild,age,bust_cache",
     [
-        (True, False, 10.0),                                   # certs just generated
-        (False, True, 10.0),                                   # --force-rebuild
-        (False, False, None),                                  # image missing
-        (False, False, cli.AGENT_IMAGE_MAX_AGE_SECONDS + 1),   # stale
+        (True, False, 10.0, False),                                  # certs just generated
+        (False, True, 10.0, True),                                   # --force-rebuild
+        (False, False, None, False),                                 # image missing
+        (False, False, cli.AGENT_IMAGE_MAX_AGE_SECONDS + 1, True),   # stale
     ],
 )
-def test_ensure_agent_image_rebuilds(monkeypatch, certs_generated, force_rebuild, age):
+def test_ensure_agent_image_rebuilds(
+    monkeypatch, certs_generated, force_rebuild, age, bust_cache
+):
     build, result = _ensure_image(
         monkeypatch, certs_generated=certs_generated, force_rebuild=force_rebuild, age=age
     )
     build.assert_called_once()
     assert result == "rebuilt-image"
+    # The cache is busted only when the rebuild exists to refresh upstream
+    # content (force or staleness); certs/missing reuse cached layers.
+    assert build.call_args.kwargs["bust_cache"] is bust_cache
 
 
 def test_ensure_agent_image_reuses_fresh_image(monkeypatch):

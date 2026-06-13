@@ -30,6 +30,7 @@ def _capture_build_context(monkeypatch) -> dict:
             captured["files"] = {
                 str(p.relative_to(ctx)) for p in ctx.rglob("*") if p.is_file()
             }
+            captured["command"] = command
         return ""
 
     monkeypatch.setattr(bootstrap, "run_command", fake_run_command)
@@ -70,6 +71,33 @@ def test_build_and_push_agent_image_excludes_ca_private_key(tmp_path, monkeypatc
     # The actual image inputs are present.
     assert "Dockerfile" in files
     assert "entrypoint.py" in files
+
+
+def _build_with(monkeypatch, tmp_path, *, bust_cache):
+    container_dir = tmp_path / "agentimg"
+    container_dir.mkdir()
+    (container_dir / "Dockerfile").write_text("FROM scratch\n")
+    mitm_dir = tmp_path / "mitm"
+    mitm_dir.mkdir()
+    (mitm_dir / "mitmproxy-ca-cert.pem").write_text("PUBLIC CERT")
+
+    captured = _capture_build_context(monkeypatch)
+    bootstrap.build_and_push_agent_image(
+        "repo", container_dir, "u", mitm_dir, bust_cache=bust_cache
+    )
+    return captured["command"]
+
+
+def test_build_passes_cache_bust_when_requested(monkeypatch, tmp_path):
+    command = _build_with(monkeypatch, tmp_path, bust_cache=True)
+    # A CACHE_BUST build-arg invalidates the Claude CLI install layer.
+    assert any(a.startswith("CACHE_BUST=") for a in command)
+
+
+def test_build_omits_cache_bust_by_default(monkeypatch, tmp_path):
+    command = _build_with(monkeypatch, tmp_path, bust_cache=False)
+    # Without a bust, docker is free to reuse cached layers (fast path).
+    assert not any(a.startswith("CACHE_BUST=") for a in command)
 
 
 # --------------------------------------------------------------------------- #
