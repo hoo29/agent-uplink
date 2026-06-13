@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 from pathlib import Path
 from typing import ClassVar
 
@@ -76,6 +77,14 @@ class ClaudeAgent(Agent):
             const="bedrock",
             help="Configure container for AWS Bedrock bearer-token auth",
         )
+        parser.add_argument(
+            "claude_args",
+            nargs="*",
+            metavar="-- ARG",
+            help="Extra args passed verbatim to the `claude` CLI in the pod, after "
+            "a `--` separator (e.g. `-- --resume <id>`, `-- -p \"prompt\"`). "
+            "--dangerously-skip-permissions is always added and need not be repeated.",
+        )
 
     def _config(self) -> dict:
         if self._claude_config is None:
@@ -138,7 +147,9 @@ class ClaudeAgent(Agent):
             mounts=mounts,
             security_context=self._container_security_context(),
             init_command=["/usr/local/bin/dockerd-entrypoint.sh"],
-            command=self._container_command(ctx.username, ctx.debug),
+            command=self._container_command(
+                ctx.username, ctx.debug, self.args.claude_args
+            ),
             # tmpfs /var/lib/docker counts against this; default 1Gi can't hold
             # even a small image alongside the agent process.
             memory="4Gi",
@@ -344,12 +355,15 @@ class ClaudeAgent(Agent):
             "seccompProfile": {"type": "Unconfined"},
         }
 
-    def _container_command(self, username: str, debug: bool) -> list[str]:
-        flag = (
-            "-d --dangerously-skip-permissions"
-            if debug
-            else "--dangerously-skip-permissions"
-        )
+    def _container_command(
+        self, username: str, debug: bool, extra_args: list[str]
+    ) -> list[str]:
+        # -d (debug) then --dangerously-skip-permissions, then any user-supplied
+        # passthrough args (--resume <id>, -p "prompt", ...). Each is shell-quoted
+        # so values can't break out of the `bash -lc` string.
+        argv = (["-d"] if debug else []) + ["--dangerously-skip-permissions"]
+        argv += extra_args
+        claude_args = " ".join(shlex.quote(a) for a in argv)
         # PID 1 runs as root so it can start dockerd; drop to the agent user
         # for the interactive session. runuser re-initialises HOME/USER/groups
         # to the target user (including the `docker` group, so the socket is
@@ -361,5 +375,5 @@ class ClaudeAgent(Agent):
             "--",
             "bash",
             "-lc",
-            f'cd "$WORKDIR" && exec claude {flag}',
+            f'cd "$WORKDIR" && exec claude {claude_args}',
         ]

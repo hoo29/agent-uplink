@@ -37,7 +37,15 @@ agent-uplink claude --anthropic --kube-context dev-cluster                      
 agent-uplink claude --anthropic --kube-context ctx-a ctx-b --kubeconfig ~/.kube/extra.yaml        # multiple contexts
 agent-uplink claude --anthropic --deploy-context my-cluster                                       # cluster to deploy into
 agent-uplink claude --anthropic --add-dir ~/code/repo-b ~/code/repo-c                            # mount extra repos
+agent-uplink claude --anthropic -- --resume <id>                                                 # forward args to `claude`
+agent-uplink claude --anthropic -- -p "prompt"                                                   # non-interactive print mode
 agent-uplink claude --anthropic --debug
+
+# Session management (orphan reaper — namespaces left by killed/crashed runs)
+agent-uplink list                          # list session namespaces (status + age)
+agent-uplink clean <id> [<id> ...]         # delete specific sessions (id or namespace)
+agent-uplink clean --older-than 2h         # delete sessions older than a duration
+agent-uplink clean --all --yes             # delete all (skip confirmation)
 
 # Tests
 pytest
@@ -117,7 +125,7 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 13. Assemble the full manifest set: namespace, ConfigMap (mitm-addon), Secrets, NetworkPolicies (default-deny + agent-egress + mitm-policy + sigv4-policy), mitm Pod + Service, one sigv4 Pod + Service per profile, agent Pod.
 14. `kubectl apply -f -` for everything in one call.
 15. Wait for support pods Ready, then agent pod Ready (Kata cold start + nested `dockerd` warmup is the long pole).
-16. `kubectl exec -it agent -- <PodContribution.command>` — for Claude: `runuser -u <username> -- bash -lc 'cd "$WORKDIR" && exec claude --dangerously-skip-permissions'` (with `--debug`, `-d` is prepended to the `claude` flags). PID 1 (`dockerd-entrypoint.sh`) is root so it can start the nested `dockerd` and chgrp the socket; `runuser` drops the interactive session to the host UID so hostPath writes land as the host user.
+16. `kubectl exec -it agent -- <PodContribution.command>` — for Claude: `runuser -u <username> -- bash -lc 'cd "$WORKDIR" && exec claude --dangerously-skip-permissions'` (with `--debug`, `-d` is prepended to the `claude` flags; any args after a `--` separator on the agent-uplink command line are shell-quoted and appended, e.g. `-- --resume <id>` or `-- -p "prompt"`). PID 1 (`dockerd-entrypoint.sh`) is root so it can start the nested `dockerd` and chgrp the socket; `runuser` drops the interactive session to the host UID so hostPath writes land as the host user.
 17. On exit / SIGINT / SIGTERM: `kubectl delete ns <id> --wait=false` and `rmtree(session_dir)`. The cluster finishes the cascade in the background.
 
 ### Key constraints
@@ -134,13 +142,14 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 | File | Responsibility |
 |---|---|
 | `agent_uplink/__main__.py` | Entry point shim — re-exports `cli.main` |
-| `agent_uplink/cli.py` | Arg parsing, signal handler wiring, manifest assembly, orchestration |
+| `agent_uplink/cli.py` | Arg parsing, signal handler wiring, manifest assembly, orchestration, `list`/`clean` dispatch |
 | `agent_uplink/k8s.py` | Low-level `kubectl` wrappers + typed manifest builders (Pod/Secret/ConfigMap/Service/NetworkPolicy/Deployment) and reusable volume/securityContext fragments |
 | `agent_uplink/bootstrap.py` | One-time setup: local registry, k3s `registries.yaml` check, mitm CA generation, docker build+push |
 | `agent_uplink/aws.py` | AWS helpers: dummy AKIA, dummy + real shared-credentials INI as bytes, profile env export, k8s-safe name sanitiser |
 | `agent_uplink/kube.py` | Kubernetes context resolution: reads host kubeconfig via `kubectl config view`, validates auth method, produces sanitized pod kubeconfig + mitm wiring (allow rules, client certs, upstream CA bundle) |
 | `agent_uplink/rules.py` | Rule resolution: layers user YAML + kube rules + agent auth rules + `agent.default_rules()` + generic defaults (in precedence order, generic last), resolves keyring/exec placeholders, returns JSON bytes |
 | `agent_uplink/session.py` | `Session` dataclass: tracks namespace + session_dir; `cleanup()` is `kubectl delete ns --wait=false` + rmtree |
+| `agent_uplink/reaper.py` | `list` / `clean` subcommands: find session namespaces by `managed-by=agent-uplink`, filter by id/age/all, delete leftovers from killed runs |
 | `agent_uplink/process.py` | `run_command` (piped) + `run_interactive` (stdio-attached) |
 | `agent_uplink/default_rules.yaml` | Generic baseline (allow `GET`/`OPTIONS`/`HEAD` everywhere) |
 | `agent_uplink/mitm_addon/filter.py` | mitmproxy addon — enforces allow-list, injects pre-resolved headers, reroutes AWS SigV4 requests to sidecar services by dummy AKIA (stdlib only) |

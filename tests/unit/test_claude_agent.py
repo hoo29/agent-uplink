@@ -25,8 +25,11 @@ SAFE_SECRET_NAMES = {
 }
 
 
-def _agent(auth_mode):
-    return ClaudeAgent(argparse.Namespace(auth_mode=auth_mode, image="agent-uplink-claude"))
+def _agent(auth_mode, claude_args=None):
+    return ClaudeAgent(argparse.Namespace(
+        auth_mode=auth_mode, image="agent-uplink-claude",
+        claude_args=claude_args or [],
+    ))
 
 
 def _build_pod(
@@ -101,6 +104,38 @@ def test_git_config_overlay_mounts_at_include_path(tmp_path, monkeypatch):
 def _mount(pod, name):
     container = pod["spec"]["containers"][0]
     return next((m for m in container["volumeMounts"] if m["name"] == name), None)
+
+
+def _claude_invocation(agent):
+    # The interactive command is `runuser -u u -- bash -lc '<script>'`; return
+    # the trailing bash script that ends with the `exec claude ...` line.
+    return agent._container_command("u", False, agent.args.claude_args)[-1]
+
+
+def test_default_invocation_has_skip_permissions_only():
+    script = _claude_invocation(_agent("anthropic"))
+    assert script.endswith("exec claude --dangerously-skip-permissions")
+
+
+def test_passthrough_args_appended_after_skip_permissions():
+    script = _claude_invocation(_agent("anthropic", ["--resume", "abc123"]))
+    assert script.endswith(
+        "exec claude --dangerously-skip-permissions --resume abc123"
+    )
+
+
+def test_debug_flag_precedes_skip_permissions_with_passthrough():
+    agent = _agent("anthropic", ["-c"])
+    script = agent._container_command("u", True, agent.args.claude_args)[-1]
+    assert script.endswith("exec claude -d --dangerously-skip-permissions -c")
+
+
+def test_passthrough_args_are_shell_quoted():
+    # A prompt with spaces must reach claude as a single argv element, not be
+    # word-split by the bash -lc string.
+    script = _claude_invocation(_agent("anthropic", ["-p", "explain this; rm -rf /"]))
+    assert "exec claude --dangerously-skip-permissions -p 'explain this; rm -rf /'" \
+        in script
 
 
 def test_ansible_cfg_not_mounted_when_absent(tmp_path, monkeypatch):

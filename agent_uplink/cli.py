@@ -53,6 +53,7 @@ from .k8s import (
 from .kube import KubePlan, resolve as resolve_kube
 from .rules import resolve as resolve_rules
 from .session import Session, handle_signal
+from . import reaper
 
 LOGGER = logging.getLogger("agent-uplink")
 
@@ -235,7 +236,56 @@ def parse_args() -> argparse.Namespace:
             help=f"Run the {name} agent",
         )
         agent_cls.add_cli_args(agent_parser)
+    _add_management_commands(sub)
     return parser.parse_args()
+
+
+def _add_deploy_context_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--deploy-context",
+        default=DEFAULT_DEPLOY_CONTEXT,
+        metavar="CONTEXT",
+        help="kubeconfig context to operate on (pass '' for current-context)",
+    )
+
+
+def _add_management_commands(sub) -> None:
+    """`list` / `clean` — manage leftover session namespaces (orphan reaper).
+    Separate from the agent subcommands: no image build, no pods, no run."""
+    list_p = sub.add_parser(
+        "list", help="List active agent-uplink session namespaces"
+    )
+    _add_deploy_context_arg(list_p)
+
+    clean_p = sub.add_parser(
+        "clean",
+        help="Delete agent-uplink session namespaces left by killed/crashed runs",
+    )
+    clean_p.add_argument(
+        "ids",
+        nargs="*",
+        metavar="SESSION",
+        help="Session id(s) or namespace(s) to delete. Omit when using "
+        "--all or --older-than.",
+    )
+    clean_p.add_argument(
+        "--all", action="store_true", help="Delete every session namespace"
+    )
+    clean_p.add_argument(
+        "--older-than",
+        metavar="DURATION",
+        default=None,
+        help="Delete sessions older than DURATION (e.g. 30m, 2h, 1d)",
+    )
+    clean_p.add_argument(
+        "-y", "--yes", action="store_true", help="Skip the confirmation prompt"
+    )
+    clean_p.add_argument(
+        "--wait",
+        action="store_true",
+        help="Block until each namespace is fully deleted",
+    )
+    _add_deploy_context_arg(clean_p)
 
 
 def _under_home(username: str, path: Path) -> bool:
@@ -1043,6 +1093,21 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
     )
 
 
+def _run_management_command(args: argparse.Namespace) -> int:
+    """Dispatch the non-agent subcommands (list / clean)."""
+    if args.agent_name == "list":
+        return reaper.cmd_list()
+    if args.agent_name == "clean":
+        return reaper.cmd_clean(
+            ids=args.ids,
+            all_sessions=args.all,
+            older_than=args.older_than,
+            assume_yes=args.yes,
+            wait=args.wait,
+        )
+    raise SystemExit(f"unknown command {args.agent_name!r}")
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
@@ -1050,6 +1115,9 @@ def main() -> None:
     # Target every deploy-side kubectl call (incl. signal-handler cleanup) at the
     # chosen context before anything can shell out to kubectl.
     set_kube_context(args.deploy_context)
+
+    if args.agent_name not in AGENTS:
+        raise SystemExit(_run_management_command(args))
 
     agent_cls = AGENTS[args.agent_name]
     agent = agent_cls(args)
