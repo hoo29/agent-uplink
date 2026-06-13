@@ -39,3 +39,9 @@ def test_run_command_tolerated_failure_logs_stderr(caplog):
         out = run_command(["sh", "-c", "printf boom >&2; exit 1"], raise_error=False)
     assert out == ""
     assert "boom" in caplog.text  # stderr surfaced, not swallowed
+
+
+def test_run_command_pipes_stdin():
+    # apply_manifests feeds kubectl its YAML over stdin; pin that plumbing.
+    out = run_command(["sh", "-c", "cat"], stdin=b"hello world\n")
+    assert out.strip() == "hello world"
