@@ -98,3 +98,45 @@ def test_build_safe_name_map_rejects_safe_name_collision():
 def test_build_safe_name_map_rejects_invalid_profile_name():
     with pytest.raises(ValueError):
         aws.build_safe_name_map(["[evil]"])
+
+
+# --------------------------------------------------------------------------- #
+# export_aws_profile_env — host-side credential extraction
+# --------------------------------------------------------------------------- #
+
+
+def test_export_aws_profile_env_parses_env_lines(monkeypatch):
+    output = (
+        "AWS_ACCESS_KEY_ID=AKIA123\n"
+        "AWS_SECRET_ACCESS_KEY=secret\n"
+        "  AWS_SESSION_TOKEN = token \n"
+        "noequals-line\n"  # lines without '=' are skipped
+    )
+    monkeypatch.setattr(aws, "run_command", lambda cmd: output)
+    assert aws.export_aws_profile_env("prof") == {
+        "AWS_ACCESS_KEY_ID": "AKIA123",
+        "AWS_SECRET_ACCESS_KEY": "secret",
+        "AWS_SESSION_TOKEN": "token",
+    }
+
+
+def test_export_aws_profile_env_falls_back_to_sso_login(monkeypatch):
+    creds = "AWS_ACCESS_KEY_ID=AKIA\nAWS_SECRET_ACCESS_KEY=s\n"
+    calls: list[list[str]] = []
+    outputs = iter([RuntimeError("not logged in"), "", creds])
+
+    def fake(cmd):
+        calls.append(cmd)
+        val = next(outputs)
+        if isinstance(val, Exception):
+            raise val
+        return val
+
+    monkeypatch.setattr(aws, "run_command", fake)
+    env = aws.export_aws_profile_env("prof")
+
+    assert env == {"AWS_ACCESS_KEY_ID": "AKIA", "AWS_SECRET_ACCESS_KEY": "s"}
+    # First export fails -> `aws sso login` -> export retried.
+    assert calls[0][:3] == ["aws", "configure", "export-credentials"]
+    assert calls[1] == ["aws", "sso", "login", "--profile", "prof"]
+    assert calls[2][:3] == ["aws", "configure", "export-credentials"]

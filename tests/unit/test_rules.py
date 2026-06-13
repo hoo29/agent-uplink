@@ -41,7 +41,7 @@ def _write(tmp_path, text):
 
 
 def _resolve(path, agent=None, *, no_default_rules=False, auth_rules=None,
-             allow_exec=False, sigv4_routes=None):
+             allow_exec=False, sigv4_routes=None, kube_rules=None):
     return json.loads(
         rules.resolve(
             path,
@@ -50,6 +50,7 @@ def _resolve(path, agent=None, *, no_default_rules=False, auth_rules=None,
             auth_rules or [],
             allow_exec=allow_exec,
             aws_sigv4_routes=sigv4_routes,
+            kube_rules=kube_rules,
         )
     )
 
@@ -198,3 +199,64 @@ def test_sigv4_routes_embedded(tmp_path):
     routes = {"AKIAEXAMPLE": {"upstream_host": "sigv4-p", "upstream_port": 8080}}
     out = _resolve(None, sigv4_routes=routes)
     assert out["aws_sigv4_routes"] == routes
+
+
+# --------------------------------------------------------------------------- #
+# kube rules layering
+# --------------------------------------------------------------------------- #
+
+
+def test_kube_rules_included_even_with_no_default_rules(tmp_path):
+    out = _resolve(None, no_default_rules=True,
+                   kube_rules=[{"name": "kube", "host": "k8s.example.com"}])
+    # kube rules survive --no-default-rules so k8s traffic is never silently
+    # blocked, even when every other default layer is dropped.
+    assert [r["name"] for r in out["rules"]] == ["kube"]
+
+
+def test_kube_rules_layer_between_user_and_auth(tmp_path):
+    path = _write(tmp_path, "rules:\n  - {name: user, host: 'u'}\n")
+    agent = _Agent(defaults=[{"name": "agent-default", "host": "d"}])
+    out = _resolve(path, agent, auth_rules=[{"name": "auth", "host": "a"}],
+                   kube_rules=[{"name": "kube", "host": "k"}])
+    names = [r["name"] for r in out["rules"]]
+    # user -> kube -> auth -> agent defaults -> generic catch-all.
+    assert names == ["user", "kube", "auth", "agent-default", "default-readonly"]
+
+
+# --------------------------------------------------------------------------- #
+# YAML shape + placeholder edge cases
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("text", ["- {name: r, host: h}\n", "just a string\n", "42\n"])
+def test_non_mapping_yaml_rejected(tmp_path, text):
+    path = _write(tmp_path, text)
+    with pytest.raises(ValueError, match="expected a YAML mapping"):
+        _resolve(path)
+
+
+def test_multiple_placeholders_in_one_value(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        rules.keyring, "get_password",
+        lambda s, u: "key1" if (s, u) == ("svc", "u") else None,
+    )
+    path = _write(
+        tmp_path,
+        "rules:\n  - name: r\n    host: 'h'\n    inject:\n      headers:\n"
+        "        X: '{{keyring:svc:u}} and {{exec:printf secret}}'\n",
+    )
+    out = _resolve(path, allow_exec=True)
+    # Both distinct placeholders in one value resolve in the single pass.
+    assert out["rules"][0]["inject"]["headers"]["X"] == "key1 and secret"
+
+
+def test_exec_nonzero_exit_aborts(tmp_path):
+    path = _write(
+        tmp_path,
+        "rules:\n  - name: r\n    host: 'h'\n    inject:\n      headers:\n"
+        "        X: '{{exec:sh -c \"exit 42\"}}'\n",
+    )
+    # A failed command aborts startup rather than injecting an empty/partial cred.
+    with pytest.raises(RuntimeError, match="exec placeholder failed"):
+        _resolve(path, allow_exec=True)
