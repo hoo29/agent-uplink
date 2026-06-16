@@ -4,4 +4,8 @@
 # IdentityFile is assumed here: either pass the key explicitly
 # (ssh -i ~/.sshclaude/<key> ...) or ship a `config` in the key dir mapping
 # hosts to keys, which this includes.
-Include ~/.sshclaude/config
+#
+# An absolute path is required: ssh only expands '~' in Include for user
+# configs, not system-wide ones like this. __USERNAME__ is substituted with the
+# agent user at image build time.
+Include /home/__USERNAME__/.sshclaude/config
