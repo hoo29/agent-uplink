@@ -87,7 +87,10 @@ COPY gitconfig /etc/gitconfig
 
 # Point ssh at keys mounted read-only at ~/.sshclaude (--ssh-key-dir) so ~/.ssh
 # stays writable for known_hosts. Ubuntu's /etc/ssh/ssh_config includes this dir.
+# The Include path must be absolute (ssh only expands '~' in user configs, not
+# system-wide ones), so bake in the agent user's home.
 COPY ssh_config /etc/ssh/ssh_config.d/agent-uplink.conf
+RUN sed -i "s|__USERNAME__|${USERNAME}|" /etc/ssh/ssh_config.d/agent-uplink.conf
 
 ENV SHELL=/bin/bash
 ENV EDITOR=vim
