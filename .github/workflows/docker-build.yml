@@ -1,0 +1,38 @@
+# Builds the Claude agent Docker image to catch Dockerfile regressions before
+# they reach a real run. Mirrors bootstrap.build_and_push_agent_image: the same
+# build args, and a stand-in public CA cert dropped into certs/ (the real cert
+# is generated per-host and gitignored, so CI fabricates one for the build).
+# Build only — no push.
+name: Docker build
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Dockerfile COPYs certs/mitmproxy-ca-cert.pem and feeds it to
+      # update-ca-certificates, so any syntactically valid PEM cert suffices.
+      - name: Generate stand-in mitm CA cert
+        run: |
+          mkdir -p agent_uplink/agents/claude/certs
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj "/CN=mitmproxy-ci" \
+            -keyout /tmp/ca-key.pem \
+            -out agent_uplink/agents/claude/certs/mitmproxy-ca-cert.pem
+
+      - name: Build agent image
+        run: |
+          docker build \
+            --build-arg USERNAME=agent \
+            --build-arg USER_UID=1000 \
+            --build-arg USER_GID=1000 \
+            -t agent-uplink-claude:ci \
+            agent_uplink/agents/claude

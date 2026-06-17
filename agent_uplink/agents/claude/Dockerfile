@@ -52,7 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
   && unzip awscliv2.zip \
   && ./aws/install \
-  && rm -rf ./aws*
+  && rm -rf ./aws* \
   && curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/$(dpkg --print-architecture)/kubectl" -o /usr/local/bin/kubectl \
   && chmod 0755 /usr/local/bin/kubectl \
   && curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 | bash
