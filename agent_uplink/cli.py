@@ -397,6 +397,12 @@ def _mitm_manifests(
         f"--listen-port={PROXY_PORT}",
         "--set",
         f"confdir={confdir}",
+        # Stream bodies over 1MB instead of buffering them whole in memory.
+        # Large git packs (clone/fetch over HTTPS) would otherwise hold the
+        # entire response in RAM and OOM the pod. The addon only inspects and
+        # injects headers, so streaming bodies is safe.
+        "--set",
+        "stream_large_bodies=1m",
         "-s",
         "/addon/filter.py",
         "--set",
@@ -439,7 +445,7 @@ def _mitm_manifests(
         volume_mounts=volume_mounts,
         security_context=hardened_container_security_context(uid=1000, gid=1000),
         resources=Resources(
-            memory="1Gi", cpu="500m", memory_request="96Mi", cpu_request="50m"
+            memory="512Mi", cpu="500m", memory_request="96Mi", cpu_request="50m"
         ),
         ports=[{"containerPort": PROXY_PORT, "protocol": "TCP"}],
     )
