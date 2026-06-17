@@ -439,7 +439,7 @@ def _mitm_manifests(
         volume_mounts=volume_mounts,
         security_context=hardened_container_security_context(uid=1000, gid=1000),
         resources=Resources(
-            memory="512Mi", cpu="500m", memory_request="96Mi", cpu_request="50m"
+            memory="1Gi", cpu="500m", memory_request="96Mi", cpu_request="50m"
         ),
         ports=[{"containerPort": PROXY_PORT, "protocol": "TCP"}],
     )
