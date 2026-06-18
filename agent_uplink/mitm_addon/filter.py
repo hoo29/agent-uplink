@@ -132,7 +132,13 @@ class RuleEnforcer:
         )
         return True
 
-    def request(self, flow: http.HTTPFlow) -> None:
+    def requestheaders(self, flow: http.HTTPFlow) -> None:
+        # Enforce + inject at headers time, not in the `request` hook. With
+        # `stream_large_bodies` set, mitmproxy flushes the request headers
+        # upstream as soon as they arrive and streams the body behind them, so
+        # the `request` hook (which fires only after the full body is received)
+        # is too late to overwrite Authorization. The addon never reads the
+        # body, so headers-time enforcement loses nothing.
         req = flow.request
         matched = self._match_rule(req)
         if matched is None:

@@ -59,7 +59,7 @@ flowchart LR
 
 ## Install
 
-### k3s prequisites
+### k3s prerequisites
 
 ```sh
 # install k3s with local custom registry support
@@ -99,7 +99,7 @@ install -m 600 /tmp/kubeconfig.merged "$HOME/.kube/config"
 rm /tmp/local-k8s.yaml /tmp/kubeconfig.merged
 ```
 
-### agent-uplink
+### agent-uplink install
 
 ```bash
 pip install agent-uplink
