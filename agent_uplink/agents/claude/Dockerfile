@@ -53,6 +53,14 @@ RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2
   && unzip awscliv2.zip \
   && ./aws/install \
   && rm -rf ./aws* \
+  && case "$(dpkg --print-architecture)" in \
+       amd64) ssm_arch=64bit ;; \
+       arm64) ssm_arch=arm64 ;; \
+       *) echo "unsupported arch for ssm plugin" >&2; exit 1 ;; \
+     esac \
+  && curl -fsSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_${ssm_arch}/session-manager-plugin.deb" -o session-manager-plugin.deb \
+  && dpkg -i session-manager-plugin.deb \
+  && rm -f session-manager-plugin.deb \
   && curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/$(dpkg --print-architecture)/kubectl" -o /usr/local/bin/kubectl \
   && chmod 0755 /usr/local/bin/kubectl \
   && curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 | bash
