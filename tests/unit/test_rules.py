@@ -41,7 +41,7 @@ def _write(tmp_path, text):
 
 
 def _resolve(path, agent=None, *, no_default_rules=False, auth_rules=None,
-             allow_exec=False, sigv4_routes=None, kube_rules=None):
+             allow_exec=False, kube_rules=None):
     return json.loads(
         rules.resolve(
             path,
@@ -49,7 +49,6 @@ def _resolve(path, agent=None, *, no_default_rules=False, auth_rules=None,
             agent or _Agent(),
             auth_rules or [],
             allow_exec=allow_exec,
-            aws_sigv4_routes=sigv4_routes,
             kube_rules=kube_rules,
         )
     )
@@ -188,17 +187,6 @@ def test_resolution_is_single_pass(tmp_path, monkeypatch):
     )
     out = _resolve(path, allow_exec=True)
     assert out["rules"][0]["inject"]["headers"]["X"] == "{{exec:touch /tmp/pwned}}"
-
-
-# --------------------------------------------------------------------------- #
-# SigV4 route embedding
-# --------------------------------------------------------------------------- #
-
-
-def test_sigv4_routes_embedded(tmp_path):
-    routes = {"AKIAEXAMPLE": {"upstream_host": "sigv4-p", "upstream_port": 8080}}
-    out = _resolve(None, sigv4_routes=routes)
-    assert out["aws_sigv4_routes"] == routes
 
 
 # --------------------------------------------------------------------------- #

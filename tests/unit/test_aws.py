@@ -1,6 +1,9 @@
 """Unit tests for the AWS dummy-credential machinery. The security-relevant
-invariants: the agent only ever holds deterministic *dummy* keys, and profile
-names can't smuggle INI sections or break k8s resource names."""
+invariants: the agent only ever holds deterministic *dummy* keys, the real
+credentials are serialised only for the mitm pod, and profile names can't
+smuggle INI sections."""
+
+import json
 
 import pytest
 
@@ -30,39 +33,58 @@ def test_dummy_credentials_ini_empty_profiles():
     assert aws.dummy_aws_credentials_ini([]) == (b"", {})
 
 
-def test_real_credentials_ini_from_env():
-    env = {
-        "AWS_ACCESS_KEY_ID": "AKIAREAL",
-        "AWS_SECRET_ACCESS_KEY": "realsecret",
-        "AWS_SESSION_TOKEN": "tok",
+# --------------------------------------------------------------------------- #
+# real_aws_credentials / sigv4_credentials_json — real creds for the mitm pod
+# --------------------------------------------------------------------------- #
+
+
+def test_real_aws_credentials_from_env():
+    creds = aws.real_aws_credentials(
+        {
+            "AWS_ACCESS_KEY_ID": "AKIAREAL",
+            "AWS_SECRET_ACCESS_KEY": "realsecret",
+            "AWS_SESSION_TOKEN": "tok",
+        }
+    )
+    assert creds == {
+        "access_key_id": "AKIAREAL",
+        "secret_access_key": "realsecret",
+        "session_token": "tok",
     }
-    text = aws.real_aws_credentials_ini("prod", env).decode()
-    assert "[prod]" in text
-    assert "aws_access_key_id = AKIAREAL" in text
-    assert "aws_secret_access_key = realsecret" in text
-    assert "aws_session_token = tok" in text
 
 
-def test_real_credentials_ini_omits_absent_keys():
-    text = aws.real_aws_credentials_ini(
-        "p", {"AWS_ACCESS_KEY_ID": "x", "AWS_SECRET_ACCESS_KEY": "y"}
-    ).decode()
-    assert "aws_session_token" not in text
+def test_real_aws_credentials_omits_absent_session_token():
+    creds = aws.real_aws_credentials(
+        {"AWS_ACCESS_KEY_ID": "x", "AWS_SECRET_ACCESS_KEY": "y"}
+    )
+    assert "session_token" not in creds
 
 
 @pytest.mark.parametrize(
-    "name,expected",
+    "env",
     [
-        ("prod", "prod"),
-        ("My.Profile_1", "my-profile-1"),
-        ("--weird--", "weird"),
-        ("", "default"),
+        {"AWS_SECRET_ACCESS_KEY": "y"},  # no access key id
+        {"AWS_ACCESS_KEY_ID": "x"},  # no secret
     ],
 )
-def test_sanitize_profile_for_k8s_name(name, expected):
-    out = aws.sanitize_profile_for_k8s_name(name)
-    assert out == expected
-    assert len(out) <= 63
+def test_real_aws_credentials_requires_key_and_secret(env):
+    with pytest.raises(ValueError):
+        aws.real_aws_credentials(env)
+
+
+def test_sigv4_credentials_json_roundtrips_the_map():
+    akia = aws.dummy_akia("prod")
+    blob = aws.sigv4_credentials_json(
+        {akia: {"access_key_id": "AKIAREAL", "secret_access_key": "s"}}
+    )
+    assert json.loads(blob) == {
+        akia: {"access_key_id": "AKIAREAL", "secret_access_key": "s"}
+    }
+
+
+# --------------------------------------------------------------------------- #
+# validate_profile_name — INI-section injection guard
+# --------------------------------------------------------------------------- #
 
 
 @pytest.mark.parametrize("bad", ["a b", "a/b", "a]b", "[evil]", "a$b"])
@@ -76,28 +98,9 @@ def test_validate_profile_name_accepts_normal():
         aws.validate_profile_name(ok)  # no raise
 
 
-def test_real_credentials_ini_rejects_bad_profile_name():
+def test_dummy_credentials_ini_rejects_bad_profile_name():
     with pytest.raises(ValueError):
-        aws.real_aws_credentials_ini("[evil]", {"AWS_ACCESS_KEY_ID": "x"})
-
-
-def test_build_safe_name_map_maps_each_profile():
-    assert aws.build_safe_name_map(["prod", "My.Profile"]) == {
-        "prod": "prod",
-        "My.Profile": "my-profile",
-    }
-
-
-def test_build_safe_name_map_rejects_safe_name_collision():
-    # Two distinct profiles that sanitise to the same k8s label would emit
-    # duplicate Pod/Service manifests; that must be rejected, not silently merged.
-    with pytest.raises(ValueError, match="map to the k8s-safe name"):
-        aws.build_safe_name_map(["My.Profile", "my-profile"])
-
-
-def test_build_safe_name_map_rejects_invalid_profile_name():
-    with pytest.raises(ValueError):
-        aws.build_safe_name_map(["[evil]"])
+        aws.dummy_aws_credentials_ini(["[evil]"])
 
 
 # --------------------------------------------------------------------------- #

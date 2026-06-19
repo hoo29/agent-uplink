@@ -66,7 +66,7 @@ class Agent(ABC):
       - The set of K8s Secrets, volumes, and volumeMounts the agent pod needs.
       - Any auth rules the mitmproxy layer must inject.
 
-    Generic concerns (mitmproxy lifecycle, aws-sigv4-proxy sidecars, registry
+    Generic concerns (mitmproxy lifecycle, AWS SigV4 re-signing, registry
     bootstrap, namespace lifecycle, NetworkPolicy) live outside subclasses and
     are wired together by `agent_uplink.cli`.
 

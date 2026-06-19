@@ -155,7 +155,6 @@ def resolve(
     auth_rules: list[dict],
     *,
     allow_exec: bool = False,
-    aws_sigv4_routes: dict[str, dict[str, Any]] | None = None,
     kube_rules: list[dict] | None = None,
 ) -> bytes:
     """Build the resolved rules JSON.
@@ -180,8 +179,6 @@ def resolve(
     supplying any auth the chosen mode needs.
 
     `allow_exec` permits `{{exec:...}}` placeholders to run host shell commands.
-    `aws_sigv4_routes` maps dummy AKIA → {upstream_host, upstream_port} so the
-    addon can route AWS requests to the matching aws-sigv4-proxy Service.
     `kube_rules` are synthetic rules produced by kube.resolve(); they are always
     included when non-empty so that k8s traffic is allowed regardless of
     --no-default-rules.
@@ -208,10 +205,5 @@ def resolve(
         _validate_and_resolve_rule(r, i, allow_exec) for i, r in enumerate(layered)
     ]
     out: dict[str, Any] = {"rules": resolved}
-    if aws_sigv4_routes:
-        out["aws_sigv4_routes"] = aws_sigv4_routes
-    LOGGER.info(
-        f"resolved {len(resolved)} rules"
-        + (f", {len(aws_sigv4_routes)} sigv4 routes" if aws_sigv4_routes else "")
-    )
+    LOGGER.info(f"resolved {len(resolved)} rules")
     return json.dumps(out, indent=2).encode("utf-8")

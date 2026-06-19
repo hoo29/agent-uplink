@@ -20,9 +20,12 @@ The integration suite is built around three security questions:
    bypassed), and `--ssh-cidr` opens exactly TCP 22 to exactly that CIDR.
 3. **The injector / allow-list works** (`test_injector.py`, `test_sigv4.py`) —
    allowed requests reach the upstream with the injected header (over HTTP and
-   intercepted HTTPS), denied requests get 403, path rules are honoured, and AWS
-   SigV4 requests are rerouted to the sidecar with their signature stripped and
-   Host preserved — only *after* the allow-list authorises the host.
+   intercepted HTTPS), denied requests get 403, path rules are honoured, and a
+   signed AWS request to an unlisted host is denied (a signature is not a
+   backdoor around the allow-list). The real AWS credentials live in the mitm
+   pod that re-signs and never reach the agent pod. The re-sign + forward crypto
+   itself (canonical request, signature, body hashing, session tokens) is
+   validated end-to-end against real AWS by the live test below.
 
 Plus `test_dockerd.py`: a privileged pod on the default runtime runs its own dockerd,
 which is what lets the whole suite run without kata installed.
@@ -71,7 +74,7 @@ not a parallel reimplementation. Only two things are swapped for testability:
   on any k3s without kata;
 - **the upstreams** → an in-cluster `echo` server that reflects the request it
   received, so a test can read back exactly what mitm forwarded, injected or
-  stripped. For SigV4 the same echo stands in for the `aws-sigv4-proxy` sidecar.
+  stripped.
 
 A `warmup` poll gates each test on the full agent→mitm→upstream path being live,
 because `kubectl wait Ready` returns before Service endpoints and NetworkPolicy
@@ -83,3 +86,36 @@ The mitm pod and the addon target mitmproxy 12.x (the image is pinned to
 `mitmproxy/mitmproxy:12`). `tests/unit/test_mitm_addon.py` imports the addon
 under whatever mitmproxy is installed in your venv, so keep that on 12.x too
 (`pip install -e ".[tests]" mitmproxy`).
+
+## Live SigV4 signing check (real AWS)
+
+The unit and integration suites pin the addon's host parsing, signature shape
+and the security gates, but they never reach real AWS, so they can't prove the
+re-signed request is cryptographically valid. That is checked manually, against
+real AWS, by running the production addon under a local `mitmdump`:
+
+1. Build the real-credentials map for a profile's dummy AKIA and a dummy
+   `~/.aws/credentials` the "agent" side signs with (see `agent_uplink.aws`:
+   `dummy_akia`, `dummy_aws_credentials_ini`, `real_aws_credentials`,
+   `sigv4_credentials_json`), plus a `rules.json` allowing the AWS hosts to test.
+2. Run `mitmdump` with the shipping addon and those files:
+
+   ```bash
+   mitmdump --listen-host 127.0.0.1 --listen-port 18080 \
+     --set confdir=~/.agent_uplink/mitm --set stream_large_bodies=1m \
+     -s agent_uplink/mitm_addon/filter.py \
+     --set rules_file=rules.json --set aws_creds_file=creds.json
+   ```
+
+3. Point the AWS CLI at it with the dummy credentials and the mitm CA, then make
+   real calls — STS, SSM, S3 (regional, global, virtual-hosted):
+
+   ```bash
+   HTTPS_PROXY=http://127.0.0.1:18080 \
+   AWS_CA_BUNDLE=~/.agent_uplink/mitm/mitmproxy-ca-cert.pem \
+   AWS_SHARED_CREDENTIALS_FILE=dummy-credentials AWS_PROFILE=<profile> \
+   aws sts get-caller-identity
+   ```
+
+A `200` (the real identity / real data) confirms AWS accepted the re-signed
+request; the addon log shows the detected `service/region` per request.

@@ -199,40 +199,26 @@ rules:
 
 @pytest.fixture(scope="session")
 def sigv4_session(cluster, test_image, mitm_certs_dir):
-    """mitm + agent + an echo pod standing in for the aws-sigv4-proxy sidecar
-    (Service `sigv4-testprofile`, label tier=sigv4 so the real sigv4-policy
-    grants it mitm ingress). Rules allow s3.us-east-1 only and carry the real
-    dummy-AKIA -> sidecar route map."""
+    """mitm (with the real per-AKIA creds Secret mounted, carrying a sentinel
+    secret) + agent. The rules carry no allowed AWS host, so a signed request to
+    an AWS host is denied at the allow-list — proving a signature is not a
+    backdoor — and the suite never reaches real AWS. The re-sign+forward crypto
+    is validated by the live test (see tests/README); here we pin the allow-list
+    gate and the real-creds isolation in the mitm pod."""
     ns = _new_ns()
     akia = harness.aws.dummy_akia(harness.TEST_PROFILE)
-    rules_yaml = r"""
-rules:
-  - name: allow-s3-useast1
-    host: 's3\.us-east-1\.amazonaws\.com'
-"""
-    routes = {akia: {"upstream_host": "sigv4-testprofile", "upstream_port": 8080}}
-    rules_bytes = harness.resolve_rules(rules_yaml, sigv4_routes=routes)
-    aws_secret = harness.real_aws_secret(ns)
+    # Generic defaults allow GET everywhere, so the deny probe uses POST.
+    rules_bytes = harness.resolve_rules(None)
+    creds_secret = harness.real_aws_creds_secret(ns)
     manifests = [
         *harness.control_plane(ns, mitm_certs_dir, rules_bytes),
-        *harness.network_policies(ns, has_sigv4=True),
-        *harness.mitm(ns),
-        aws_secret,
-        # echo as the sidecar: tier=sigv4 lets the real sigv4-policy admit mitm.
-        # It also mounts the real-creds Secret (sentinel) at /aws/credentials,
-        # mirroring the real aws-sigv4-proxy, so a test can confirm those creds
-        # live here and never in the agent pod.
-        *harness.echo(
-            ns,
-            ["sigv4-testprofile"],
-            labels_extra={"tier": "sigv4"},
-            allow_ingress_from_mitm=False,
-            aws_creds_secret=aws_secret["metadata"]["name"],
-        ),
+        *harness.network_policies(ns),
+        *harness.mitm(ns, aws_creds_secret=creds_secret["metadata"]["name"]),
+        creds_secret,
         *harness.agent_probe(ns),
     ]
     try:
-        _deploy(ns, manifests, ["mitm", "echo", "agent"])
+        _deploy(ns, manifests, ["mitm", "agent"])
 
         def _warm():
             rc, out, _err = harness.kexec_sh(
@@ -240,17 +226,13 @@ rules:
                 "agent",
                 harness.aws_signed_curl(
                     "s3.us-east-1.amazonaws.com", "/warmup",
-                    akia=akia, code_only=True,
+                    akia=akia, method="POST", code_only=True,
                 ),
                 timeout=20,
             )
-            return out.strip() == "200", f"rc={rc} code={out.strip()!r}"
+            return out.strip() == "403", f"rc={rc} code={out.strip()!r}"
 
-        harness.wait_until(_warm, desc="sigv4 reroute path live")
-        harness.warmup_denied(
-            ns, harness.get_pod_ip(ns, "echo"), 8080,
-            desc="agent cannot reach the sidecar directly",
-        )
+        harness.wait_until(_warm, desc="mitm denies unlisted signed AWS request")
         yield Session(ns=ns, extra={"akia": akia})
     finally:
         harness.delete_namespace(ns)
