@@ -45,7 +45,6 @@ TEST_IMAGE_REPO = "agent-uplink-test"
 # registry never clobber each other and pulls are immutable.
 TEST_IMAGE = f"localhost:5000/{TEST_IMAGE_REPO}:latest"
 MITM_IMAGE = cli.DEFAULT_MITM_IMAGE
-SIGV4_IMAGE = cli.DEFAULT_SIGV4_PROXY_IMAGE
 
 # A value that lands in the mitm-injected Authorization header. It must reach the
 # upstream (proving injection works) but must appear NOWHERE inside the agent pod
@@ -55,8 +54,8 @@ INJECT_SENTINEL = "INJECTED-BEARER-SENTINEL-9f2c7a1e"
 # Stand-in for a real OAuth access token handed to the production fake-creds
 # builder. The agent pod must only ever see the fake token, never this value.
 REAL_OAUTH_SENTINEL = "REAL-OAUTH-TOKEN-DO-NOT-LEAK-abc123def456"
-# Stand-in for a real AWS secret key. It must be readable in the sigv4 sidecar
-# (which re-signs) but never reachable from the agent pod.
+# Stand-in for a real AWS secret key. It must be readable in the mitm pod (which
+# re-signs) but never reachable from the agent pod.
 REAL_AWS_SENTINEL = "REAL-AWS-SECRET-DO-NOT-LEAK-9988776655"
 
 TEST_PROFILE = "testprofile"
@@ -254,7 +253,6 @@ def resolve_rules(
     *,
     no_default_rules: bool = False,
     auth_rules: list[dict] | None = None,
-    sigv4_routes: dict[str, dict] | None = None,
 ) -> bytes:
     """Run the production rule resolver on an inline YAML string."""
     path = None
@@ -271,7 +269,6 @@ def resolve_rules(
         NullAgent(args=argparse.Namespace()),
         auth_rules or [],
         allow_exec=False,
-        aws_sigv4_routes=sigv4_routes,
     )
 
 
@@ -315,11 +312,12 @@ def control_plane(ns: str, certs_dir: Path, rules_bytes: bytes) -> list[dict]:
     ]
 
 
-def mitm(ns: str, *, ssl_insecure: bool = True) -> list[dict]:
+def mitm(ns: str, *, ssl_insecure: bool = True, aws_creds_secret: str | None = None) -> list[dict]:
     """Real mitm Pod+Service. `ssl_insecure` appends --ssl-insecure (test-only)
     so mitm doesn't reject the self-signed cert on the *upstream* (echo) leg;
-    the agent->mitm leg still validates mitm's real CA, which is what we test."""
-    manifests = cli._mitm_manifests(ns, MITM_IMAGE, "")
+    the agent->mitm leg still validates mitm's real CA, which is what we test.
+    `aws_creds_secret` mounts the real per-AKIA creds the addon re-signs with."""
+    manifests = cli._mitm_manifests(ns, MITM_IMAGE, "", aws_creds_secret=aws_creds_secret)
     if ssl_insecure:
         pod = next(m for m in manifests if m["kind"] == "Pod")
         pod["spec"]["containers"][0]["args"].append("--ssl-insecure")
@@ -327,25 +325,26 @@ def mitm(ns: str, *, ssl_insecure: bool = True) -> list[dict]:
 
 
 def network_policies(
-    ns: str, *, has_sigv4: bool = False, ssh_cidrs: list[str] | None = None
+    ns: str, *, ssh_cidrs: list[str] | None = None
 ) -> list[dict]:
     """The real per-session NetworkPolicies (default-deny, agent-egress,
-    mitm-policy, optional sigv4-policy)."""
-    return cli._network_policies(ns, has_sigv4, ssh_cidrs)
+    mitm-policy)."""
+    return cli._network_policies(ns, ssh_cidrs)
 
 
-def real_aws_secret(ns: str, profile: str = TEST_PROFILE) -> dict:
-    """A K8s Secret shaped like the per-profile real-AWS-creds Secret the
-    orchestrator mounts into the sigv4 sidecar, carrying a sentinel secret key."""
-    ini = aws.real_aws_credentials_ini(
-        profile,
-        {"AWS_ACCESS_KEY_ID": "AKIAREALEXAMPLE", "AWS_SECRET_ACCESS_KEY": REAL_AWS_SENTINEL},
+def real_aws_creds_secret(ns: str, profile: str = TEST_PROFILE) -> dict:
+    """The real-AWS-creds Secret the orchestrator mounts into the mitm pod: a
+    JSON map from the profile's dummy AKIA to its real credentials, carrying a
+    sentinel secret key so a test can confirm it lives in mitm, not the agent."""
+    blob = aws.sigv4_credentials_json(
+        {
+            aws.dummy_akia(profile): {
+                "access_key_id": "AKIAREALEXAMPLE",
+                "secret_access_key": REAL_AWS_SENTINEL,
+            }
+        }
     )
-    return k8s.secret_manifest(
-        f"aws-creds-{aws.sanitize_profile_for_k8s_name(profile)}",
-        ns,
-        {"credentials": ini},
-    )
+    return k8s.secret_manifest("aws-sigv4-creds", ns, {"creds.json": blob})
 
 
 def echo(
@@ -354,30 +353,19 @@ def echo(
     *,
     labels_extra: dict | None = None,
     allow_ingress_from_mitm: bool = True,
-    aws_creds_secret: str | None = None,
 ) -> list[dict]:
     """Echo upstream Pod + one Service per alias name. Each Service exposes
     :80->8080 (http) and :443->8443 (https). Optionally adds a NetworkPolicy
     granting it ingress from mitm (echo is an in-cluster stand-in for the
-    internet, which the production default-deny would otherwise block).
-
-    `aws_creds_secret` mounts that Secret at /aws/credentials, mirroring how the
-    real aws-sigv4-proxy sidecar receives the real credentials, so a test can
-    confirm those creds live in the sidecar and not the agent pod."""
+    internet, which the production default-deny would otherwise block)."""
     labels = dict(ECHO_LABEL)
     if labels_extra:
         labels.update(labels_extra)
-    volumes: list[dict] = []
-    mounts: list[dict] = []
-    if aws_creds_secret:
-        volumes.append(k8s.secret_volume("aws-creds", aws_creds_secret))
-        mounts.append({"name": "aws-creds", "mountPath": "/aws", "readOnly": True})
     container = k8s.container_spec(
         name=AGENT_CONTAINER,
         image=TEST_IMAGE,
         command=["python3", "/echo.py"],
         image_pull_policy="Always",
-        volume_mounts=mounts or None,
         ports=[
             {"containerPort": 8080, "protocol": "TCP"},
             {"containerPort": 8443, "protocol": "TCP"},
@@ -395,9 +383,7 @@ def echo(
         "echo",
         ns,
         labels=labels,
-        spec=k8s.pod_spec(
-            container=container, volumes=volumes or None, restart_policy="Always"
-        ),
+        spec=k8s.pod_spec(container=container, restart_policy="Always"),
     )
     manifests: list[dict] = [pod]
     for name in services:
@@ -412,11 +398,6 @@ def echo(
                         {"name": "http", "port": 80, "targetPort": 8080,
                          "protocol": "TCP"},
                         {"name": "https", "port": 443, "targetPort": 8443,
-                         "protocol": "TCP"},
-                        # Port 8080 is what the SigV4 reroute targets directly
-                        # (PROXY_PORT), so expose it too when this echo plays the
-                        # aws-sigv4-proxy sidecar.
-                        {"name": "direct", "port": 8080, "targetPort": 8080,
                          "protocol": "TCP"},
                     ],
                 },

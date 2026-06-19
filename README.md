@@ -28,14 +28,11 @@ flowchart LR
             gitrw["git: SSH→HTTPS rewrite<br/>(baked /etc/gitconfig)"]
         end
         subgraph mitm_pod["Pod: mitm"]
-            mitm["mitmproxy<br/>+ filter addon"]
-        end
-        subgraph sigv4_pods["Pods: sigv4-&lt;profile&gt;"]
-            sidecar["aws-sigv4-proxy<br/>(one per profile)"]
+            mitm["mitmproxy<br/>+ filter addon<br/>(re-signs AWS SigV4)"]
         end
         rules[("Secret: rules-json")]
         certs[("Secret: mitm-certs")]
-        creds[("Secret: aws-creds-*")]
+        creds[("Secret: aws-sigv4-creds<br/>akia → real creds")]
     end
 
     internet(("Internet"))
@@ -47,14 +44,13 @@ flowchart LR
     awscreds -.->|host-side export| creds
     rules --> mitm
     certs --> mitm
-    creds --> sidecar
+    creds --> mitm
     agent -->|HTTPS_PROXY=http://mitm:8080| mitm
     agent -.->|"git@host: / ssh://git@host"| gitrw
     gitrw -.->|cloned over HTTPS| mitm
     agent -.->|TCP 22 only, --ssh-cidr<br/>bypasses mitm| internet
     mitm -->|allowed + injected| internet
-    mitm -->|SigV4 reroute by dummy AKIA| sidecar
-    sidecar -->|re-signed| aws
+    mitm -->|re-signed with real creds<br/>by dummy AKIA| aws
 ```
 
 ## Install
@@ -287,7 +283,7 @@ Unit tests need nothing. The integration suite runs against a live k3s cluster
 (reusing the same `kubectl` + `docker` + `localhost:5000` registry setup the tool
 itself needs) and focuses on the security posture: credentials never reaching the
 agent pod, the agent's egress being confined to mitm + kube-dns, and the
-allow-list / credential-injection / SigV4 reroute behaving as designed. **No real
+allow-list / credential-injection / SigV4 re-signing behaving as designed. **No real
 credentials are needed** — every secret is a dummy or a sentinel. Pods run
 privileged on the default runtime (no kata), so the suite runs on a bare k3s /
 GitHub runner; `.github/workflows/integration-tests.yml` does exactly that. If no

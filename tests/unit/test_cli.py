@@ -4,6 +4,7 @@ scoping and the cwd guard. These run with no cluster."""
 
 import argparse
 import base64
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -27,7 +28,7 @@ def _by_name(policies):
 
 
 def test_default_deny_blocks_all():
-    policies = cli._network_policies("ns", has_sigv4=False)
+    policies = cli._network_policies("ns")
     deny = _by_name(policies)["default-deny"]
     assert deny["spec"]["podSelector"] == {}
     assert deny["spec"]["ingress"] == []
@@ -36,7 +37,7 @@ def test_default_deny_blocks_all():
 
 
 def test_agent_egress_is_mitm_and_dns_only():
-    policies = cli._network_policies("ns", has_sigv4=False)
+    policies = cli._network_policies("ns")
     egress = _by_name(policies)["agent-egress"]["spec"]["egress"]
     # mitm:8080
     mitm = [e for e in egress if any(
@@ -50,7 +51,7 @@ def test_agent_egress_is_mitm_and_dns_only():
 
 
 def test_agent_egress_adds_ssh_cidr_on_port_22_only():
-    policies = cli._network_policies("ns", has_sigv4=False, ssh_cidrs=["10.0.0.0/24"])
+    policies = cli._network_policies("ns", ssh_cidrs=["10.0.0.0/24"])
     egress = _by_name(policies)["agent-egress"]["spec"]["egress"]
     ssh = [e for e in egress if any(
         t.get("ipBlock", {}).get("cidr") == "10.0.0.0/24" for t in e.get("to", []))]
@@ -58,19 +59,21 @@ def test_agent_egress_adds_ssh_cidr_on_port_22_only():
     assert ssh[0]["ports"] == [{"protocol": "TCP", "port": 22}]
 
 
-def test_sigv4_policy_only_present_with_profiles():
-    assert "sigv4-policy" not in _by_name(cli._network_policies("ns", has_sigv4=False))
-    sigv4 = _by_name(cli._network_policies("ns", has_sigv4=True))["sigv4-policy"]
-    ingress = sigv4["spec"]["ingress"][0]
-    assert ingress["from"][0]["podSelector"]["matchLabels"]["app"] == "mitm"
-    assert sigv4["spec"]["podSelector"]["matchLabels"]["tier"] == "sigv4"
+def test_no_sigv4_policy_signing_happens_in_mitm():
+    # AWS re-signing now runs inside mitm, so there is no separate sidecar tier
+    # and no sigv4-policy; mitm's unrestricted egress reaches AWS directly.
+    names = _by_name(cli._network_policies("ns"))
+    assert "sigv4-policy" not in names
+    assert set(names) == {"default-deny", "agent-egress", "mitm-policy"}
 
 
 def test_mitm_policy_ingress_from_agent_only():
-    mitm = _by_name(cli._network_policies("ns", has_sigv4=False))["mitm-policy"]
+    mitm = _by_name(cli._network_policies("ns"))["mitm-policy"]
     ingress = mitm["spec"]["ingress"][0]
     assert ingress["from"][0]["podSelector"]["matchLabels"]["app"] == "agent"
     assert ingress["ports"][0]["port"] == cli.PROXY_PORT
+    # Egress unrestricted so mitm can reach the real AWS endpoints it re-signs for.
+    assert mitm["spec"]["egress"] == [{}]
 
 
 # --------------------------------------------------------------------------- #
@@ -369,61 +372,7 @@ def _assert_set_arg(args, value):
 
 
 # --------------------------------------------------------------------------- #
-# sigv4 sidecar manifest — credential wiring + hardening
-# --------------------------------------------------------------------------- #
-
-
-def test_sigv4_manifests_wiring_and_hardening():
-    pod = next(
-        m
-        for m in cli._sigv4_manifests(
-            "ns", "profile-name", "my-profile", "img:tag", "", "eu-west-2"
-        )
-        if m["kind"] == "Pod"
-    )
-    assert pod["metadata"]["labels"]["tier"] == "sigv4"
-    assert pod["metadata"]["labels"]["managed-by"] == "agent-uplink"
-
-    container = pod["spec"]["containers"][0]
-    # --region is passed through; the credential-leaking --log-signing-process
-    # flag must not be present.
-    assert container["args"] == ["--region", "eu-west-2"]
-    env = _env_dict(container)
-    assert env["AWS_SHARED_CREDENTIALS_FILE"] == "/aws/credentials"
-    # AWS_PROFILE is the original profile name; the safe name is only for k8s
-    # resource names (the per-profile Secret).
-    assert env["AWS_PROFILE"] == "profile-name"
-    assert env["AWS_SDK_LOAD_CONFIG"] == "true"
-
-    creds_vol = _volume_by_name(pod, "creds")
-    assert creds_vol["secret"]["secretName"] == "aws-creds-my-profile"
-    creds_mount = _mount_by_name(container, "creds")
-    assert creds_mount["mountPath"] == "/aws"
-    assert creds_mount["readOnly"] is True
-
-    # The re-signing sidecar holds the real credentials, so it must stay hardened.
-    sc = container["securityContext"]
-    assert sc["readOnlyRootFilesystem"] is True
-    assert sc["allowPrivilegeEscalation"] is False
-    assert sc["runAsNonRoot"] is True
-    assert sc["runAsUser"] == 1000 and sc["runAsGroup"] == 1000
-    assert sc["capabilities"]["drop"] == ["ALL"]
-    assert sc["seccompProfile"]["type"] == "RuntimeDefault"
-
-
-def test_sigv4_manifests_region_unset_omits_flag():
-    pod = next(
-        m
-        for m in cli._sigv4_manifests(
-            "ns", "profile-name", "my-profile", "img:tag", "", ""
-        )
-        if m["kind"] == "Pod"
-    )
-    assert "args" not in pod["spec"]["containers"][0]
-
-
-# --------------------------------------------------------------------------- #
-# mitm manifest — hardening + kube (mTLS / upstream-CA) wiring
+# mitm manifest — hardening + AWS creds + kube (mTLS / upstream-CA) wiring
 # --------------------------------------------------------------------------- #
 
 
@@ -435,6 +384,26 @@ def test_mitm_manifest_is_hardened_without_kube():
     assert sc["runAsNonRoot"] is True
     assert sc["capabilities"]["drop"] == ["ALL"]
     assert sc["seccompProfile"]["type"] == "RuntimeDefault"
+
+
+def test_mitm_manifest_no_aws_creds_mount_without_profiles():
+    pod = next(m for m in cli._mitm_manifests("ns", "img", "") if m["kind"] == "Pod")
+    container = pod["spec"]["containers"][0]
+    assert not any(v["name"] == "aws-creds" for v in pod["spec"]["volumes"])
+    assert "aws_creds_file=/aws-creds/creds.json" not in container["args"]
+
+
+def test_mitm_manifest_mounts_aws_creds_when_present():
+    pod = next(
+        m for m in cli._mitm_manifests("ns", "img", "", aws_creds_secret="aws-sigv4-creds")
+        if m["kind"] == "Pod"
+    )
+    container = pod["spec"]["containers"][0]
+    # Real per-AKIA creds map mounted read-only, and the addon pointed at it.
+    assert _volume_by_name(pod, "aws-creds")["secret"]["secretName"] == "aws-sigv4-creds"
+    mount = _mount_by_name(container, "aws-creds")
+    assert mount["mountPath"] == "/aws-creds" and mount["readOnly"] is True
+    _assert_set_arg(container["args"], "aws_creds_file=/aws-creds/creds.json")
 
 
 def test_mitm_manifest_kube_client_certs_and_upstream_ca():
@@ -509,7 +478,7 @@ def test_agent_pod_mounts_kubeconfig_outside_home_with_env():
 
 
 # --------------------------------------------------------------------------- #
-# _build_aws_plan — dummy creds in the agent, AKIA -> sidecar routes
+# _build_aws_plan — dummy creds for the agent, real per-AKIA creds for mitm
 # --------------------------------------------------------------------------- #
 
 
@@ -517,42 +486,47 @@ def _decode_secret(manifest, key):
     return base64.b64decode(manifest["data"][key]).decode()
 
 
-def test_build_aws_plan_dummy_creds_and_sigv4_routes(monkeypatch):
+def test_build_aws_plan_dummy_for_agent_real_for_mitm(monkeypatch):
     monkeypatch.setattr(
         cli, "export_aws_profile_env",
-        lambda profile: {"AWS_ACCESS_KEY_ID": "AKIAREAL", "AWS_SECRET_ACCESS_KEY": "realsecret"},
+        lambda profile: {
+            "AWS_ACCESS_KEY_ID": f"AKIAREAL-{profile}",
+            "AWS_SECRET_ACCESS_KEY": "realsecret",
+            "AWS_SESSION_TOKEN": "realtoken",
+        },
     )
     session = Session(session_dir=Path("/tmp/unused"), namespace="test-ns")
     plan = cli._build_aws_plan(session, ["test-profile", "My.Profile"])
 
-    assert plan.profile_safe == {"test-profile": "test-profile", "My.Profile": "my-profile"}
     assert plan.dummy_secret_name == "agent-aws-creds"
+    assert plan.creds_secret_name == "aws-sigv4-creds"
 
     by_name = {m["metadata"]["name"]: m for m in plan.secret_manifests}
     # The agent's credentials Secret holds only deterministic dummy values.
     dummy_ini = _decode_secret(by_name["agent-aws-creds"], "credentials")
     assert "[test-profile]" in dummy_ini
     assert "AKIA" in dummy_ini and "DUMMYsecret" in dummy_ini
-    assert "realsecret" not in dummy_ini
-    # The real creds live in per-profile sidecar Secrets, never the agent's.
-    assert "aws-creds-test-profile" in by_name
-    assert "aws-creds-my-profile" in by_name
-    assert by_name["agent-aws-creds"]["metadata"]["namespace"] == "test-ns"
+    assert "realsecret" not in dummy_ini and "realtoken" not in dummy_ini
 
-    # Each dummy AKIA routes to its profile's sidecar Service.
-    assert plan.sigv4_routes[aws.dummy_akia("test-profile")] == {
-        "upstream_host": "sigv4-test-profile", "upstream_port": cli.PROXY_PORT,
+    # The real creds live only in the mitm pod's Secret, keyed by dummy AKIA.
+    creds_map = json.loads(_decode_secret(by_name["aws-sigv4-creds"], "creds.json"))
+    assert set(creds_map) == {aws.dummy_akia("test-profile"), aws.dummy_akia("My.Profile")}
+    entry = creds_map[aws.dummy_akia("test-profile")]
+    assert entry == {
+        "access_key_id": "AKIAREAL-test-profile",
+        "secret_access_key": "realsecret",
+        "session_token": "realtoken",
     }
-    assert plan.sigv4_routes[aws.dummy_akia("My.Profile")] == {
-        "upstream_host": "sigv4-my-profile", "upstream_port": cli.PROXY_PORT,
-    }
+    # No per-profile sidecar Secrets exist anymore.
+    assert not any(n.startswith("aws-creds-") for n in by_name)
+    assert by_name["aws-sigv4-creds"]["metadata"]["namespace"] == "test-ns"
 
 
-def test_build_aws_plan_no_profiles_has_no_dummy_secret_or_routes():
+def test_build_aws_plan_no_profiles_has_no_secrets():
     session = Session(session_dir=Path("/tmp/unused"), namespace="test-ns")
     plan = cli._build_aws_plan(session, [])
     assert plan.dummy_secret_name is None
-    assert plan.sigv4_routes == {}
+    assert plan.creds_secret_name is None
     assert plan.secret_manifests == []
 
 

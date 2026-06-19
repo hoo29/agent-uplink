@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-**agent-uplink** runs a coding agent in a Kata-containers microVM on a local k3s cluster with all outbound traffic intercepted by mitmproxy. The agent pod has its egress restricted by a `NetworkPolicy` to the mitmproxy service only; the microVM boundary (`runtimeClassName: kata-clh`) gives defence in depth on top of the cluster network. Support pods (mitm, aws-sigv4-proxy) run with the cluster's default runtime under hardened security contexts.
+**agent-uplink** runs a coding agent in a Kata-containers microVM on a local k3s cluster with all outbound traffic intercepted by mitmproxy. The agent pod has its egress restricted by a `NetworkPolicy` to the mitmproxy service only; the microVM boundary (`runtimeClassName: kata-clh`) gives defence in depth on top of the cluster network. The mitm support pod runs with the cluster's default runtime under a hardened security context.
 
 The microVM also exists to make running a Docker daemon inside the pod viable: the agent container runs its own `dockerd` so the agent can spin up testcontainers and other Docker workloads while debugging tests. (This is *not* Docker-in-Docker — the outer pod runtime is k3s's containerd plus the kata microVM, not a second Docker. There is exactly one `dockerd` in the stack, inside the agent container.) The earlier "Claude in a plain Docker container" design couldn't host that. The cost is that the agent container itself runs `privileged`, root, `seccompProfile=Unconfined` *inside* the kata guest — the kata guest kernel is the trust boundary, not the in-container hardening that the support pods retain.
 
 It is **agent-agnostic by design** — agent-specific bits (image, auth, config files, default rules) live behind an `Agent` interface in `agent_uplink/agents/`. Currently only `claude` is implemented; new agents are added by dropping a directory in `agent_uplink/agents/<name>/` and registering it in `agent_uplink/agents/__init__.py`.
 
-AWS requests get an extra hop regardless of agent: the agent pod's `~/.aws/credentials` holds only dummy AWS credentials, mitmproxy detects the SigV4 `Authorization` header, strips it, and reroutes the request to an `aws-sigv4-proxy` pod (one per `--aws-profiles` profile) that re-signs with the real credentials kept in a K8s Secret. Real AWS keys never enter the agent pod.
+AWS requests are re-signed in the mitm pod regardless of agent: the agent pod's `~/.aws/credentials` holds only dummy AWS credentials (a deterministic dummy AKIA per `--aws-profiles` profile). mitmproxy detects the SigV4 `Authorization` header, maps the dummy AKIA to the profile's real credentials (mounted into the mitm pod as a K8s Secret), derives the service and region from the host, strips the bogus signature and re-signs the request before forwarding it straight to AWS. Real AWS keys never enter the agent pod.
 
 ## Commands
 
@@ -72,7 +72,7 @@ The runtime splits cleanly into two halves:
 
 | Layer | Files | Responsibility |
 |---|---|---|
-| **Generic** | `cli.py`, `k8s.py`, `bootstrap.py`, `rules.py`, `aws.py`, `session.py`, `process.py`, `mitm_addon/`, `default_rules.yaml` | mitm lifecycle, AWS SigV4 sidecars, K8s manifest assembly, registry + cert bootstrap, session cleanup, rule resolution. Knows nothing about specific agents. |
+| **Generic** | `cli.py`, `k8s.py`, `bootstrap.py`, `rules.py`, `aws.py`, `session.py`, `process.py`, `mitm_addon/`, `default_rules.yaml` | mitm lifecycle, AWS SigV4 re-signing in mitm, K8s manifest assembly, registry + cert bootstrap, session cleanup, rule resolution. Knows nothing about specific agents. |
 | **Agent** | `agents/base.py` (interface), `agents/<name>/...` (impl) | Image to build, auth flow, fake-creds production, K8s volumes/mounts, agent-specific default rules, per-mode auth-rule injection. |
 
 `cli.py` is the orchestrator. It parses args, picks an `Agent` subclass from the registry, and calls its lifecycle hooks at the right points around the generic plumbing.
@@ -92,16 +92,12 @@ Every run creates a namespace `agent-uplink-<id>` containing:
               │                       ▼                     │
               │  Pod: mitm  ──► Service mitm:8080           │
               │    addon: ConfigMap (filter.py)             │
-              │    rules: Secret  ─► sigv4-<profile>:8080
+              │    rules: Secret                            │
+              │    AWS creds: Secret (akia → real creds)    │
               │    CA cert+key: Secret                      │
-              │                       │                     │
-              │                       ▼                     │
-              │  Pod(s): sigv4-<profile>                    │
-              │    creds: Secret /aws/credentials           │
-              │    NetworkPolicy: ingress from mitm only    │
               │                                             │
               └─────────────────────────────────────────────┘
-                                      │ egress (mitm + sigv4 only)
+                                      │ egress (mitm only)
                                       ▼
                               real AWS / Anthropic / etc
 ```
@@ -118,15 +114,14 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 6. `agent.discover_aws_profiles()` — agent may add to the AWS profile list (e.g. Claude bedrock mode picks up `env.AWS_PROFILE`). Combined with `--aws-profiles`, deduped.
 7. `agent.prepare(session, aws_profile_names)` — host-side OAuth refresh, keyring reads, fake-creds + settings.json bytes (all in memory; no disk writes). Returns a `PreparedAgent` (the agent's auth rules + K8s Secret payloads) rather than stashing them on the instance.
 8. `bootstrap.build_and_push_agent_image(...)` — assemble a temp build context (agent dir + the **public** mitm CA cert only; the CA private key never enters the context or any image layer), `docker build`, `docker push localhost:5000/<repo>:latest`. Rebuilds also fire if certs were just regenerated, `--force-rebuild`, or the image is older than `AGENT_IMAGE_MAX_AGE_SECONDS` (24 h).
-9. For each AWS profile: export real AWS env vars on the host, build a per-profile shared-credentials INI as bytes, wrap in a K8s Secret (`aws-creds-<safe-profile>`).
-10. Build the dummy `~/.aws/credentials` INI (deterministic AKIA per profile) as bytes, wrap in a K8s Secret (`agent-aws-creds`).
-11. Resolve rules: layer in precedence order user `--rules` YAML → agent auth rules (from `prepare()`) → agent default rules → generic defaults (first match wins, generic catch-all last); expand `{{keyring:...}}` (and `{{exec:...}}` only when `--allow-exec`) placeholders; embed the `aws_sigv4_routes` map; wrap as Secret (`rules-json`).
-12. `prepared.secret_payloads` — any agent-specific Secrets (`claude-settings`, `claude-fake-creds` in anthropic mode).
-13. Assemble the full manifest set: namespace, ConfigMap (mitm-addon), Secrets, NetworkPolicies (default-deny + agent-egress + mitm-policy + sigv4-policy), mitm Pod + Service, one sigv4 Pod + Service per profile, agent Pod.
-14. `kubectl apply -f -` for everything in one call.
-15. Wait for support pods Ready, then agent pod Ready (Kata cold start + nested `dockerd` warmup is the long pole).
-16. `kubectl exec -it agent -- <PodContribution.command>` — for Claude: `runuser -u <username> -- bash -lc 'cd "$WORKDIR" && exec claude --dangerously-skip-permissions'` (with `--debug`, `-d` is prepended to the `claude` flags; any args after a `--` separator on the agent-uplink command line are shell-quoted and appended, e.g. `-- --resume <id>` or `-- -p "prompt"`). PID 1 (`dockerd-entrypoint.sh`) is root so it can start the nested `dockerd` and chgrp the socket; `runuser` drops the interactive session to the host UID so hostPath writes land as the host user.
-17. On exit / SIGINT / SIGTERM: `kubectl delete ns <id> --wait=false` and `rmtree(session_dir)`. The cluster finishes the cascade in the background.
+9. Build the dummy `~/.aws/credentials` INI (deterministic AKIA per profile) as bytes, wrap in a K8s Secret (`agent-aws-creds`) for the agent pod. For each AWS profile, export real AWS env vars on the host and collect them into a single dummy-AKIA → real-credentials JSON map, wrapped in one K8s Secret (`aws-sigv4-creds`) mounted only into the mitm pod.
+10. Resolve rules: layer in precedence order user `--rules` YAML → agent auth rules (from `prepare()`) → agent default rules → generic defaults (first match wins, generic catch-all last); expand `{{keyring:...}}` (and `{{exec:...}}` only when `--allow-exec`) placeholders; wrap as Secret (`rules-json`).
+11. `prepared.secret_payloads` — any agent-specific Secrets (`claude-settings`, `claude-fake-creds` in anthropic mode).
+12. Assemble the full manifest set: namespace, ConfigMap (mitm-addon), Secrets, NetworkPolicies (default-deny + agent-egress + mitm-policy), mitm Pod + Service, agent Pod.
+13. `kubectl apply -f -` for everything in one call.
+14. Wait for the mitm pod Ready, then agent pod Ready (Kata cold start + nested `dockerd` warmup is the long pole).
+15. `kubectl exec -it agent -- <PodContribution.command>` — for Claude: `runuser -u <username> -- bash -lc 'cd "$WORKDIR" && exec claude --dangerously-skip-permissions'` (with `--debug`, `-d` is prepended to the `claude` flags; any args after a `--` separator on the agent-uplink command line are shell-quoted and appended, e.g. `-- --resume <id>` or `-- -p "prompt"`). PID 1 (`dockerd-entrypoint.sh`) is root so it can start the nested `dockerd` and chgrp the socket; `runuser` drops the interactive session to the host UID so hostPath writes land as the host user.
+16. On exit / SIGINT / SIGTERM: `kubectl delete ns <id> --wait=false` and `rmtree(session_dir)`. The cluster finishes the cascade in the background.
 
 ### Key constraints
 
@@ -135,7 +130,7 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
   directory or each other; startup is refused otherwise. All are mounted read-write at their identical host paths.
 - **Image rebuild triggers**: rebuild + push whenever mitm certs are newly generated, `--force-rebuild` is passed, the image doesn't exist locally, or it's older than `AGENT_IMAGE_MAX_AGE_SECONDS` (24 h).
 - **Security posture (agent pod)**: `runtimeClassName: kata-clh` (microVM isolation; `kata-qemu` / `kata-fc` selectable via `--agent-runtime-class`). Container runs `privileged=true`, `allowPrivilegeEscalation=true`, `seccompProfile=Unconfined`, PID 1 as root — required so the nested `dockerd` can manage cgroups/namespaces/mounts/iptables inside the guest. `readOnlyRootFilesystem` is deliberately **off** here. On a privileged, root, seccomp-unconfined container it is not a boundary — the agent holds `CAP_SYS_ADMIN` and can remount the rootfs read-write at will — so it would only add friction (an explicit writable mount per path the agent touches). The container rootfs is writable; the trust boundary is the kata guest kernel plus the NetworkPolicy egress lock. Two paths are still memory-backed tmpfs because they require it regardless: `/var/lib/docker` (2Gi — the nested `dockerd`'s overlayfs upperdir, which kata's virtio-fs rejects) and `/run` (64Mi — holds the `dockerd` unix socket, unreliable on virtio-fs). The interactive session drops to the host UID via `runuser` in `container_command`. NetworkPolicy egress restricted to `mitm:8080` + `kube-dns` (plus TCP 22 to `--ssh-cidr` ranges if set — see SSH egress). Memory limit 4Gi (sized for the 2Gi tmpfs `/var/lib/docker` plus headroom for image layers and the agent process), CPU limit 1; requests are lower (1Gi / 250m) so the pod schedules on small nodes but can burst to the limit. Trust boundary is the kata guest kernel.
-- **Security posture (mitm / sigv4 pods)**: full hardened container security context (`drop=[ALL]`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation=false`, `runAsNonRoot=true`, `seccompProfile=RuntimeDefault`) under the cluster default runtime (faster cold start). Egress isolation enforced by NetworkPolicy. Memory limits 512Mi / 128Mi, CPU limits 500m / 100m (requests 96Mi·50m / 48Mi·25m).
+- **Security posture (mitm pod)**: full hardened container security context (`drop=[ALL]`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation=false`, `runAsNonRoot=true`, `seccompProfile=RuntimeDefault`) under the cluster default runtime (faster cold start). Holds the real AWS credentials (mounted Secret) and the resolved rules, so it is the most secret-bearing support pod — kept off any hostPath and locked down accordingly. Egress isolation enforced by NetworkPolicy. Memory limit 512Mi, CPU limit 500m (requests 96Mi·50m).
 
 ### Module layout
 
@@ -145,14 +140,14 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 | `agent_uplink/cli.py` | Arg parsing, signal handler wiring, manifest assembly, orchestration, `list`/`clean` dispatch |
 | `agent_uplink/k8s.py` | Low-level `kubectl` wrappers + typed manifest builders (Pod/Secret/ConfigMap/Service/NetworkPolicy/Deployment) and reusable volume/securityContext fragments |
 | `agent_uplink/bootstrap.py` | One-time setup: local registry, k3s `registries.yaml` check, mitm CA generation, docker build+push |
-| `agent_uplink/aws.py` | AWS helpers: dummy AKIA, dummy + real shared-credentials INI as bytes, profile env export, k8s-safe name sanitiser |
+| `agent_uplink/aws.py` | AWS helpers: dummy AKIA, dummy `~/.aws/credentials` INI for the agent, real per-AKIA credentials JSON for the mitm pod, profile env export |
 | `agent_uplink/kube.py` | Kubernetes context resolution: reads host kubeconfig via `kubectl config view`, validates auth method, produces sanitized pod kubeconfig + mitm wiring (allow rules, client certs, upstream CA bundle) |
 | `agent_uplink/rules.py` | Rule resolution: layers user YAML + kube rules + agent auth rules + `agent.default_rules()` + generic defaults (in precedence order, generic last), resolves keyring/exec placeholders, returns JSON bytes |
 | `agent_uplink/session.py` | `Session` dataclass: tracks namespace + session_dir; `cleanup()` is `kubectl delete ns --wait=false` + rmtree |
 | `agent_uplink/reaper.py` | `list` / `clean` subcommands: find session namespaces by `managed-by=agent-uplink`, filter by id/age/all, delete leftovers from killed runs |
 | `agent_uplink/process.py` | `run_command` (piped) + `run_interactive` (stdio-attached) |
 | `agent_uplink/default_rules.yaml` | Generic baseline (allow `GET`/`OPTIONS`/`HEAD` everywhere) |
-| `agent_uplink/mitm_addon/filter.py` | mitmproxy addon — enforces allow-list, injects pre-resolved headers, reroutes AWS SigV4 requests to sidecar services by dummy AKIA (stdlib only) |
+| `agent_uplink/mitm_addon/filter.py` | mitmproxy addon — enforces allow-list, injects pre-resolved headers, re-signs AWS SigV4 requests in place with real per-AKIA credentials (stdlib SigV4 implementation; parses service/region from the host) |
 | `agent_uplink/agents/__init__.py` | `AGENTS` registry keyed by agent name |
 | `agent_uplink/agents/base.py` | `Agent` ABC — interface every agent implements |
 | `agent_uplink/agents/claude/agent.py` | `ClaudeAgent`: per-mode auth, K8s volumes/mounts, privileged (in-pod `dockerd`) security context, container command |
@@ -173,7 +168,7 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 2. Register the class in `agent_uplink/agents/__init__.py`'s `AGENTS` dict.
 3. Add the package to `[tool.setuptools]` in `pyproject.toml`.
 
-The CLI picks up the new agent as a subcommand automatically. All generic infra (mitm, sigv4 sidecars, K8s Secrets, NetworkPolicy, namespace lifecycle, registry, certs) works without modification.
+The CLI picks up the new agent as a subcommand automatically. All generic infra (mitm, AWS SigV4 re-signing, K8s Secrets, NetworkPolicy, namespace lifecycle, registry, certs) works without modification.
 
 ## Rules and credential injection
 
@@ -229,7 +224,7 @@ keyring get my-svc my-user           # verify
 `--anthropic` and `--bedrock` are mutually exclusive and one is required for `agent-uplink claude`.
 
 - **`--anthropic`**: requires `~/.claude/.credentials.json` on the host (populated by `claude login`). The real OAuth `accessToken` is embedded directly into the mitm rules; the pod gets a *fake* `.credentials.json` (`sk-ant-oat01-agent-uplink-*` tokens, `expiresAt` pinned ~10 years out) so the Claude CLI takes the OAuth code path and shows the welcome banner. There are no fallback auth paths in this mode — if the credentials file is missing or unparseable, startup fails.
-- **`--bedrock`**: injects `AWS_BEARER_TOKEN_BEDROCK=placeholder` into the pod's settings.json. mitm swaps it for the real bearer (from `keyring get bedrock key`) on `bedrock-runtime.<region>.amazonaws.com`. If `settings.json` sets `env.AWS_PROFILE`, that profile is added to the sigv4-proxy pod list automatically (in addition to anything from `--aws-profiles`) — note that wires the agent to that profile's full IAM scope via the SigV4 hop (above), gated on your rules.
+- **`--bedrock`**: injects `AWS_BEARER_TOKEN_BEDROCK=placeholder` into the pod's settings.json. mitm swaps it for the real bearer (from `keyring get bedrock key`) on `bedrock-runtime.<region>.amazonaws.com`. If `settings.json` sets `env.AWS_PROFILE`, that profile is added to the SigV4 re-signing credential map automatically (in addition to anything from `--aws-profiles`) — note that wires the agent to that profile's full IAM scope via the re-signing hop (above), gated on your rules.
 
 **Known limitation — host settings.json is copied wholesale.** `claude_settings_bytes` currently copies the host `settings.json` into the pod *as-is*: it drops only the top-level `sandbox` key, replaces `permissions`, and merges the mode's injected placeholder into `env`. It does **not** implement an allow-list, so secret-bearing keys — `apiKeyHelper` and any secret `env` entries (e.g. API tokens) — in your host `settings.json` **do** reach the agent container's `~/.claude/settings.json`. Keep secrets out of your host `settings.json` for now.
 
@@ -254,19 +249,21 @@ secrets (or `vault_password_file` references) out of it.
 
 `~/.docker/config.json` is **not** mounted into the pod. Private registry pulls (ECR, etc.) are handled purely by mitm rules, the same mechanism as every other credential — there is no docker-specific code path. The in-pod `dockerd` makes anonymous registry requests; a rule matching the registry host injects the `Authorization` header (header injection adds it even when the request had none), so the registry accepts the pull. The credential is resolved on the host and never enters the pod.
 
-ECR uses HTTP **Basic** auth (`AWS:<token>`, token from `aws ecr get-login-password`), so a single `{{exec:...}}` rule on the registry host suffices — see `examples/rules/ecr.yaml`. Blob downloads redirect to presigned S3 URLs on a different host (no `Authorization` header) and fall through to the default `GET` allow rule. (This is unrelated to the SigV4 routing below: ECR's Basic-auth `Authorization` header is not `AWS4-HMAC-SHA256`, so it is never picked up by the sigv4 reroute.)
+ECR uses HTTP **Basic** auth (`AWS:<token>`, token from `aws ecr get-login-password`), so a single `{{exec:...}}` rule on the registry host suffices — see `examples/rules/ecr.yaml`. Blob downloads redirect to presigned S3 URLs on a different host (no `Authorization` header) and fall through to the default `GET` allow rule. (This is unrelated to the SigV4 re-signing below: ECR's Basic-auth `Authorization` header is not `AWS4-HMAC-SHA256`, so it is never picked up by the re-signer.)
 
-## AWS SigV4 routing
+## AWS SigV4 re-signing
 
 When one or more `--aws-profiles` are supplied (directly or via an agent's `discover_aws_profiles()` hook), a Secret `agent-aws-creds` is created with **dummy** values: a deterministic dummy AKIA per profile (`AKIA` + first 16 hex chars of `sha256(profile)`) plus a fixed dummy secret. The container's AWS SDK signs requests with these fake creds; the resulting signature is bogus and never goes to AWS.
 
-The allow-list is checked **first**, on the original AWS host — the SigV4 reroute no longer bypasses it. Only if a rule permits the request does the addon then reroute: for a `*.amazonaws.com` request whose `Authorization` header is `AWS4-HMAC-SHA256`, it extracts the AKIA from the `Credential=` field, looks it up in the `aws_sigv4_routes` map (embedded into the rules JSON), strips the `Authorization` / `X-Amz-Date` / `X-Amz-Security-Token` / `X-Amz-Content-Sha256` headers, and reroutes to the matching `sigv4-<safe-profile>` `Service` (port 8080). The original `Host` header is preserved so the sidecar can re-sign with the real credentials for the right service/region. (SigV4 rerouting and `inject.headers` are mutually exclusive on a rerouted AWS host — the sidecar re-signs, so injected headers would be discarded.)
+The allow-list is checked **first**, on the original AWS host. Only if a rule permits the request does the addon re-sign it: for a `*.amazonaws.com` request whose `Authorization` header is `AWS4-HMAC-SHA256`, it extracts the AKIA from the `Credential=` field, looks it up in the real-credentials map (the `aws-sigv4-creds` Secret mounted into the mitm pod), derives the service and region from the host (a pattern parse — `service.region.amazonaws.com`, with global/region-less hosts signing as `us-east-1`; not a frozen endpoint table), strips the dummy `Authorization` / `X-Amz-Date` / `X-Amz-Security-Token` / `X-Amz-Content-Sha256` headers, and re-signs with the real credentials before forwarding straight to AWS. The original `Host` is preserved. (Re-signing and `inject.headers` are mutually exclusive on an AWS host — the re-signer overwrites `Authorization`, so injected headers would be discarded.)
 
-So an AWS host is reachable **only if an allow rule matches it** (e.g. a rule with `host: 's3\.eu-west-2\.amazonaws\.com'`); the mere presence of an AWS signature grants nothing. A request to `*.amazonaws.com` that no rule allows returns `403`. A matched AWS host signed with an unknown AKIA is forwarded unrerouted (and fails at AWS with the dummy signature); a non-`AWS4-HMAC-SHA256` request to a matched host is handled normally (e.g. anonymous `GET`).
+S3 is signed with `x-amz-content-sha256: UNSIGNED-PAYLOAD` at headers time so large objects keep streaming; every other service buffers the body and signs the real SHA256 payload hash (AWS API bodies are small). The SigV4 implementation is stdlib-only (the addon ships as a ConfigMap into the stock mitmproxy image, so it can't use botocore).
 
-**Security note:** the sidecar re-signs with the real profile credentials and is not scoped to a single service, so any *allowed* AWS request runs with that profile's full IAM permissions. Scope both the profile you pass and the host rules you write — don't pass broad admin profiles.
+So an AWS host is reachable **only if an allow rule matches it** (e.g. a rule with `host: 's3\.eu-west-2\.amazonaws\.com'`); the mere presence of an AWS signature grants nothing. A request to `*.amazonaws.com` that no rule allows returns `403`. A matched AWS host signed with an unknown AKIA is forwarded unchanged (and fails at AWS with the dummy signature); a non-`AWS4-HMAC-SHA256` request to a matched host is handled normally (e.g. anonymous `GET`).
 
-Real AWS credentials are obtained on the host via `aws configure export-credentials` (with an `aws sso login` fallback), formatted as a single-profile shared-credentials-file INI blob, and wrapped in a K8s Secret (`aws-creds-<safe-profile>`) in the session namespace. The sidecar mounts that Secret read-only at `/aws/credentials` and reads it via `AWS_SHARED_CREDENTIALS_FILE`; `AWS_PROFILE` is the only AWS-related env var on the pod. The `sigv4-policy` NetworkPolicy ensures only the mitm pod can reach those services, so the agent pod can't bypass the SigV4 hop.
+**Security note:** re-signing uses the real profile credentials and is not scoped to a single service, so any *allowed* AWS request runs with that profile's full IAM permissions. Scope both the profile you pass and the host rules you write — don't pass broad admin profiles.
+
+Real AWS credentials are obtained on the host via `aws configure export-credentials` (with an `aws sso login` fallback), collected into a single JSON map (dummy AKIA → `{access_key_id, secret_access_key, session_token?}`), and wrapped in one K8s Secret (`aws-sigv4-creds`) mounted read-only into the mitm pod only. The agent pod never sees it; `mitm-policy`'s unrestricted egress lets mitm reach the real AWS endpoints directly, and `agent-egress` confines the agent to mitm so it can't reach AWS itself.
 
 ## NetworkPolicy perimeter
 
@@ -276,8 +273,7 @@ Real AWS credentials are obtained on the host via `aws configure export-credenti
 |---|---|---|
 | `default-deny` | all pods | Deny all ingress + egress unless another policy allows it |
 | `agent-egress` | `app=agent` | Egress only to `app=mitm` on TCP 8080 + `kube-system/kube-dns` on UDP/TCP 53, plus TCP 22 to any `--ssh-cidr` ranges (see SSH egress) |
-| `mitm-policy` | `app=mitm` | Ingress from `app=agent` on TCP 8080; egress unrestricted (out to internet + sigv4 services) |
-| `sigv4-policy` | `tier=sigv4` | Ingress from `app=mitm` on TCP 8080; egress unrestricted (to AWS) |
+| `mitm-policy` | `app=mitm` | Ingress from `app=agent` on TCP 8080; egress unrestricted (out to the internet, including the real AWS endpoints it re-signs for) |
 
 ### SSH egress
 

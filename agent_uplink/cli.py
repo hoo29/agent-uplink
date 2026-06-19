@@ -13,10 +13,10 @@ from pathlib import Path
 from .agents import AGENTS, Agent
 from .agents.base import PodBuildContext, PodContribution, PreparedAgent
 from .aws import (
-    build_safe_name_map,
     dummy_aws_credentials_ini,
     export_aws_profile_env,
-    real_aws_credentials_ini,
+    real_aws_credentials,
+    sigv4_credentials_json,
 )
 from .bootstrap import (
     AGENT_IMAGE_MAX_AGE_SECONDS,
@@ -60,11 +60,10 @@ LOGGER = logging.getLogger("agent-uplink")
 STATE_DIR = Path.home() / ".agent_uplink"
 
 DEFAULT_MITM_IMAGE = "mitmproxy/mitmproxy:12"
-DEFAULT_SIGV4_PROXY_IMAGE = "public.ecr.aws/aws-observability/aws-sigv4-proxy:latest"
 DEFAULT_AGENT_RUNTIME_CLASS = "kata-clh"
 DEFAULT_DEPLOY_CONTEXT = "local-k8s-admin"
 
-PROXY_PORT = 8080  # mitm and aws-sigv4-proxy both listen on this port
+PROXY_PORT = 8080  # mitm listens here
 
 AGENT_CONTAINER_NAME = "main"
 
@@ -88,18 +87,16 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         nargs="*",
         action="extend",
         default=[],
-        help="AWS profiles to provide credentials for (one sigv4-proxy pod per profile)",
+        help="AWS profiles to provide credentials for (re-signed by mitm per request)",
     )
     common.add_argument("--mitmproxy-image", default=DEFAULT_MITM_IMAGE)
-    common.add_argument("--sigv4-proxy-image",
-                        default=DEFAULT_SIGV4_PROXY_IMAGE)
     common.add_argument("--registry-image", default=REGISTRY_IMAGE_DEFAULT)
     common.add_argument(
         "--deploy-context",
         default=DEFAULT_DEPLOY_CONTEXT,
         metavar="CONTEXT",
         help="kubeconfig context agent-uplink deploys the session into (registry, "
-        "mitm, sigv4, agent pods). Distinct from --kube-context, which exposes "
+        "mitm, agent pods). Distinct from --kube-context, which exposes "
         "clusters to the agent. Pass '' to use the kubeconfig's current-context.",
     )
     common.add_argument(
@@ -111,17 +108,6 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         "--mitm-runtime-class",
         default="",
         help="RuntimeClass for the mitm pod ('' = cluster default)",
-    )
-    common.add_argument(
-        "--sigv4-runtime-class",
-        default="",
-        help="RuntimeClass for sigv4-proxy pods ('' = cluster default)",
-    )
-    common.add_argument(
-        "--region",
-        default="eu-west-2",
-        help="AWS region passed to sigv4-proxy pods (default eu-west-2; "
-        "pass '' to leave unset and let the proxy derive it per request)",
     )
     common.add_argument(
         "-f",
@@ -388,6 +374,7 @@ def _mitm_manifests(
     image: str,
     runtime_class: str,
     *,
+    aws_creds_secret: str | None = None,
     kube_client_certs_secret: str | None = None,
     kube_upstream_ca_secret: str | None = None,
 ) -> list[dict]:
@@ -427,6 +414,15 @@ def _mitm_manifests(
         emptydir_volume("tmp", "32Mi"),
     ]
 
+    # When AWS profiles are configured, mount the real-credentials map (keyed by
+    # dummy AKIA) so the addon can re-sign requests. It lives only in this pod.
+    if aws_creds_secret:
+        volume_mounts.append(
+            {"name": "aws-creds", "mountPath": "/aws-creds", "readOnly": True}
+        )
+        volumes.append(secret_volume("aws-creds", aws_creds_secret))
+        mitm_args.extend(["--set", "aws_creds_file=/aws-creds/creds.json"])
+
     # When k8s contexts are configured, mount the client certs directory (one
     # <host>.pem per cluster) and the combined upstream CA bundle so mitmproxy
     # presents the right client cert and trusts each cluster's serving CA.
@@ -462,51 +458,6 @@ def _mitm_manifests(
     )
     pod = pod_manifest("mitm", ns, labels=labels, spec=spec)
     svc = service_manifest("mitm", ns, selector=labels, port=PROXY_PORT, labels=labels)
-    return [pod, svc]
-
-
-def _sigv4_manifests(
-    ns: str,
-    profile: str,
-    safe_name: str,
-    image: str,
-    runtime_class: str,
-    region: str,
-) -> list[dict]:
-    pod_name = f"sigv4-{safe_name}"
-    labels = {"app": pod_name, "tier": "sigv4", "managed-by": "agent-uplink"}
-    # --log-signing-process leaks credentials into pod logs, so it is omitted.
-    args = []
-    if region:
-        args += ["--region", region]
-    container = container_spec(
-        image=image,
-        args=args,
-        env={
-            "AWS_SHARED_CREDENTIALS_FILE": "/aws/credentials",
-            "AWS_PROFILE": profile,
-            "AWS_SDK_LOAD_CONFIG": "true",
-        },
-        volume_mounts=[
-            {"name": "creds", "mountPath": "/aws", "readOnly": True},
-            {"name": "tmp", "mountPath": "/tmp"},
-        ],
-        security_context=hardened_container_security_context(uid=1000, gid=1000),
-        resources=Resources(
-            memory="128Mi", cpu="100m", memory_request="48Mi", cpu_request="25m"
-        ),
-        ports=[{"containerPort": PROXY_PORT, "protocol": "TCP"}],
-    )
-    spec = pod_spec(
-        container=container,
-        volumes=[
-            secret_volume("creds", f"aws-creds-{safe_name}"),
-            emptydir_volume("tmp", "16Mi"),
-        ],
-        runtime_class=runtime_class or None,
-    )
-    pod = pod_manifest(pod_name, ns, labels=labels, spec=spec)
-    svc = service_manifest(pod_name, ns, selector=labels, port=PROXY_PORT, labels=labels)
     return [pod, svc]
 
 
@@ -638,9 +589,9 @@ def _agent_pod_manifest(
 
 
 def _network_policies(
-    ns: str, has_sigv4: bool, ssh_cidrs: list[str] | None = None
+    ns: str, ssh_cidrs: list[str] | None = None
 ) -> list[dict]:
-    """Default-deny + agent-egress + mitm-ingress + sigv4-ingress."""
+    """Default-deny + agent-egress + mitm-ingress."""
     # Agent egress: mitm:8080 and kube-dns by default; optionally TCP 22 to an
     # explicit CIDR set.
     agent_egress: list[dict] = [
@@ -692,7 +643,7 @@ def _network_policies(
             egress=agent_egress,
         ),
         # mitm: accepts ingress from agent on 8080; egress unrestricted (out to
-        # the internet for normal requests, in to sigv4 services for AWS).
+        # the internet, including the real AWS endpoints it re-signs for).
         network_policy_manifest(
             "mitm-policy",
             ns,
@@ -706,22 +657,6 @@ def _network_policies(
             egress=[{}],
         ),
     ]
-    if has_sigv4:
-        # sigv4-*: accepts ingress from mitm only; egress unrestricted (to AWS).
-        policies.append(
-            network_policy_manifest(
-                "sigv4-policy",
-                ns,
-                pod_selector={"matchLabels": {"tier": "sigv4"}},
-                ingress=[
-                    {
-                        "from": [{"podSelector": {"matchLabels": {"app": "mitm"}}}],
-                        "ports": [{"protocol": "TCP", "port": PROXY_PORT}],
-                    }
-                ],
-                egress=[{}],
-            )
-        )
     return policies
 
 
@@ -742,19 +677,15 @@ class MitmCerts:
 
 @dataclass
 class AwsPlan:
-    """Everything the AWS SigV4 hop contributes: the per-profile k8s-safe names,
-    the Secret manifests (real per-profile creds + the agent's dummy creds), the
-    dummy Secret's name for mounting, and the AKIA -> sidecar route map."""
+    """Everything the AWS SigV4 hop contributes: the Secret manifests (the real
+    per-AKIA creds for the mitm pod + the agent's dummy creds), the dummy
+    Secret's name for mounting into the agent, and the real-creds Secret's name
+    for mounting into mitm."""
 
     profile_names: list[str]
-    profile_safe: dict[str, str]
     secret_manifests: list[dict]
     dummy_secret_name: str | None
-    sigv4_routes: dict[str, dict]
-
-    @property
-    def has_sigv4(self) -> bool:
-        return bool(self.profile_names)
+    creds_secret_name: str | None
 
 
 @dataclass
@@ -808,24 +739,28 @@ def _ensure_agent_image(
 
 
 def _build_aws_plan(session: Session, profile_names: list[str]) -> AwsPlan:
-    """Resolve real per-profile credentials into Secrets, build the agent's dummy
-    credentials Secret, and map each profile's dummy AKIA to its sidecar route."""
-    profile_safe = build_safe_name_map(profile_names)
-
+    """Build the agent's dummy-credentials Secret and the mitm pod's real-creds
+    Secret (a JSON map from each profile's dummy AKIA to its real credentials)."""
+    dummy_ini, profile_to_akia = dummy_aws_credentials_ini(profile_names)
     secret_manifests: list[dict] = []
-    for profile in profile_names:
-        env = export_aws_profile_env(profile)
+    dummy_secret_name: str | None = None
+    creds_secret_name: str | None = None
+
+    if profile_names:
+        akia_to_creds = {
+            profile_to_akia[profile]: real_aws_credentials(
+                export_aws_profile_env(profile)
+            )
+            for profile in profile_names
+        }
+        creds_secret_name = "aws-sigv4-creds"
         secret_manifests.append(
             secret_manifest(
-                f"aws-creds-{profile_safe[profile]}",
+                creds_secret_name,
                 session.namespace,
-                {"credentials": real_aws_credentials_ini(profile, env)},
+                {"creds.json": sigv4_credentials_json(akia_to_creds)},
             )
         )
-
-    dummy_ini, profile_to_akia = dummy_aws_credentials_ini(profile_names)
-    dummy_secret_name: str | None = None
-    if dummy_ini:
         dummy_secret_name = "agent-aws-creds"
         secret_manifests.append(
             secret_manifest(
@@ -833,19 +768,11 @@ def _build_aws_plan(session: Session, profile_names: list[str]) -> AwsPlan:
             )
         )
 
-    sigv4_routes = {
-        akia: {
-            "upstream_host": f"sigv4-{profile_safe[profile]}",
-            "upstream_port": PROXY_PORT,
-        }
-        for profile, akia in profile_to_akia.items()
-    }
     return AwsPlan(
         profile_names=profile_names,
-        profile_safe=profile_safe,
         secret_manifests=secret_manifests,
         dummy_secret_name=dummy_secret_name,
-        sigv4_routes=sigv4_routes,
+        creds_secret_name=creds_secret_name,
     )
 
 
@@ -943,13 +870,9 @@ def _prepare_debug_dir(args: argparse.Namespace, session: Session) -> Path | Non
     return debug_host_dir
 
 
-def _wait_for_pods(session: Session, aws_plan: AwsPlan) -> None:
+def _wait_for_pods(session: Session) -> None:
     LOGGER.info("waiting for support pods")
     wait_for_pod_ready(session.namespace, "mitm", timeout=90)
-    for profile in aws_plan.profile_names:
-        wait_for_pod_ready(
-            session.namespace, f"sigv4-{aws_plan.profile_safe[profile]}", timeout=90
-        )
     LOGGER.info("waiting for agent pod (kata cold-start)")
     wait_for_pod_ready(session.namespace, "agent", timeout=180)
 
@@ -983,29 +906,17 @@ def _assemble_manifests(
     manifests.extend(kube_secrets.manifests)
     if git_manifest is not None:
         manifests.append(git_manifest)
-    manifests.extend(
-        _network_policies(session.namespace, aws_plan.has_sigv4, ssh_cidrs)
-    )
+    manifests.extend(_network_policies(session.namespace, ssh_cidrs))
     manifests.extend(
         _mitm_manifests(
             session.namespace,
             args.mitmproxy_image,
             args.mitm_runtime_class,
+            aws_creds_secret=aws_plan.creds_secret_name,
             kube_client_certs_secret=kube_secrets.client_certs_secret,
             kube_upstream_ca_secret=kube_secrets.upstream_ca_secret,
         )
     )
-    for profile in aws_plan.profile_names:
-        manifests.extend(
-            _sigv4_manifests(
-                session.namespace,
-                profile,
-                aws_plan.profile_safe[profile],
-                args.sigv4_proxy_image,
-                args.sigv4_runtime_class,
-                args.region,
-            )
-        )
     manifests.append(
         _agent_pod_manifest(
             session.namespace,
@@ -1055,7 +966,6 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
         agent,
         prepared.auth_rules,
         allow_exec=args.allow_exec,
-        aws_sigv4_routes=aws_plan.sigv4_routes,
         kube_rules=kube_plan.rules if kube_plan else None,
     )
 
@@ -1096,7 +1006,7 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
     LOGGER.info(f"applying {len(manifests)} manifests to ns/{session.namespace}")
     apply_manifests(manifests)
 
-    _wait_for_pods(session, aws_plan)
+    _wait_for_pods(session)
 
     LOGGER.info("attaching to agent")
     if contribution.command is None:

@@ -1,13 +1,15 @@
 """AWS profile helpers shared by all agents.
 
-Real AWS credentials live on the host and ride into per-profile
-`aws-sigv4-proxy` sidecar pods as K8s Secrets mounted at
-`/aws/credentials`. The agent container only sees deterministic dummy
-values per profile, derived so the mitm addon can map a signed request
-back to a sidecar by the AKIA in its `Authorization` header.
+Real AWS credentials live on the host and ride into the mitm pod as a single
+K8s Secret: a JSON map from each profile's dummy AKIA to its real credentials.
+The mitm addon loads that map and re-signs requests with the matching real key.
+The agent container only ever sees deterministic dummy values per profile, so
+the mitm addon can map a signed request back to a real identity by the AKIA in
+its `Authorization` header.
 """
 
 import hashlib
+import json
 import logging
 import re
 
@@ -16,13 +18,12 @@ from .process import run_command
 LOGGER = logging.getLogger("agent-uplink")
 
 # 40-char dummy AWS secret. Real secrets are 40 base64-ish chars; SDKs don't
-# validate format. The container signs with these and the signature is
-# discarded by mitmproxy before re-signing in aws-sigv4-proxy.
+# validate format. The container signs with these and the signature is discarded
+# by the mitm addon, which re-signs with the real key.
 _DUMMY_SECRET = "DUMMYsecret0000000000000000000000000000A"
 
-# Profile names are interpolated into INI section headers and into k8s resource
-# names; restrict them to a safe charset so they can't inject INI sections or
-# break manifest names.
+# Profile names are interpolated into INI section headers; restrict them to a
+# safe charset so they can't inject INI sections.
 _PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
@@ -58,31 +59,38 @@ def export_aws_profile_env(profile_name: str) -> dict[str, str]:
     return env
 
 
-def real_aws_credentials_ini(profile_name: str, env: dict[str, str]) -> bytes:
-    """Build a shared-credentials-file (INI) blob for one profile.
+def real_aws_credentials(env: dict[str, str]) -> dict[str, str]:
+    """Pick the real credential fields out of an exported AWS env dict.
 
-    Wrapped in a K8s Secret and mounted into the matching aws-sigv4-proxy
-    sidecar at /aws/credentials.
+    The session token is included only when present (long-lived IAM-user keys
+    don't have one). Raises if the mandatory key/secret are missing.
     """
-    validate_profile_name(profile_name)
-    key_map = {
-        "AWS_ACCESS_KEY_ID": "aws_access_key_id",
-        "AWS_SECRET_ACCESS_KEY": "aws_secret_access_key",
-        "AWS_SESSION_TOKEN": "aws_session_token",
-    }
-    lines = [f"[{profile_name}]"]
-    for env_key, ini_key in key_map.items():
-        if env_key in env:
-            lines.append(f"{ini_key} = {env[env_key]}")
-    lines.append("")
-    return "\n".join(lines).encode()
+    try:
+        creds = {
+            "access_key_id": env["AWS_ACCESS_KEY_ID"],
+            "secret_access_key": env["AWS_SECRET_ACCESS_KEY"],
+        }
+    except KeyError as exc:
+        raise ValueError(f"missing AWS credential field: {exc.args[0]}") from exc
+    if env.get("AWS_SESSION_TOKEN"):
+        creds["session_token"] = env["AWS_SESSION_TOKEN"]
+    return creds
+
+
+def sigv4_credentials_json(akia_to_creds: dict[str, dict[str, str]]) -> bytes:
+    """Serialise the dummy-AKIA -> real-credentials map for the mitm pod.
+
+    Wrapped in a K8s Secret and mounted into the mitm pod, where the addon reads
+    it to re-sign requests. Never mounted into the agent pod.
+    """
+    return json.dumps(akia_to_creds, indent=2).encode("utf-8")
 
 
 def dummy_akia(profile_name: str) -> str:
     """Generate a deterministic dummy AKIA-format access key for a profile.
 
-    The mitmproxy addon parses this back out of the request's Authorization
-    header to determine which aws-sigv4-proxy sidecar to forward to.
+    The mitm addon parses this back out of the request's Authorization header to
+    find the real credentials to re-sign with.
     """
     suffix = hashlib.sha256(profile_name.encode()).hexdigest()[:16].upper()
     return f"AKIA{suffix}"
@@ -109,34 +117,3 @@ def dummy_aws_credentials_ini(
         lines.append(f"aws_secret_access_key = {_DUMMY_SECRET}")
         lines.append("")
     return "\n".join(lines).encode(), profile_to_akia
-
-
-def sanitize_profile_for_k8s_name(profile: str) -> str:
-    """RFC 1123 label rules: [a-z0-9-], starts/ends alnum, max 63 chars.
-    Used in Secret/Pod/Service names."""
-    out = "".join(c.lower() if c.isalnum() else "-" for c in profile)
-    out = out.strip("-") or "default"
-    return out[:63]
-
-
-def build_safe_name_map(profile_names: list[str]) -> dict[str, str]:
-    """Map each profile to its k8s-safe name, validating the name and rejecting
-    collisions in one place.
-
-    Two distinct profiles that sanitise to the same label would emit duplicate
-    Pod/Service manifests, so that case is an error the caller must resolve by
-    renaming a profile.
-    """
-    safe_map: dict[str, str] = {}
-    seen: dict[str, str] = {}
-    for profile in profile_names:
-        validate_profile_name(profile)
-        safe = sanitize_profile_for_k8s_name(profile)
-        if safe in seen:
-            raise ValueError(
-                f"AWS profiles {seen[safe]!r} and {profile!r} both map to the "
-                f"k8s-safe name {safe!r}; rename one to disambiguate"
-            )
-        seen[safe] = profile
-        safe_map[profile] = safe
-    return safe_map
