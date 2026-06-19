@@ -375,13 +375,19 @@ def _assert_set_arg(args, value):
 
 def test_sigv4_manifests_wiring_and_hardening():
     pod = next(
-        m for m in cli._sigv4_manifests("ns", "profile-name", "my-profile", "img:tag", "")
+        m
+        for m in cli._sigv4_manifests(
+            "ns", "profile-name", "my-profile", "img:tag", "", "eu-west-2"
+        )
         if m["kind"] == "Pod"
     )
     assert pod["metadata"]["labels"]["tier"] == "sigv4"
     assert pod["metadata"]["labels"]["managed-by"] == "agent-uplink"
 
     container = pod["spec"]["containers"][0]
+    # --region is passed through; the credential-leaking --log-signing-process
+    # flag must not be present.
+    assert container["args"] == ["--region", "eu-west-2"]
     env = _env_dict(container)
     assert env["AWS_SHARED_CREDENTIALS_FILE"] == "/aws/credentials"
     # AWS_PROFILE is the original profile name; the safe name is only for k8s
@@ -403,6 +409,17 @@ def test_sigv4_manifests_wiring_and_hardening():
     assert sc["runAsUser"] == 1000 and sc["runAsGroup"] == 1000
     assert sc["capabilities"]["drop"] == ["ALL"]
     assert sc["seccompProfile"]["type"] == "RuntimeDefault"
+
+
+def test_sigv4_manifests_region_unset_omits_flag():
+    pod = next(
+        m
+        for m in cli._sigv4_manifests(
+            "ns", "profile-name", "my-profile", "img:tag", "", ""
+        )
+        if m["kind"] == "Pod"
+    )
+    assert "args" not in pod["spec"]["containers"][0]
 
 
 # --------------------------------------------------------------------------- #

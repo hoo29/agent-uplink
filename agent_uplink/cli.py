@@ -118,6 +118,12 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         help="RuntimeClass for sigv4-proxy pods ('' = cluster default)",
     )
     common.add_argument(
+        "--region",
+        default="eu-west-2",
+        help="AWS region passed to sigv4-proxy pods (default eu-west-2; "
+        "pass '' to leave unset and let the proxy derive it per request)",
+    )
+    common.add_argument(
         "-f",
         "--force-rebuild",
         action=argparse.BooleanOptionalAction,
@@ -465,12 +471,17 @@ def _sigv4_manifests(
     safe_name: str,
     image: str,
     runtime_class: str,
+    region: str,
 ) -> list[dict]:
     pod_name = f"sigv4-{safe_name}"
     labels = {"app": pod_name, "tier": "sigv4", "managed-by": "agent-uplink"}
+    # --log-signing-process leaks credentials into pod logs, so it is omitted.
+    args = []
+    if region:
+        args += ["--region", region]
     container = container_spec(
         image=image,
-        args=["--log-failed-requests", "--log-signing-process"],
+        args=args,
         env={
             "AWS_SHARED_CREDENTIALS_FILE": "/aws/credentials",
             "AWS_PROFILE": profile,
@@ -992,6 +1003,7 @@ def _assemble_manifests(
                 aws_plan.profile_safe[profile],
                 args.sigv4_proxy_image,
                 args.sigv4_runtime_class,
+                args.region,
             )
         )
     manifests.append(
