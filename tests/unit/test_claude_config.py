@@ -57,10 +57,13 @@ def _host_settings():
     }
 
 
-def test_settings_drops_sandbox_and_forces_permissions():
+def test_settings_drops_sandbox_and_defaults_to_auto_mode():
     out = json.loads(config.claude_settings_bytes(_host_settings(), {}))
     assert "sandbox" not in out
-    assert out["permissions"] == {"skipDangerousModePermissionPrompt": True}
+    assert out["permissions"] == {
+        "defaultMode": "auto",
+        "skipDangerousModePermissionPrompt": True,
+    }
     assert out["skipDangerousModePermissionPrompt"] is True
 
 
@@ -70,5 +73,7 @@ def test_settings_injects_bedrock_placeholder_over_non_secret_env():
     )
     # The placeholder is injected; the real bearer is added by mitm, never here.
     assert out["env"]["AWS_BEARER_TOKEN_BEDROCK"] == "placeholder"
+    # Required for defaultMode "auto" to take effect on Bedrock.
+    assert out["env"]["CLAUDE_CODE_ENABLE_AUTO_MODE"] == "1"
     # Non-secret config still passes through.
     assert out["env"]["AWS_REGION"] == "us-east-1"

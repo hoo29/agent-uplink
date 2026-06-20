@@ -106,14 +106,20 @@ def get_bedrock_aws_profile_name(claude_config: dict) -> str | None:
 def claude_settings_bytes(claude_config: dict, auth_env: dict[str, str]) -> bytes:
     """Build the in-pod settings.json by copying the host settings.json wholesale,
     with two changes: the top-level `sandbox` key is dropped, and `permissions` is
-    replaced with just `{skipDangerousModePermissionPrompt: true}` (the agent runs
-    with --dangerously-skip-permissions, so host permission lists are irrelevant).
-    `auth_env` (our injected placeholders, e.g. AWS_BEARER_TOKEN_BEDROCK) is merged
-    into env and wins."""
+    replaced with `{defaultMode: "auto", skipDangerousModePermissionPrompt: true}`.
+    The pod's settings.json mounts at ~/.claude/settings.json (user settings) — the
+    only scope from which Claude honours `defaultMode: "auto"`. skipDangerousMode...
+    keeps Shift+Tab into bypassPermissions prompt-free (the launch flag is
+    --allow-dangerously-skip-permissions, which enables but does not activate that
+    mode). `auth_env` (our injected placeholders, e.g. AWS_BEARER_TOKEN_BEDROCK and,
+    in bedrock mode, CLAUDE_CODE_ENABLE_AUTO_MODE) is merged into env and wins."""
     settings = dict(claude_config)
     settings.pop("sandbox", None)
     if auth_env:
         settings["env"] = {**(settings.get("env") or {}), **auth_env}
-    settings["permissions"] = {"skipDangerousModePermissionPrompt": True}
+    settings["permissions"] = {
+        "defaultMode": "auto",
+        "skipDangerousModePermissionPrompt": True,
+    }
     settings["skipDangerousModePermissionPrompt"] = True
     return json.dumps(settings, indent=2).encode("utf-8")

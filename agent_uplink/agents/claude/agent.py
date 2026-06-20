@@ -25,8 +25,17 @@ from .config import (
 # a fake .credentials.json instead, so it has no entry here. Real credentials
 # are added by mitm header injection (see prepare()) and never enter the
 # container.
+#
+# CLAUDE_CODE_ENABLE_AUTO_MODE=1 (bedrock only): permission mode "auto" is off
+# on Bedrock until this is set, and defaultMode "auto" is ignored without it.
+# On the Anthropic API auto mode is available by default, so anthropic needs no
+# entry. (Bedrock supports auto only on Opus 4.7/4.8; other models fall back to
+# the default mode, with bypassPermissions still reachable via Shift+Tab.)
 _AUTH_MODE_ENV: dict[str, dict[str, str]] = {
-    "bedrock": {"AWS_BEARER_TOKEN_BEDROCK": "placeholder"},
+    "bedrock": {
+        "AWS_BEARER_TOKEN_BEDROCK": "placeholder",
+        "CLAUDE_CODE_ENABLE_AUTO_MODE": "1",
+    },
 }
 
 _SETTINGS_SECRET = "claude-settings"
@@ -78,12 +87,22 @@ class ClaudeAgent(Agent):
             help="Configure container for AWS Bedrock bearer-token auth",
         )
         parser.add_argument(
+            "--maven",
+            action="store_true",
+            help="Mount the host's ~/.m2 (settings.xml read-only, repository "
+            "read-write) and point the in-pod Maven JVM at mitm. Off by default; "
+            "equivalent to --mount-ro ~/.m2/settings.xml --mount-rw ~/.m2/repository "
+            "plus the proxy env Maven needs.",
+        )
+        parser.add_argument(
             "claude_args",
             nargs="*",
             metavar="-- ARG",
             help="Extra args passed verbatim to the `claude` CLI in the pod, after "
-            "a `--` separator (e.g. `-- --resume <id>`, `-- -p \"prompt\"`). "
-            "--dangerously-skip-permissions is always added and need not be repeated.",
+            "a `--` separator (e.g. `-- --resume <id>`, `-- -p \"prompt\"`). The pod "
+            "defaults to permission mode \"auto\"; --allow-dangerously-skip-permissions "
+            "is always added so bypassPermissions stays reachable via Shift+Tab. Pass "
+            "--permission-mode here to override the default.",
         )
 
     def _config(self) -> dict:
@@ -244,23 +263,24 @@ class ClaudeAgent(Agent):
                 }
             )
 
-        # Maven: settings.xml read-only, the local repository read-write so the
-        # agent writes downloaded artifacts straight into the host's real repo.
-        # Gated on the host paths existing, so non-Java sessions are unaffected.
-        m2_dir = Path.home() / ".m2"
-        m2_settings = m2_dir / "settings.xml"
-        if m2_settings.exists():
-            volumes.append(
-                hostpath_volume("m2-settings", str(m2_settings), hp_type="File")
-            )
-            mounts.append(
-                {
-                    "name": "m2-settings",
-                    "mountPath": f"{container_home}/.m2/settings.xml",
-                    "readOnly": True,
-                }
-            )
-        if m2_dir.is_dir():
+        # Maven (opt-in via --maven): settings.xml read-only, the local repository
+        # read-write so the agent writes downloaded artifacts straight into the
+        # host's real repo. Other host configs (e.g. ~/.ansible.cfg) are no longer
+        # auto-mounted — use the generic --mount-ro / --mount-rw flags instead.
+        if getattr(self.args, "maven", False):
+            m2_dir = Path.home() / ".m2"
+            m2_settings = m2_dir / "settings.xml"
+            if m2_settings.exists():
+                volumes.append(
+                    hostpath_volume("m2-settings", str(m2_settings), hp_type="File")
+                )
+                mounts.append(
+                    {
+                        "name": "m2-settings",
+                        "mountPath": f"{container_home}/.m2/settings.xml",
+                        "readOnly": True,
+                    }
+                )
             volumes.append(
                 hostpath_volume(
                     "m2-repo",
@@ -270,21 +290,6 @@ class ClaudeAgent(Agent):
             )
             mounts.append(
                 {"name": "m2-repo", "mountPath": f"{container_home}/.m2/repository"}
-            )
-
-        # Ansible: ~/.ansible.cfg read-only when the host has one, so the in-pod
-        # ansible picks up the user's defaults. Gated on existence, like Maven.
-        ansible_cfg = Path.home() / ".ansible.cfg"
-        if ansible_cfg.is_file():
-            volumes.append(
-                hostpath_volume("ansible-cfg", str(ansible_cfg), hp_type="File")
-            )
-            mounts.append(
-                {
-                    "name": "ansible-cfg",
-                    "mountPath": f"{container_home}/.ansible.cfg",
-                    "readOnly": True,
-                }
             )
 
         # Private registry auth (ECR, etc.) is handled by mitm rules injecting
@@ -317,8 +322,8 @@ class ClaudeAgent(Agent):
         return volumes, mounts
 
     def _container_env(self, cwd: Path) -> dict[str, str]:
-        # Only relevant when the host has a Maven setup; otherwise no-op.
-        if not (Path.home() / ".m2").is_dir():
+        # Only relevant with --maven; otherwise no-op.
+        if not getattr(self.args, "maven", False):
             return {}
         # The Maven JVM does not read HTTPS_PROXY (unlike dockerd), and the pod
         # can egress only to mitm. Point Maven's HTTP client at mitm explicitly.
@@ -358,10 +363,15 @@ class ClaudeAgent(Agent):
     def _container_command(
         self, username: str, debug: bool, extra_args: list[str]
     ) -> list[str]:
-        # -d (debug) then --dangerously-skip-permissions, then any user-supplied
-        # passthrough args (--resume <id>, -p "prompt", ...). Each is shell-quoted
-        # so values can't break out of the `bash -lc` string.
-        argv = (["-d"] if debug else []) + ["--dangerously-skip-permissions"]
+        # -d (debug) then --allow-dangerously-skip-permissions, then any
+        # user-supplied passthrough args (--resume <id>, -p "prompt", ...).
+        # The --allow- variant adds bypassPermissions to the Shift+Tab cycle
+        # WITHOUT activating it: the session starts in the default mode ("auto",
+        # set via settings.json defaultMode), but the user can Shift+Tab to
+        # bypass, and bypass stays reachable on models that don't support auto
+        # (e.g. older Sonnet, where auto falls back to the default mode). Each
+        # arg is shell-quoted so values can't break out of the `bash -lc` string.
+        argv = (["-d"] if debug else []) + ["--allow-dangerously-skip-permissions"]
         argv += extra_args
         claude_args = " ".join(shlex.quote(a) for a in argv)
         # PID 1 runs as root so it can start dockerd; drop to the agent user
