@@ -325,11 +325,11 @@ def mitm(ns: str, *, ssl_insecure: bool = True, aws_creds_secret: str | None = N
 
 
 def network_policies(
-    ns: str, *, ssh_cidrs: list[str] | None = None
+    ns: str, *, ssh_cidrs: list[str] | None = None, ssh_relay: bool = False
 ) -> list[dict]:
     """The real per-session NetworkPolicies (default-deny, agent-egress,
-    mitm-policy)."""
-    return cli._network_policies(ns, ssh_cidrs)
+    mitm-policy, and the ssh-agent holder ingress when ssh_relay)."""
+    return cli._network_policies(ns, ssh_cidrs, ssh_relay=ssh_relay)
 
 
 def real_aws_creds_secret(ns: str, profile: str = TEST_PROFILE) -> dict:
@@ -462,6 +462,116 @@ def tcp_listener(ns: str, name: str, ports: list[int]) -> list[dict]:
         ingress=[{"from": [{"podSelector": {"matchLabels": {"app": "agent"}}}]}],
     )
     return [pod, policy]
+
+
+def ssh_holder(ns: str, *, uid: int = 1000, gid: int = 1000) -> list[dict]:
+    """The real ssh-agent holder Pod+Service (cli._ssh_agent_manifests), built on
+    the probe image (which carries ssh-agent/ssh-add/socat). It mounts the
+    `ssh-agent-keys` Secret — the test must apply that alongside."""
+    return cli._ssh_agent_manifests(ns, TEST_IMAGE, "", uid=uid, gid=gid)
+
+
+def ssh_relay_agent(
+    ns: str,
+    *,
+    ssh_pub_secret: str,
+    pub_filename: str,
+    uid: int = 1000,
+    gid: int = 1000,
+) -> list[dict]:
+    """An agent probe wired for the SSH relay using the *real* sidecar builder
+    (cli._ssh_relay_sidecar): the public key is subPath-mounted into /root/.ssh,
+    SSH_AUTH_SOCK points at the socket the sidecar bridges to the holder, and the
+    private key is nowhere in this pod. Runs as root (the probe image has no
+    dedicated user); the hardened sidecar runs as uid:gid and the shared socket
+    tmpfs is group-writable via fsGroup."""
+    env = cli._agent_env(Path("/root"), "root")
+    env["SSH_AUTH_SOCK"] = cli.SSH_AUTH_SOCK_PATH
+    container = k8s.container_spec(
+        name=AGENT_CONTAINER,
+        image=TEST_IMAGE,
+        command=["sleep", "infinity"],
+        env=env,
+        volume_mounts=[
+            {
+                "name": "ssh-pub",
+                "mountPath": f"/root/.ssh/{pub_filename}",
+                "subPath": pub_filename,
+                "readOnly": True,
+            },
+            {"name": "ssh-sock", "mountPath": "/ssh-agent"},
+        ],
+        security_context={"privileged": True},
+        image_pull_policy="Always",
+        resources=k8s.Resources(memory="256Mi", cpu="500m"),
+    )
+    pod = k8s.pod_manifest(
+        "agent",
+        ns,
+        labels={"app": "agent", "managed-by": "agent-uplink-tests"},
+        spec=k8s.pod_spec(
+            container=container,
+            volumes=[
+                k8s.secret_volume("ssh-pub", ssh_pub_secret),
+                k8s.tmpfs_volume("ssh-sock", "8Mi"),
+            ],
+            pod_security_context={"fsGroup": gid},
+            extra_containers=[cli._ssh_relay_sidecar(TEST_IMAGE, uid, gid)],
+        ),
+    )
+    return [pod]
+
+
+def sshd_host(ns: str, name: str, authorized_key: bytes) -> list[dict]:
+    """A real SSH server target (dropbear): accepts pubkey auth for root with the
+    given public key as authorized_keys. Reachability is governed by the agent's
+    egress policy (the test scopes --ssh-cidr to this pod's IP); an
+    ingress-from-agent policy lets the connection through once egress permits it.
+
+    dropbear (not openssh sshd) because the openssh server package clashes with
+    the openssh client already pinned in the docker:dind base image."""
+    secret = k8s.secret_manifest(
+        f"{name}-authkeys", ns, {"authorized_keys": authorized_key}
+    )
+    # -F foreground, -E log to stderr, -R generate host keys on demand.
+    script = (
+        "set -e\n"
+        "mkdir -p /root/.ssh\n"
+        "chmod 700 /root/.ssh\n"
+        "cat /authkeys/authorized_keys > /root/.ssh/authorized_keys\n"
+        "chmod 600 /root/.ssh/authorized_keys\n"
+        "exec dropbear -F -E -R -p 22\n"
+    )
+    container = k8s.container_spec(
+        name=AGENT_CONTAINER,
+        image=TEST_IMAGE,
+        command=["sh", "-c", script],
+        volume_mounts=[{"name": "authkeys", "mountPath": "/authkeys", "readOnly": True}],
+        image_pull_policy="Always",
+        resources=k8s.Resources(memory="64Mi", cpu="250m"),
+    )
+    container["readinessProbe"] = {
+        "tcpSocket": {"port": 22},
+        "periodSeconds": 1,
+        "initialDelaySeconds": 1,
+    }
+    pod = k8s.pod_manifest(
+        name,
+        ns,
+        labels={"app": name},
+        spec=k8s.pod_spec(
+            container=container,
+            volumes=[k8s.secret_volume("authkeys", f"{name}-authkeys")],
+            restart_policy="Always",
+        ),
+    )
+    policy = k8s.network_policy_manifest(
+        f"allow-{name}-ingress",
+        ns,
+        pod_selector={"matchLabels": {"app": name}},
+        ingress=[{"from": [{"podSelector": {"matchLabels": {"app": "agent"}}}]}],
+    )
+    return [secret, pod, policy]
 
 
 def dummy_aws_secret(ns: str, profiles: list[str]) -> tuple[dict, dict[str, str]]:

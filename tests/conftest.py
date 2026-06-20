@@ -7,13 +7,16 @@ usable kubectl/cluster is present, so `pytest` stays green on a bare checkout.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
+from agent_uplink import sshagent
 from tests.integration import harness
 
 HOST_MITM_CERTS = Path.home() / ".agent_uplink" / "mitm"
@@ -277,6 +280,76 @@ def ssh_session(cluster, test_image, mitm_certs_dir):
             ns, target_ip, 80, desc="ssh egress scoped to :22 only (:80 denied)"
         )
         yield Session(ns=ns, extra={"target_ip": target_ip})
+    finally:
+        harness.delete_namespace(ns)
+
+
+@pytest.fixture(scope="session")
+def ssh_relay_session(cluster, test_image):
+    """The full SSH agent-forwarding relay against a real sshd target, using an
+    ephemeral keypair:
+
+      * holder pod (real cli._ssh_agent_manifests) loads the *private* key into
+        an ssh-agent and bridges its socket to TCP;
+      * agent probe (real cli._ssh_relay_sidecar) gets only the *public* key in
+        ~/.ssh and SSH_AUTH_SOCK pointing at the bridge;
+      * a dummy sshd authorises that public key for root.
+
+    So the agent can authenticate to the sshd host while the private key exists
+    only in the holder. --ssh-cidr is scoped to the sshd pod's IP."""
+    if shutil.which("ssh-keygen") is None:
+        pytest.skip("ssh-keygen not available to mint an ephemeral key")
+    ns = _new_ns()
+    with tempfile.TemporaryDirectory(prefix="autest-sshkeys-") as td:
+        key_dir = Path(td)
+        subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-N", "", "-q",
+             "-f", str(key_dir / "id_ed25519")],
+            check=True,
+        )
+        plan = sshagent.prepare(key_dir)
+    assert plan is not None
+    pub_filename = "id_ed25519.pub"
+    pub_key = plan.agent_files[pub_filename]
+    try:
+        # Stage 1: namespace + sshd target (authorising the ephemeral pubkey), so
+        # its pod IP is known before the ipBlock the NetworkPolicy needs.
+        harness.apply(
+            [harness.namespace(ns), *harness.sshd_host(ns, "sshd-target", pub_key)]
+        )
+        harness.wait_ready(ns, "sshd-target", timeout=150)
+        sshd_ip = harness.get_pod_ip(ns, "sshd-target")
+        # Stage 2: the two SSH Secrets, the holder, policies scoped to the sshd IP
+        # with the relay hop open, and the relay-wired agent.
+        manifests = [
+            harness.k8s.secret_manifest("ssh-agent-keys", ns, plan.private_keys),
+            harness.k8s.secret_manifest("ssh-pub", ns, plan.agent_files),
+            *harness.ssh_holder(ns),
+            *harness.network_policies(
+                ns, ssh_cidrs=[f"{sshd_ip}/32"], ssh_relay=True
+            ),
+            *harness.ssh_relay_agent(
+                ns, ssh_pub_secret="ssh-pub", pub_filename=pub_filename
+            ),
+        ]
+        harness.apply(manifests)
+        harness.wait_ready(ns, "ssh-agent", timeout=150)
+        harness.wait_ready(ns, "agent", timeout=150)
+
+        ssh_cmd = (
+            "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+            "-o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=8 "
+            f"-i /root/.ssh/{pub_filename} root@{sshd_ip} echo RELAY_OK"
+        )
+
+        def _warm():
+            rc, out, err = harness.kexec_sh(ns, "agent", ssh_cmd, timeout=30)
+            return "RELAY_OK" in out, f"rc={rc} out={out.strip()!r} err={err[-200:]}"
+
+        harness.wait_until(_warm, desc="agent authenticates to sshd via the relay")
+        yield Session(
+            ns=ns, extra={"sshd_ip": sshd_ip, "ssh_cmd": ssh_cmd, "pub": pub_filename}
+        )
     finally:
         harness.delete_namespace(ns)
 

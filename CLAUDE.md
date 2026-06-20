@@ -56,7 +56,7 @@ pytest
 pyright
 ```
 
-**Runtime requirements** (must be on PATH): `kubectl`, `docker` (for build + push). `aws` CLI is needed only when `--aws-profiles` is used or when an agent's own config resolves an additional AWS profile (e.g. `claude --bedrock` reads `env.AWS_PROFILE` from `settings.json`).
+**Runtime requirements** (must be on PATH): `kubectl`, `docker` (for build + push). `aws` CLI is needed only when `--aws-profiles` is used or when an agent's own config resolves an additional AWS profile (e.g. `claude --bedrock` reads `env.AWS_PROFILE` from `settings.json`). `ssh-keygen` (OpenSSH client) is needed only when `--ssh-key-dir` is used (to derive public keys host-side).
 
 **Cluster requirements**:
 
@@ -74,7 +74,7 @@ The runtime splits cleanly into two halves:
 
 | Layer | Files | Responsibility |
 |---|---|---|
-| **Generic** | `cli.py`, `k8s.py`, `bootstrap.py`, `rules.py`, `aws.py`, `session.py`, `process.py`, `mitm_addon/`, `default_rules.yaml` | mitm lifecycle, AWS SigV4 re-signing in mitm, K8s manifest assembly, registry + cert bootstrap, session cleanup, rule resolution. Knows nothing about specific agents. |
+| **Generic** | `cli.py`, `k8s.py`, `bootstrap.py`, `rules.py`, `aws.py`, `kube.py`, `git.py`, `sshagent.py`, `session.py`, `process.py`, `mitm_addon/`, `default_rules.yaml` | mitm lifecycle, AWS SigV4 re-signing in mitm, K8s manifest assembly, registry + cert bootstrap, kube/git/ssh wiring, session cleanup, rule resolution. Knows nothing about specific agents. |
 | **Agent** | `agents/base.py` (interface), `agents/<name>/...` (impl) | Image to build, auth flow, fake-creds production, K8s volumes/mounts, agent-specific default rules, per-mode auth-rule injection. |
 
 `cli.py` is the orchestrator. It parses args, picks an `Agent` subclass from the registry, and calls its lifecycle hooks at the right points around the generic plumbing.
@@ -162,6 +162,7 @@ the agent's own config (Claude's `~/.claude/*`), every host integration is expli
 | `agent_uplink/aws.py` | AWS helpers: dummy AKIA, dummy `~/.aws/credentials` INI for the agent, real per-AKIA credentials JSON for the mitm pod, profile env export |
 | `agent_uplink/kube.py` | Kubernetes context resolution: reads host kubeconfig via `kubectl config view`, validates auth method, produces sanitized pod kubeconfig + mitm wiring (allow rules, client certs, upstream CA bundle) |
 | `agent_uplink/rules.py` | Rule resolution: layers agent auth rules + kube rules + user YAML + `agent.default_rules()` + generic defaults (in precedence order, generic last), resolves keyring/exec placeholders, returns JSON bytes |
+| `agent_uplink/sshagent.py` | SSH agent-forwarding relay: splits `--ssh-key-dir` into private keys (holder pod's `ssh-agent`) and public keys + `config` (agent pod); derives missing `.pub` halves |
 | `agent_uplink/session.py` | `Session` dataclass: tracks namespace + session_dir; `cleanup()` is `kubectl delete ns --wait=false` + rmtree |
 | `agent_uplink/reaper.py` | `list` / `clean` subcommands: find session namespaces by `managed-by=agent-uplink`, filter by id/age/all, delete leftovers from killed runs |
 | `agent_uplink/process.py` | `run_command` (piped) + `run_interactive` (stdio-attached) |
@@ -294,17 +295,20 @@ Real AWS credentials are obtained on the host via `aws configure export-credenti
 | Policy | Selector | Effect |
 |---|---|---|
 | `default-deny` | all pods | Deny all ingress + egress unless another policy allows it |
-| `agent-egress` | `app=agent` | Egress only to `app=mitm` on TCP 8080 + `kube-system/kube-dns` on UDP/TCP 53, plus TCP 22 to any `--ssh-cidr` ranges (see SSH egress) |
+| `agent-egress` | `app=agent` | Egress only to `app=mitm` on TCP 8080 + `kube-system/kube-dns` on UDP/TCP 53, plus TCP 22 to any `--ssh-cidr` ranges and the `app=ssh-agent` holder on TCP 8765 when `--ssh-key-dir` is set (see SSH egress) |
 | `mitm-policy` | `app=mitm` | Ingress from `app=agent` on TCP 8080; egress unrestricted (out to the internet, including the real AWS endpoints it re-signs for) |
+| `ssh-agent-policy` | `app=ssh-agent` | Present only with `--ssh-key-dir`: ingress from `app=agent` on TCP 8765 (the signing bridge); no egress (the holder does pure crypto) |
 
 ### SSH egress
 
-By default the agent pod can only reach `mitm` and `kube-dns`, so SSH is blocked. Two flags open a controlled SSH path that **bypasses mitm** (SSH is not HTTP — there is no allow-list, rule engine, or credential injection for it; it is a different, weaker trust model than the rest of agent-uplink):
+By default the agent pod can only reach `mitm` and `kube-dns`, so SSH is blocked. The SSH *transport* still **bypasses mitm** (SSH is not HTTP — there is no allow-list, rule engine, or per-request credential injection for it; reachability is the only control). Two flags open it:
 
 - `--ssh-cidr <CIDR> [<CIDR> ...]` — adds an `agent-egress` rule allowing **TCP 22 only** to those `ipBlock` CIDRs (a bare IP becomes `/32`; CIDRs are normalised to their network address). Everything else stays denied, and those CIDRs are reachable on no other port. This `ipBlock` set is the **sole** control on SSH egress, so scope it tightly. NetworkPolicy matches resolved IPs, not DNS names — `kube-dns` still resolves the target, but the returned IP must fall inside an allowed CIDR (mind DNS/CDN churn for hosts like GitHub).
-- `--ssh-key-dir <DIR>` — mounts a host directory of SSH private keys **read-only** at the agent user's `~/.sshclaude` (the directory need not be named `.ssh`). Key filenames are arbitrary and nothing is assumed: tell the agent which key to use (`ssh -i ~/.sshclaude/<key>`), or ship a `config` file in the dir mapping hosts to keys — the image's `/etc/ssh/ssh_config.d/agent-uplink.conf` includes it. Keeping the keys out of `~/.ssh` leaves that directory writable so ssh can create `known_hosts` itself; read-only keeps the untrusted agent from tampering with the keys. The container user shares the host UID (`USER_UID` build arg), so `0600` host-owned keys are readable.
+- `--ssh-key-dir <DIR>` — the private keys **never enter the agent pod**. They are loaded into an `ssh-agent` running in a dedicated **holder pod** (`app=ssh-agent`), and the agent reaches that agent over a `socat` TCP bridge, so it can request signatures but can never read the key bytes. This matters because the agent container is `privileged`/`CAP_SYS_ADMIN` inside the kata guest — a same-pod sidecar would not be a boundary against it, so the holder is a separate, hardened pod (non-root, read-only root, `drop=[ALL]`), modelled on mitm. Host→key mapping stays client-side: for each private key a `<name>.pub` is derived host-side via `ssh-keygen -y` (which also rejects passphrase-protected keys, since the holder's `ssh-add` runs non-interactively) and, with any `config`, dropped file-by-file into the agent's `~/.ssh` via per-file subPath mounts; the agent gets `SSH_AUTH_SOCK` pointing at the bridged socket. Per-file mounts (not a single read-only mount over `~/.ssh`, which the image pre-creates user-owned) keep the directory writable so ssh can create `known_hosts`, and `~/.ssh/config` is read by default with no Include. Pin a key to a host with `IdentityFile ~/.ssh/<name>.pub` + `IdentitiesOnly yes`; ssh loads the public half locally and the holder signs.
 
-The two flags are independent but want each other: keys without a CIDR can't reach anything on 22, and a CIDR without keys opens egress with nothing to authenticate with — each case logs a warning. Implementation: `--ssh-cidr` flows into `_network_policies` (`cli.py`) and `--ssh-key-dir` into `_agent_pod_manifest` (`cli.py`); both are orchestrator-level (universal) concerns, so no `Agent` subclass is involved.
+Topology: the holder runs `ssh-agent` + `socat TCP-LISTEN→UNIX` (port 8765); a `ssh-agent-relay` sidecar in the agent pod runs `socat UNIX-LISTEN→TCP` to present the socket locally. `agent-egress` adds a rule to the holder on 8765; `ssh-agent-policy` accepts that ingress and grants the holder no egress (it does pure crypto). The actual SSH connection still leaves the *agent* pod via the `--ssh-cidr` rule — only signing is delegated. What this buys: key **confidentiality** (no theft/reuse). What it does not buy: per-host authorization — anyone who can reach the agent socket can sign for any host the key works on, so the CIDR set remains the egress control (tighten further with OpenSSH 8.9+ destination-constrained keys if needed).
+
+The two flags are independent but want each other: keys without a CIDR can't reach anything on 22, and a CIDR without keys opens egress with nothing to authenticate with — each case logs a warning. Implementation: `--ssh-cidr` flows into `_network_policies`, `--ssh-key-dir` is split by `agent_uplink/sshagent.py` into the holder + agent Secrets and wired in `cli.py` (`_ssh_agent_manifests`, the relay sidecar in `_agent_pod_manifest`); both are orchestrator-level (universal) concerns, so no `Agent` subclass is involved. The holder/sidecar reuse the agent image purely for its `ssh-agent`/`socat` binaries.
 
 ### Git over HTTPS
 

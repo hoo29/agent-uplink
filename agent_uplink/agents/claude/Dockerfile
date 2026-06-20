@@ -42,6 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   procps \
   python3 \
   python3-venv \
+  socat \
   tofu \
   unzip \
   util-linux \
@@ -92,12 +93,12 @@ COPY --chmod=0755 dockerd-entrypoint.sh /usr/local/bin/dockerd-entrypoint.sh
 # is mounted by the orchestrator (see agent_uplink/git.py).
 COPY gitconfig /etc/gitconfig
 
-# Point ssh at keys mounted read-only at ~/.sshclaude (--ssh-key-dir) so ~/.ssh
-# stays writable for known_hosts. Ubuntu's /etc/ssh/ssh_config includes this dir.
-# The Include path must be absolute (ssh only expands '~' in user configs, not
-# system-wide ones), so bake in the agent user's home.
-COPY ssh_config /etc/ssh/ssh_config.d/agent-uplink.conf
-RUN sed -i "s|__USERNAME__|${USERNAME}|" /etc/ssh/ssh_config.d/agent-uplink.conf
+# Pre-create ~/.ssh owned by the agent user (mode 700) so the orchestrator's
+# per-file subPath mounts of public keys + config (--ssh-key-dir) drop into an
+# existing, user-owned dir. That keeps the directory itself writable, so ssh can
+# create known_hosts, while the mounted files stay read-only. ssh reads
+# ~/.ssh/config by default.
+RUN install -d -m 0700 -o "${USERNAME}" -g "${USER_GID}" "/home/${USERNAME}/.ssh"
 
 ENV SHELL=/bin/bash
 ENV EDITOR=vim
