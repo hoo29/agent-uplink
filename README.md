@@ -30,6 +30,9 @@ flowchart LR
         subgraph mitm_pod["Pod: mitm"]
             mitm["mitmproxy<br/>+ filter addon<br/>(re-signs AWS SigV4)"]
         end
+        subgraph ssh_pod["Pod: ssh-agent (--ssh-key-dir)"]
+            sshagent["ssh-agent<br/>(holds private keys)"]
+        end
         rules[("Secret: rules-json")]
         certs[("Secret: mitm-certs")]
         creds[("Secret: aws-sigv4-creds<br/>akia → real creds")]
@@ -48,7 +51,8 @@ flowchart LR
     agent -->|HTTPS_PROXY=http://mitm:8080| mitm
     agent -.->|"git@host: / ssh://git@host"| gitrw
     gitrw -.->|cloned over HTTPS| mitm
-    agent -.->|TCP 22 only, --ssh-cidr<br/>bypasses mitm| internet
+    agent -.->|"SSH_AUTH_SOCK<br/>sign via holder (no keys in agent)"| sshagent
+    agent -.->|"TCP 22 only, --ssh-cidr<br/>transport bypasses mitm"| internet
     mitm -->|allowed + injected| internet
     mitm -->|re-signed with real creds<br/>by dummy AKIA| aws
 ```
@@ -167,18 +171,21 @@ pod).
 
 ### SSH egress
 
-By default the agent pod reaches only `mitm` and `kube-dns`, so SSH is blocked. Two flags open a controlled SSH path that
-**bypasses mitm** — SSH is not HTTP, so there is no allow-list, rule engine, or credential injection for it (a weaker trust
-model than the rest of agent-uplink):
+By default the agent pod reaches only `mitm` and `kube-dns`, so SSH is blocked. The SSH *transport* still **bypasses mitm** —
+SSH is not HTTP, so there is no allow-list or rule engine for it; reachability is the only control. Two flags open it:
 
 - `--ssh-cidr <CIDR> [<CIDR> ...]` — allows **TCP 22 only** to those CIDRs (a bare IP becomes `/32`). This is the sole control
-  on SSH egress, so scope it tightly. NetworkPolicy matches resolved IPs, not DNS names, so mind DNS/CDN churn for hosts like
-  GitHub.
-- `--ssh-key-dir <DIR>` — mounts a host directory of SSH private keys **read-only** at the agent user's `~/.sshclaude`. Key
-  names are arbitrary: tell the agent which key to use (`ssh -i ~/.sshclaude/<key>`) or ship a `config` in the dir. `~/.ssh`
-  stays writable so ssh can create `known_hosts` itself. The container user shares the host UID, so `0600` host keys are readable.
+  on which hosts SSH can reach, so scope it tightly. NetworkPolicy matches resolved IPs, not DNS names, so mind DNS/CDN churn
+  for hosts like GitHub.
+- `--ssh-key-dir <DIR>` — the **private keys never enter the agent pod**. They are loaded into an `ssh-agent` in a separate,
+  hardened *holder* pod, and the agent reaches it over a socat bridge, so it can sign but never read the key bytes. (The holder
+  is a separate pod because the privileged agent container could read a same-pod sidecar's memory.) The agent gets only the
+  public keys + any `config`, placed in the standard `~/.ssh`; signing happens in the holder. Pin a key to a host with
+  `IdentityFile ~/.ssh/<name>.pub` + `IdentitiesOnly yes`. Keys must be passphraseless (the holder loads them non-interactively).
 
-The flags are independent but want each other (each logs a warning if used alone).
+This protects key **confidentiality** — a compromised agent can't steal the keys — but not authorization: the agent can still
+use a key against any host the `--ssh-cidr` set allows, so that CIDR set remains the egress control. The flags are independent
+but want each other (each logs a warning if used alone).
 
 ### Git over HTTPS
 
@@ -272,7 +279,9 @@ single-user tool, and the agent is assumed cooperative. Known limitations of the
   via GET query strings/headers. For untrusted workloads, run `--no-default-rules` with an explicit allow-list.
 - DNS to kube-dns is allowed (`^`) — a residual exfiltration channel the mitm allow-list never sees.
 - `--allow-exec` lets a `--rules` file run host shell commands at startup - only enable it for rules files you trust.
-- `--ssh-cidr` opens TCP 22 to the given CIDRs **bypassing mitm entirely** (no allow-list or rule engine for SSH) — scope the CIDRs tightly.
+- `--ssh-cidr` opens TCP 22 to the given CIDRs **bypassing mitm entirely** (no allow-list or rule engine for the SSH transport)
+  — scope the CIDRs tightly. With `--ssh-key-dir` the private keys stay in a separate holder pod and never enter the agent (it
+  signs via an ssh-agent bridge), so the keys can't be stolen, but they can still be used against any host the CIDRs allow.
 - For the `claude` agent, the host `~/.claude/settings.json` is currently copied into the pod **wholesale** (only the top-level
   `sandbox` key is dropped and `permissions` is replaced). Secret-bearing keys — `apiKeyHelper` and any secret `env` vars —
   therefore **do** reach the agent pod's `settings.json`, so keep secrets out of your host `settings.json`.

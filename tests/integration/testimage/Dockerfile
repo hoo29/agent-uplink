@@ -1,10 +1,14 @@
-# Single image used by the integration tests for three roles:
+# Single image used by the integration tests for several roles:
 #   * agent-probe  — a stand-in for the real agent pod (labelled app=agent) that
 #     we exec curl/nc/dig into to observe egress + injection behaviour.
 #   * echo-upstream — a tiny HTTP(S) server that reflects the request headers it
 #     received, so we can assert what mitm forwarded/injected/stripped.
 #   * dockerd-target — proves an in-pod dockerd runs under privileged + the
 #     default (runc) runtime, i.e. without kata installed.
+#   * ssh-agent holder + relay sidecar — bash + socat run the production relay
+#     scripts; the base already ships the openssh client (ssh/ssh-agent/ssh-add).
+#   * sshd-target — dropbear is a self-contained SSH server for the relay test
+#     (the openssh server package clashes with the base image's pinned openssh).
 #
 # Built FROM docker:dind so the same image can host the in-pod dockerd smoke test.
 # The mitmproxy CA (public cert only) is baked in so curl trusts mitm's TLS
@@ -18,7 +22,9 @@ RUN apk add --no-cache \
     python3 \
     socat \
     netcat-openbsd \
-    ca-certificates
+    ca-certificates \
+    bash \
+    dropbear
 
 # Trust mitm's CA so `curl https://...` validates the intercepted TLS without -k.
 COPY mitm-ca.pem /usr/local/share/ca-certificates/mitm-ca.crt

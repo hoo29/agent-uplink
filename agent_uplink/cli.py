@@ -48,12 +48,14 @@ from .k8s import (
     secret_volume,
     service_manifest,
     set_kube_context,
+    tmpfs_volume,
     wait_for_pod_ready,
 )
 from .kube import KubePlan, resolve as resolve_kube
 from .rules import resolve as resolve_rules
 from .session import Session, handle_signal
 from . import reaper
+from . import sshagent
 
 LOGGER = logging.getLogger("agent-uplink")
 
@@ -64,6 +66,8 @@ DEFAULT_AGENT_RUNTIME_CLASS = "kata-clh"
 DEFAULT_DEPLOY_CONTEXT = "local-k8s-admin"
 
 PROXY_PORT = 8080  # mitm listens here
+SSH_AGENT_PORT = 8765  # ssh-agent holder's socat TCP bridge
+SSH_AUTH_SOCK_PATH = "/ssh-agent/agent.sock"  # bridged agent socket in the agent pod
 
 AGENT_CONTAINER_NAME = "main"
 
@@ -150,9 +154,12 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         metavar="DIR",
-        help="Host directory of SSH private keys to mount read-only at the "
-        "agent's ~/.sshclaude (keys keep their names; use ssh -i, or ship a "
-        "config in the dir). ~/.ssh stays writable so known_hosts can be created",
+        help="Host directory of SSH private keys. The private keys are loaded "
+        "into an ssh-agent in a separate holder pod and never enter the agent "
+        "pod; the agent gets only the public keys + any `config` (in "
+        "~/.ssh) and signs via the holder. Pin a key to a host with "
+        "IdentityFile ~/.ssh/<name>.pub + IdentitiesOnly yes. Keys must be "
+        "passphraseless (the holder loads them non-interactively).",
     )
     common.add_argument(
         "--git-https-rewrite",
@@ -496,6 +503,117 @@ def _mitm_manifests(
     return [pod, svc]
 
 
+def _ssh_agent_manifests(
+    ns: str, image: str, runtime_class: str, *, uid: int, gid: int
+) -> list[dict]:
+    """The SSH key holder: a hardened pod running `ssh-agent` with the private
+    keys (mounted as the `ssh-agent-keys` Secret), its socket bridged to TCP by
+    socat so the agent pod can request signatures without seeing the keys. Reuses
+    the agent image purely for its `ssh-agent`/`ssh-add`/`socat` binaries; the
+    container itself runs unprivileged, non-root, read-only-root like mitm."""
+    labels = _label("ssh-agent")
+    sock = "/run/ssh-agent/agent.sock"
+    # ssh-agent daemonises onto `sock`; load every key the Secret provides (the
+    # `*` glob skips the Secret's dotfile bookkeeping, and nullglob makes an empty
+    # dir a no-op rather than a literal `/keys/*`), then bridge the socket to TCP
+    # for the agent pod. Keys are piped via `ssh-add -` (stdin) because ssh-add
+    # refuses a key file that is group/world-readable, and the Secret mount is
+    # mode 0644 — reading from stdin skips that permission check while the key
+    # bytes still never leave this pod. A per-key failure is logged and skipped
+    # so one bad key cannot strand the others; the pod fails (and is retried) only
+    # if no key loads at all. `rm -f` clears any socket left by a prior container
+    # start (the tmpfs survives in-place restarts), which would otherwise make
+    # `ssh-agent -a` fail to bind.
+    script = (
+        "set -e\n"
+        "shopt -s nullglob\n"
+        f"rm -f {sock}\n"
+        f"ssh-agent -a {sock} >/dev/null\n"
+        "loaded=0\n"
+        "for k in /keys/*; do\n"
+        f'  if SSH_AUTH_SOCK={sock} ssh-add - < "$k"; then\n'
+        "    loaded=$((loaded + 1))\n"
+        "  else\n"
+        '    echo "agent-uplink: failed to load SSH key $(basename "$k")" >&2\n'
+        "  fi\n"
+        "done\n"
+        '[ "$loaded" -gt 0 ] || { '
+        'echo "agent-uplink: no SSH keys could be loaded" >&2; exit 1; }\n'
+        f"exec socat TCP-LISTEN:{SSH_AGENT_PORT},fork,reuseaddr UNIX-CONNECT:{sock}\n"
+    )
+    container = container_spec(
+        name="ssh-agent",
+        image=image,
+        command=["bash", "-c", script],
+        volume_mounts=[
+            {"name": "keys", "mountPath": "/keys", "readOnly": True},
+            {"name": "sock", "mountPath": "/run/ssh-agent"},
+        ],
+        security_context=hardened_container_security_context(uid=uid, gid=gid),
+        resources=Resources(
+            memory="128Mi", cpu="250m", memory_request="32Mi", cpu_request="20m"
+        ),
+        ports=[{"containerPort": SSH_AGENT_PORT, "protocol": "TCP"}],
+        image_pull_policy="Always",
+    )
+    # Ready only once the agent is reachable and holds at least one key; `ssh-add
+    # -l` exits 0 only then. An exec probe is used (not tcpSocket) so the kubelet
+    # check is not blocked by ssh-agent-policy's ingress restriction. This makes a
+    # key-load failure surface as a readiness timeout rather than silently later.
+    container["readinessProbe"] = {
+        "exec": {"command": ["sh", "-c", f"SSH_AUTH_SOCK={sock} ssh-add -l >/dev/null"]},
+        "initialDelaySeconds": 1,
+        "periodSeconds": 2,
+    }
+    spec = pod_spec(
+        container=container,
+        volumes=[
+            secret_volume("keys", "ssh-agent-keys"),
+            # Unix socket on tmpfs: virtio-fs-backed emptyDir is unreliable for
+            # sockets, and the root fs is read-only.
+            tmpfs_volume("sock", "8Mi"),
+        ],
+        runtime_class=runtime_class or None,
+        pod_security_context={"fsGroup": gid},
+    )
+    pod = pod_manifest("ssh-agent", ns, labels=labels, spec=spec)
+    svc = service_manifest(
+        "ssh-agent", ns, selector=labels, port=SSH_AGENT_PORT, labels=labels
+    )
+    return [pod, svc]
+
+
+def _ssh_relay_sidecar(image: str, uid: int, gid: int) -> dict:
+    """Sidecar in the agent pod that presents a local unix socket bridged to the
+    holder's ssh-agent over TCP. Holds no secret (it only relays), so a hardened
+    context is enough even next to the privileged agent container."""
+    # `unlink-early` clears any socket left by a prior container start (the tmpfs
+    # survives in-place restarts), which would otherwise make the bind fail.
+    script = (
+        f"exec socat UNIX-LISTEN:{SSH_AUTH_SOCK_PATH},fork,unlink-early,perm=0666 "
+        f"TCP-CONNECT:ssh-agent:{SSH_AGENT_PORT}\n"
+    )
+    sidecar = container_spec(
+        name="ssh-agent-relay",
+        image=image,
+        command=["bash", "-c", script],
+        volume_mounts=[{"name": "ssh-sock", "mountPath": "/ssh-agent"}],
+        security_context=hardened_container_security_context(uid=uid, gid=gid),
+        resources=Resources(
+            memory="64Mi", cpu="200m", memory_request="16Mi", cpu_request="10m"
+        ),
+        image_pull_policy="Always",
+    )
+    # Gate the agent pod's readiness on the bridged socket existing, so the agent
+    # never sees SSH_AUTH_SOCK pointing at a not-yet-created socket on attach.
+    sidecar["readinessProbe"] = {
+        "exec": {"command": ["sh", "-c", f"test -S {SSH_AUTH_SOCK_PATH}"]},
+        "initialDelaySeconds": 1,
+        "periodSeconds": 2,
+    }
+    return sidecar
+
+
 def _agent_env(cwd: Path, username: str) -> dict[str, str]:
     """Universal env for the agent pod: force every client through mitm. Built
     from a single proxy address so the upper/lower-case pairs can't drift."""
@@ -527,7 +645,8 @@ class AgentMounts:
     the agent's own PodContribution. Grouped so the manifest builder takes one
     argument instead of a tail of nullable secret names."""
 
-    ssh_key_dir: Path | None = None
+    ssh_pub_secret: str | None = None
+    ssh_pub_files: list[str] = field(default_factory=list)
     kube_config_secret: str | None = None
     git_config_secret: str | None = None
     extra_mounts: list[HostMount] = field(default_factory=list)
@@ -542,31 +661,37 @@ def _agent_pod_manifest(
     gid: int,
     runtime_class: str,
     pod_mounts: AgentMounts | None = None,
+    *,
+    uid: int,
 ) -> dict:
     pod_mounts = pod_mounts or AgentMounts()
     env = _agent_env(cwd, username)
     env.update(contribution.env)
     volumes = list(contribution.volumes)
     mounts = list(contribution.mounts)
-    # SSH private keys: the host dir is mounted read-only at the agent user's
-    # ~/.sshclaude (not ~/.ssh). Key filenames are arbitrary, so the agent is
-    # told which key to use (ssh -i ~/.sshclaude/<key>) or a `config` shipped in
-    # the dir maps hosts to keys (the image's ssh_config includes it). Keeping
-    # keys out of ~/.ssh leaves that dir writable so ssh can create known_hosts
-    # itself; read-only keeps the untrusted agent from tampering with the host
-    # keys. The container user shares the host UID (Dockerfile USER_UID), so
-    # 0600 host keys are readable. Reachability is gated by the --ssh-cidr rule.
-    if pod_mounts.ssh_key_dir is not None:
-        volumes.append(
-            hostpath_volume("ssh-keys", str(pod_mounts.ssh_key_dir), hp_type="Directory")
-        )
-        mounts.append(
-            {
-                "name": "ssh-keys",
-                "mountPath": f"/home/{username}/.sshclaude",
-                "readOnly": True,
-            }
-        )
+    extra_containers: list[dict] = []
+    # SSH key holder relay: the private keys never enter this pod. The agent gets
+    # only the public keys + the user's `config`, dropped into the standard
+    # ~/.ssh via per-file subPath mounts so the directory itself stays writable
+    # (ssh creates known_hosts there) and ssh reads ~/.ssh/config by default.
+    # SSH_AUTH_SOCK points at a unix socket the ssh-agent-relay sidecar bridges to
+    # the holder pod's ssh-agent over TCP.
+    if pod_mounts.ssh_pub_secret is not None:
+        ssh_dir = f"/home/{username}/.ssh"
+        volumes.append(secret_volume("ssh-pub", pod_mounts.ssh_pub_secret))
+        for fname in pod_mounts.ssh_pub_files:
+            mounts.append(
+                {
+                    "name": "ssh-pub",
+                    "mountPath": f"{ssh_dir}/{fname}",
+                    "subPath": fname,
+                    "readOnly": True,
+                }
+            )
+        volumes.append(tmpfs_volume("ssh-sock", "8Mi"))
+        mounts.append({"name": "ssh-sock", "mountPath": "/ssh-agent"})
+        env["SSH_AUTH_SOCK"] = SSH_AUTH_SOCK_PATH
+        extra_containers.append(_ssh_relay_sidecar(full_image, uid, gid))
     # Sanitized kubeconfig: trusts mitm CA, carries placeholder creds. Mounted
     # outside the home dir so readOnlyRootFilesystem doesn't block the mount.
     # kubectl's cache writes (~/.kube/cache) are non-fatal when they fail.
@@ -622,14 +747,15 @@ def _agent_pod_manifest(
         volumes=volumes,
         runtime_class=runtime_class or None,
         pod_security_context={"fsGroup": gid},
+        extra_containers=extra_containers or None,
     )
     return pod_manifest("agent", ns, labels=_label("agent"), spec=spec)
 
 
 def _network_policies(
-    ns: str, ssh_cidrs: list[str] | None = None
+    ns: str, ssh_cidrs: list[str] | None = None, *, ssh_relay: bool = False
 ) -> list[dict]:
-    """Default-deny + agent-egress + mitm-ingress."""
+    """Default-deny + agent-egress + mitm-ingress (+ ssh-agent holder ingress)."""
     # Agent egress: mitm:8080 and kube-dns by default; optionally TCP 22 to an
     # explicit CIDR set.
     agent_egress: list[dict] = [
@@ -664,6 +790,17 @@ def _network_policies(
                 "ports": [{"protocol": "TCP", "port": 22}],
             }
         )
+    # SSH key holder: the agent reaches the ssh-agent-relay sidecar locally, but
+    # that sidecar egresses to the holder pod for signing. Only signatures cross
+    # this hop; the actual SSH connection still leaves the agent pod via the
+    # --ssh-cidr rule above.
+    if ssh_relay:
+        agent_egress.append(
+            {
+                "to": [{"podSelector": {"matchLabels": {"app": "ssh-agent"}}}],
+                "ports": [{"protocol": "TCP", "port": SSH_AGENT_PORT}],
+            }
+        )
     policies = [
         # Deny everything by default in this namespace.
         network_policy_manifest(
@@ -695,6 +832,22 @@ def _network_policies(
             egress=[{}],
         ),
     ]
+    # ssh-agent holder: accepts the signing bridge from the agent only; no egress
+    # (default-deny covers it — the agent does pure crypto, no network).
+    if ssh_relay:
+        policies.append(
+            network_policy_manifest(
+                "ssh-agent-policy",
+                ns,
+                pod_selector={"matchLabels": {"app": "ssh-agent"}},
+                ingress=[
+                    {
+                        "from": [{"podSelector": {"matchLabels": {"app": "agent"}}}],
+                        "ports": [{"protocol": "TCP", "port": SSH_AGENT_PORT}],
+                    }
+                ],
+            )
+        )
     return policies
 
 
@@ -908,9 +1061,14 @@ def _prepare_debug_dir(args: argparse.Namespace, session: Session) -> Path | Non
     return debug_host_dir
 
 
-def _wait_for_pods(session: Session) -> None:
+def _wait_for_pods(session: Session, *, ssh_relay: bool = False) -> None:
     LOGGER.info("waiting for support pods")
     wait_for_pod_ready(session.namespace, "mitm", timeout=90)
+    if ssh_relay:
+        # The holder's readiness probe (`ssh-add -l`) passes only once a key is
+        # loaded and the agent is reachable, so a key-load failure surfaces as a
+        # timeout here rather than as a silent "ssh just doesn't work" on attach.
+        wait_for_pod_ready(session.namespace, "ssh-agent", timeout=90)
     LOGGER.info("waiting for agent pod (kata cold-start)")
     wait_for_pod_ready(session.namespace, "agent", timeout=180)
 
@@ -930,24 +1088,28 @@ def _assemble_manifests(
     git_secret_name: str | None,
     cwd: Path,
     username: str,
+    uid: int,
     gid: int,
     ssh_cidrs: list[str],
-    ssh_key_dir: Path | None,
+    ssh_plan: sshagent.SshAgentPlan | None,
     extra_mounts: list[HostMount],
 ) -> list[dict]:
     """The full manifest set in apply order: namespace + mitm inputs, all
     Secrets, NetworkPolicies, support pods, then the agent pod."""
+    ns = session.namespace
     manifests = _base_manifests(session, rules_bytes, mitm_certs)
     manifests.extend(aws_plan.secret_manifests)
     for name, files in prepared.secret_payloads.items():
-        manifests.append(secret_manifest(name, session.namespace, files))
+        manifests.append(secret_manifest(name, ns, files))
     manifests.extend(kube_secrets.manifests)
     if git_manifest is not None:
         manifests.append(git_manifest)
-    manifests.extend(_network_policies(session.namespace, ssh_cidrs))
+    manifests.extend(
+        _network_policies(ns, ssh_cidrs, ssh_relay=ssh_plan is not None)
+    )
     manifests.extend(
         _mitm_manifests(
-            session.namespace,
+            ns,
             args.mitmproxy_image,
             args.mitm_runtime_class,
             aws_creds_secret=aws_plan.creds_secret_name,
@@ -955,9 +1117,17 @@ def _assemble_manifests(
             kube_upstream_ca_secret=kube_secrets.upstream_ca_secret,
         )
     )
+    if ssh_plan is not None:
+        manifests.append(secret_manifest("ssh-agent-keys", ns, ssh_plan.private_keys))
+        manifests.append(secret_manifest("ssh-pub", ns, ssh_plan.agent_files))
+        manifests.extend(
+            _ssh_agent_manifests(
+                ns, full_image, args.mitm_runtime_class, uid=uid, gid=gid
+            )
+        )
     manifests.append(
         _agent_pod_manifest(
-            session.namespace,
+            ns,
             full_image,
             contribution,
             cwd,
@@ -965,11 +1135,13 @@ def _assemble_manifests(
             gid,
             args.agent_runtime_class,
             AgentMounts(
-                ssh_key_dir=ssh_key_dir,
+                ssh_pub_secret="ssh-pub" if ssh_plan is not None else None,
+                ssh_pub_files=list(ssh_plan.agent_files) if ssh_plan is not None else [],
                 kube_config_secret=kube_secrets.config_secret,
                 git_config_secret=git_secret_name,
                 extra_mounts=extra_mounts,
             ),
+            uid=uid,
         )
     )
     return manifests
@@ -980,6 +1152,18 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
     cwd = Path.cwd()
     validate_cwd(username, cwd)
     ssh_cidrs, ssh_key_dir = validate_ssh_args(args.ssh_cidr, args.ssh_key_dir)
+    ssh_plan = sshagent.prepare(ssh_key_dir) if ssh_key_dir is not None else None
+    if ssh_plan is not None and os.getuid() == 0:
+        raise ValueError(
+            "--ssh-key-dir is unsupported when running agent-uplink as root: the "
+            "hardened holder/relay pods run runAsNonRoot with runAsUser=0, which "
+            "the kubelet refuses to start. Run as a non-root host user."
+        )
+    if ssh_key_dir is not None and ssh_plan is None:
+        LOGGER.warning(
+            "--ssh-key-dir %s holds no private keys: no ssh-agent relay started",
+            ssh_key_dir,
+        )
     extra_mounts = validate_mounts(username, cwd, args.mount_rw, args.mount_ro)
 
     mitm_dir = STATE_DIR / "mitm"
@@ -1035,16 +1219,17 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
         git_secret_name=git_secret_name,
         cwd=cwd,
         username=username,
+        uid=os.getuid(),
         gid=os.getgid(),
         ssh_cidrs=ssh_cidrs,
-        ssh_key_dir=ssh_key_dir,
+        ssh_plan=ssh_plan,
         extra_mounts=extra_mounts,
     )
 
     LOGGER.info(f"applying {len(manifests)} manifests to ns/{session.namespace}")
     apply_manifests(manifests)
 
-    _wait_for_pods(session)
+    _wait_for_pods(session, ssh_relay=ssh_plan is not None)
 
     LOGGER.info("attaching to agent")
     if contribution.command is None:

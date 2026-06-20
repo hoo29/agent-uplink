@@ -4,7 +4,7 @@ Two layers:
 
 | Layer | Path | Needs a cluster? | What it covers |
 |---|---|---|---|
-| **unit** | `tests/unit/` | no | rule layering + validation + placeholder resolution, AWS dummy-cred derivation, the mitm addon's match/reroute logic, NetworkPolicy/env assembly, SSH-CIDR + cwd validation, the Claude fake-credential strip |
+| **unit** | `tests/unit/` | no | rule layering + validation + placeholder resolution, AWS dummy-cred derivation, the mitm addon's match/reroute logic, NetworkPolicy/env assembly, SSH-CIDR + cwd validation, the SSH relay key split + holder/sidecar manifests, the Claude fake-credential strip |
 | **integration** | `tests/integration/` | yes (live k3s) | the security properties end-to-end against real pods, NetworkPolicies and a real mitmproxy running the real addon |
 
 The integration suite is built around three security questions:
@@ -26,6 +26,13 @@ The integration suite is built around three security questions:
    pod that re-signs and never reach the agent pod. The re-sign + forward crypto
    itself (canonical request, signature, body hashing, session tokens) is
    validated end-to-end against real AWS by the live test below.
+
+4. **The SSH agent-forwarding relay isolates keys** (`test_ssh_relay.py`) — an
+   ephemeral keypair is split by the production `sshagent.prepare`: the private
+   half is loaded into the holder pod's ssh-agent, the public half goes to the
+   agent pod. Against a real sshd that authorises that public key, the agent
+   authenticates (signing delegated to the holder over the socat bridge) while
+   the private key is proven absent from the agent pod and present in the holder.
 
 Plus `test_dockerd.py`: a privileged pod on the default runtime runs its own dockerd,
 which is what lets the whole suite run without kata installed.

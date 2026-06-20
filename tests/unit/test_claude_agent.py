@@ -48,6 +48,7 @@ def _build_pod(
     return cli._agent_pod_manifest(
         "ns", "img", contribution, Path("/home/u/proj"), "u", 1000, "",
         cli.AgentMounts(git_config_secret=git_config_secret),
+        uid=1000,
     )
 
 

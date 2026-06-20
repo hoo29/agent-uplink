@@ -294,10 +294,11 @@ def pod_spec(
     host_network: bool = False,
     dns_policy: str | None = None,
     automount_service_account_token: bool = False,
+    extra_containers: list[dict] | None = None,
 ) -> dict:
     spec: dict = {
         "restartPolicy": restart_policy,
-        "containers": [container],
+        "containers": [container, *(extra_containers or [])],
         "automountServiceAccountToken": automount_service_account_token,
     }
     if volumes:

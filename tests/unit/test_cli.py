@@ -77,6 +77,68 @@ def test_mitm_policy_ingress_from_agent_only():
 
 
 # --------------------------------------------------------------------------- #
+# SSH agent-forwarding relay (holder pod + sidecar bridge)
+# --------------------------------------------------------------------------- #
+
+
+def test_ssh_relay_adds_egress_to_holder_and_ingress_policy():
+    names = _by_name(cli._network_policies("ns", ssh_relay=True))
+    assert "ssh-agent-policy" in names
+    egress = names["agent-egress"]["spec"]["egress"]
+    relay = [e for e in egress if any(
+        t.get("podSelector", {}).get("matchLabels", {}).get("app") == "ssh-agent"
+        for t in e.get("to", []))]
+    assert relay and relay[0]["ports"][0]["port"] == cli.SSH_AGENT_PORT
+    # Holder accepts the signing bridge from the agent only, and has no egress.
+    holder = names["ssh-agent-policy"]["spec"]
+    assert holder["ingress"][0]["from"][0]["podSelector"]["matchLabels"]["app"] == "agent"
+    assert "Egress" not in holder["policyTypes"]
+
+
+def test_ssh_relay_absent_by_default():
+    names = _by_name(cli._network_policies("ns"))
+    assert "ssh-agent-policy" not in names
+
+
+def test_ssh_agent_holder_is_hardened_and_mounts_keys_secret():
+    pod, svc = cli._ssh_agent_manifests("ns", "img", "", uid=1000, gid=1000)
+    container = pod["spec"]["containers"][0]
+    sc = container["securityContext"]
+    assert sc["readOnlyRootFilesystem"] is True
+    assert sc["runAsNonRoot"] is True
+    assert sc["capabilities"]["drop"] == ["ALL"]
+    # The private keys arrive as a Secret; the socket lives on tmpfs.
+    vols = {v["name"]: v for v in pod["spec"]["volumes"]}
+    assert vols["keys"]["secret"]["secretName"] == "ssh-agent-keys"
+    assert vols["sock"]["emptyDir"]["medium"] == "Memory"
+    assert svc["spec"]["ports"][0]["port"] == cli.SSH_AGENT_PORT
+    # Keys must be piped via `ssh-add -` (stdin): ssh-add rejects the 0644
+    # Secret-mounted key file as "too open", so loading from a file would fail.
+    script = container["command"][-1]
+    assert "ssh-add - <" in script
+    assert 'ssh-add "$k"' not in script
+    # A stale socket from a prior in-place restart is cleared before ssh-agent
+    # binds, and an empty key dir is a no-op (nullglob), not a literal /keys/*.
+    assert "rm -f /run/ssh-agent/agent.sock" in script
+    assert "nullglob" in script
+    # A per-key load failure is isolated; the pod fails only if no key loads.
+    assert "no SSH keys could be loaded" in script
+    # Readiness reflects a reachable agent that holds a key (exec probe, so it is
+    # not blocked by the holder's ingress NetworkPolicy).
+    assert "ssh-add -l" in container["readinessProbe"]["exec"]["command"][-1]
+
+
+def test_ssh_relay_sidecar_clears_stale_socket_and_gates_on_socket():
+    sidecar = cli._ssh_relay_sidecar("img", 1000, 1000)
+    script = sidecar["command"][-1]
+    # unlink-early clears any socket left by a prior in-place restart.
+    assert "unlink-early" in script
+    # Readiness gates on the bridged socket existing so the agent never attaches
+    # to a not-yet-created SSH_AUTH_SOCK.
+    assert cli.SSH_AUTH_SOCK_PATH in sidecar["readinessProbe"]["exec"]["command"][-1]
+
+
+# --------------------------------------------------------------------------- #
 # Proxy env
 # --------------------------------------------------------------------------- #
 
@@ -119,7 +181,7 @@ def test_agent_pod_never_mounts_rules_secret():
         memory="1Gi",
     )
     pod = cli._agent_pod_manifest(
-        "ns", "img", contribution, Path("/home/u"), "u", 1000, ""
+        "ns", "img", contribution, Path("/home/u"), "u", 1000, "", uid=1000
     )
     assert "rules-json" not in _secret_names(pod)
     # The app=agent label (so the agent-egress policy selects the pod) is owned by
@@ -321,6 +383,7 @@ def test_agent_pod_manifest_extra_mounts_adds_volumes_and_mounts(tmp_path):
         cli.AgentMounts(
             extra_mounts=[cli.HostMount(d1, False), cli.HostMount(ro_file, True)]
         ),
+        uid=1000,
     )
     mounts = pod["spec"]["containers"][0]["volumeMounts"]
     by_name = {m["name"]: m for m in mounts}
@@ -479,29 +542,40 @@ def _minimal_contribution():
     )
 
 
-def test_agent_pod_mounts_ssh_keys_read_only_outside_dot_ssh():
+def test_agent_pod_ssh_relay_mounts_pub_secret_and_adds_sidecar():
     pod = cli._agent_pod_manifest(
         "ns", "img", _minimal_contribution(), Path("/home/u"), "u", 1000, "",
-        cli.AgentMounts(ssh_key_dir=Path("/host/keys")),
+        cli.AgentMounts(
+            ssh_pub_secret="ssh-pub", ssh_pub_files=["id_ed25519.pub", "config"]
+        ),
+        uid=1000,
     )
     container = pod["spec"]["containers"][0]
-    vol = _volume_by_name(pod, "ssh-keys")
-    assert vol["hostPath"]["path"] == "/host/keys"
-    assert vol["hostPath"]["type"] == "Directory"
-    mount = _mount_by_name(container, "ssh-keys")
-    # Keys land in ~/.sshclaude (read-only) so the agent can't tamper with them,
-    # and ~/.ssh stays writable for ssh to create known_hosts itself.
-    assert mount["mountPath"] == "/home/u/.sshclaude"
-    assert mount["readOnly"] is True
-    assert not any(
-        m["mountPath"] == "/home/u/.ssh" for m in container["volumeMounts"]
-    )
+    assert _volume_by_name(pod, "ssh-pub")["secret"]["secretName"] == "ssh-pub"
+    # Public keys + config land read-only via per-file subPath mounts INTO ~/.ssh,
+    # so the directory itself stays writable (ssh creates known_hosts there) and
+    # no private key is ever mounted into the agent pod.
+    pub_mounts = {
+        m["mountPath"]: m for m in container["volumeMounts"] if m["name"] == "ssh-pub"
+    }
+    assert set(pub_mounts) == {"/home/u/.ssh/id_ed25519.pub", "/home/u/.ssh/config"}
+    assert pub_mounts["/home/u/.ssh/config"]["subPath"] == "config"
+    assert all(m["readOnly"] for m in pub_mounts.values())
+    # The whole ~/.ssh is never a single read-only mount.
+    assert not any(m["mountPath"] == "/home/u/.ssh" for m in container["volumeMounts"])
+    # SSH_AUTH_SOCK points at the bridged socket.
+    assert _env_dict(container)["SSH_AUTH_SOCK"] == cli.SSH_AUTH_SOCK_PATH
+    # The relay sidecar bridges the unix socket to the holder over TCP.
+    sidecar = {c["name"]: c for c in pod["spec"]["containers"]}["ssh-agent-relay"]
+    assert sidecar["securityContext"]["readOnlyRootFilesystem"] is True
+    assert any(m["mountPath"] == "/ssh-agent" for m in sidecar["volumeMounts"])
 
 
 def test_agent_pod_mounts_kubeconfig_outside_home_with_env():
     pod = cli._agent_pod_manifest(
         "ns", "img", _minimal_contribution(), Path("/home/u"), "u", 1000, "",
         cli.AgentMounts(kube_config_secret="kube-config"),
+        uid=1000,
     )
     container = pod["spec"]["containers"][0]
     assert _env_dict(container)["KUBECONFIG"] == "/etc/agent-uplink/kube/config"
