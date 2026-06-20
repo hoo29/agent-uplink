@@ -273,7 +273,7 @@ See `examples/rules/`.
 ## Security
 
 This is a fun side project that was nearly all written with claude, no guarantees about security are made. It's a local,
-single-user tool, and the agent is assumed cooperative. Known limitations of the egress control:
+single-user tool, and is not a malware sandbox. Known limitations/tradeoffs of the egress control:
 
 - Default rules allow `GET`/`OPTIONS`/`HEAD` to any host, so with defaults on, anything the agent can read can be exfiltrated
   via GET query strings/headers. For untrusted workloads, run `--no-default-rules` with an explicit allow-list.
