@@ -25,25 +25,26 @@ SAFE_SECRET_NAMES = {
 }
 
 
-def _agent(auth_mode, claude_args=None):
+def _agent(auth_mode, claude_args=None, maven=False):
     return ClaudeAgent(argparse.Namespace(
         auth_mode=auth_mode, image="agent-uplink-claude",
-        claude_args=claude_args or [],
+        claude_args=claude_args or [], maven=maven,
     ))
 
 
 def _build_pod(
-    tmp_path, monkeypatch, auth_mode, *, aws_secret="agent-aws-creds",
-    git_config_secret=None,
+    tmp_path, monkeypatch, auth_mode, *, aws_secret: str | None = "agent-aws-creds",
+    git_config_secret=None, maven=False,
 ):
     # Point the agent's host-probing at a tmp dir so pod_contribution is hermetic
-    # (it mkdir's a per-project dir and conditionally mounts ~/.claude/* and ~/.m2).
+    # (it mkdir's a per-project dir and conditionally mounts ~/.claude/*; --maven
+    # adds the ~/.m2 mounts).
     monkeypatch.setattr(claude_agent_mod, "HOST_CLAUDE_DIR", tmp_path / ".claude")
     ctx = PodBuildContext(
         cwd=Path("/home/u/proj"), username="u", uid=1000, gid=1000,
         aws_creds_secret_name=aws_secret, debug_host_dir=None, debug=False,
     )
-    contribution = _agent(auth_mode).pod_contribution(ctx)
+    contribution = _agent(auth_mode, maven=maven).pod_contribution(ctx)
     return cli._agent_pod_manifest(
         "ns", "img", contribution, Path("/home/u/proj"), "u", 1000, "",
         cli.AgentMounts(git_config_secret=git_config_secret),
@@ -112,44 +113,71 @@ def _claude_invocation(agent):
     return agent._container_command("u", False, agent.args.claude_args)[-1]
 
 
-def test_default_invocation_has_skip_permissions_only():
+def test_default_invocation_allows_skip_permissions_only():
+    # --allow- enables bypassPermissions in the Shift+Tab cycle without
+    # activating it; the default mode is "auto" via settings.json.
     script = _claude_invocation(_agent("anthropic"))
-    assert script.endswith("exec claude --dangerously-skip-permissions")
+    assert script.endswith("exec claude --allow-dangerously-skip-permissions")
 
 
-def test_passthrough_args_appended_after_skip_permissions():
+def test_passthrough_args_appended_after_allow_skip_permissions():
     script = _claude_invocation(_agent("anthropic", ["--resume", "abc123"]))
     assert script.endswith(
-        "exec claude --dangerously-skip-permissions --resume abc123"
+        "exec claude --allow-dangerously-skip-permissions --resume abc123"
     )
 
 
-def test_debug_flag_precedes_skip_permissions_with_passthrough():
+def test_debug_flag_precedes_allow_skip_permissions_with_passthrough():
     agent = _agent("anthropic", ["-c"])
     script = agent._container_command("u", True, agent.args.claude_args)[-1]
-    assert script.endswith("exec claude -d --dangerously-skip-permissions -c")
+    assert script.endswith("exec claude -d --allow-dangerously-skip-permissions -c")
 
 
 def test_passthrough_args_are_shell_quoted():
     # A prompt with spaces must reach claude as a single argv element, not be
     # word-split by the bash -lc string.
     script = _claude_invocation(_agent("anthropic", ["-p", "explain this; rm -rf /"]))
-    assert "exec claude --dangerously-skip-permissions -p 'explain this; rm -rf /'" \
+    assert (
+        "exec claude --allow-dangerously-skip-permissions -p 'explain this; rm -rf /'"
         in script
+    )
 
 
-def test_ansible_cfg_not_mounted_when_absent(tmp_path, monkeypatch):
-    # HOME drives Path.home(); a tmp home with no ~/.ansible.cfg => no mount.
+def test_maven_not_mounted_without_flag(tmp_path, monkeypatch):
+    # HOME has a ~/.m2, but without --maven nothing is mounted and no Maven env.
     monkeypatch.setenv("HOME", str(tmp_path))
-    pod = _build_pod(tmp_path, monkeypatch, "anthropic")
-    assert _mount(pod, "ansible-cfg") is None
+    (tmp_path / ".m2").mkdir()
+    (tmp_path / ".m2" / "settings.xml").write_text("<settings/>\n")
+    pod = _build_pod(tmp_path, monkeypatch, "anthropic", aws_secret=None, maven=False)
+    assert _mount(pod, "m2-repo") is None
+    assert _mount(pod, "m2-settings") is None
+    assert "MAVEN_OPTS" not in _agent("anthropic", maven=False)._container_env(
+        Path("/home/u/proj")
+    )
 
 
-def test_ansible_cfg_mounts_read_only_when_present(tmp_path, monkeypatch):
+def test_maven_flag_mounts_repo_and_settings(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
-    (tmp_path / ".ansible.cfg").write_text("[defaults]\n")
-    pod = _build_pod(tmp_path, monkeypatch, "anthropic")
-    mount = _mount(pod, "ansible-cfg")
-    assert mount is not None
-    assert mount["mountPath"] == "/home/u/.ansible.cfg"
-    assert mount["readOnly"] is True
+    (tmp_path / ".m2").mkdir()
+    (tmp_path / ".m2" / "settings.xml").write_text("<settings/>\n")
+    pod = _build_pod(tmp_path, monkeypatch, "anthropic", aws_secret=None, maven=True)
+    repo = _mount(pod, "m2-repo")
+    settings = _mount(pod, "m2-settings")
+    assert repo is not None and repo["mountPath"] == "/home/u/.m2/repository"
+    assert repo.get("readOnly") is not True  # read-write
+    assert settings is not None
+    assert settings["mountPath"] == "/home/u/.m2/settings.xml"
+    assert settings["readOnly"] is True
+
+
+def test_maven_flag_sets_proxy_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".m2").mkdir()
+    contribution = _agent("anthropic", maven=True).pod_contribution(
+        PodBuildContext(
+            cwd=Path("/home/u/proj"), username="u", uid=1000, gid=1000,
+            aws_creds_secret_name=None, debug_host_dir=None, debug=False,
+        )
+    )
+    assert "mitm" in contribution.env["MAVEN_OPTS"]
+    assert contribution.env["CODEARTIFACT_AUTH_TOKEN"] == "placeholder"

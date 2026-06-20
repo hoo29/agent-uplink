@@ -124,15 +124,20 @@ agent-uplink claude --anthropic --git-https-rewrite git.example.com             
 agent-uplink claude --anthropic --kube-context dev-cluster                          # k8s cluster access
 agent-uplink claude --anthropic --kube-context ctx-a ctx-b --kubeconfig ~/.kube/extra.yaml
 agent-uplink claude --anthropic --deploy-context my-cluster                         # cluster to deploy into
-agent-uplink claude --anthropic --add-dir ~/code/repo-b ~/code/repo-c              # mount extra repos
+agent-uplink claude --anthropic --mount-rw ~/code/repo-b ~/code/repo-c             # mount extra repos (read-write)
+agent-uplink claude --anthropic --mount-ro ~/.ansible.cfg                          # mount a host file read-only
+agent-uplink claude --anthropic --maven                                            # opt-in: mount ~/.m2 + Maven proxy env
 agent-uplink claude --anthropic -- --resume <session-id>             # extra args forwarded to `claude`
 agent-uplink claude --anthropic -- -p "summarise the build failure"
 ```
 
-`--anthropic` reads `~/.claude/.credentials.json` (run `claude login` first). `--bedrock` reads `keyring get bedrock key`.
+`--anthropic` reads `~/.claude/.credentials.json` (run `claude login` first). `--bedrock` reads `keyring get bedrock key`
+(set it once with `keyring set bedrock key`).
 
 Anything after a `--` separator is forwarded verbatim to the in-pod `claude` CLI (e.g. `--resume <id>`, `-c`, `-p
-"<prompt>"`). `--dangerously-skip-permissions` is always added, so it need not be repeated.
+"<prompt>"`). The pod defaults to permission mode `auto`; `--allow-dangerously-skip-permissions` is always added so
+`bypassPermissions` stays reachable via `Shift+Tab` (and on models without `auto` support, e.g. older Sonnet, where
+the default falls back to `default` mode). Pass `--permission-mode` after `--` to override the default.
 
 Each run creates a session namespace `agent-uplink-<id>`, torn down on exit.
 
@@ -190,23 +195,26 @@ Auth is **opt-in**: the default allow-list permits only `GET`/`OPTIONS`/`HEAD`, 
 `git-upload-pack`/`git-receive-pack`. Pass `--rules examples/rules/git.yaml` to allow those endpoints and inject HTTP
 Basic auth (token resolved on the host, never entering the pod). Without it, even a public clone is denied.
 
-### Multiple working directories
+### Extra mounts
 
-By default the agent sees only the current working directory, mounted read-write at its host path. `--add-dir` mounts
-additional host folders at their identical paths — useful when the agent needs to work across multiple repos at once:
+By default the agent sees only the current working directory, mounted read-write at its host path. Two flags add more
+host files or directories, each at its identical path — useful for cross-repo work or sharing a host config:
 
 ```bash
-agent-uplink claude --anthropic --add-dir ~/code/repo-b ~/code/repo-c
+agent-uplink claude --anthropic --mount-rw ~/code/repo-b ~/code/repo-c   # extra repos, read-write
+agent-uplink claude --anthropic --mount-ro ~/.ansible.cfg                # a host config, read-only
 ```
 
 Constraints (startup is refused if any are violated):
 
-- Each folder must be under `/home/<user>/`, the same rule the working directory follows.
-- No folder may be an ancestor or descendant of the working directory or another `--add-dir` folder at any depth.
-  Siblings are fine (`~/.ansible` alongside `~/code/repo-a` and `~/code/repo-b`).
+- Each path must exist and be under `/home/<user>/`, the same rule the working directory follows.
+- The same path can't be both `--mount-rw` and `--mount-ro`.
+- A writable directory may not be an ancestor or descendant of the working directory or another writable directory at
+  any depth. Siblings are fine; read-only mounts and files may sit anywhere (e.g. a read-only file inside a read-write
+  repo). The `File`/`Directory` hostPath type is auto-detected.
 
-All extra folders are read-write. The session still opens in the working directory (`cd "$WORKDIR"`); the extra paths
-are simply available alongside it.
+The session still opens in the working directory (`cd "$WORKDIR"`); the extra paths are simply available alongside it.
+There is no auto-mounting by file existence — every host integration (e.g. Maven via `--maven`) is explicit.
 
 ### Kubernetes cluster access
 
@@ -231,9 +239,10 @@ Real tokens and client keys never appear in the pod kubeconfig or the agent cont
 
 ## Rules
 
-YAML allow-list, first match wins. Match priority is by **layer**, not regex length: your rules first, then the agent's auth
-rule, then agent defaults, then the generic `GET`/`OPTIONS`/`HEAD`-anywhere catch-all last. `--no-default-rules` (or
-`replace_defaults: true`) keeps only your rules (and drops the auth rule).
+YAML allow-list, first match wins. Match priority is by **layer**, not regex length: the agent's auth rule (and any kube
+rules) first, then your rules, then agent defaults, then the generic `GET`/`OPTIONS`/`HEAD`-anywhere catch-all last. Auth
+and kube rules lead so a broad rule of yours on an overlapping host (e.g. `.*\.amazonaws\.com`) can't shadow an injected
+credential. `--no-default-rules` (or `replace_defaults: true`) keeps only your rules (and drops the auth rule).
 
 ```yaml
 rules:

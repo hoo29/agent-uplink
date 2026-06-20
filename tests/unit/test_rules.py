@@ -64,8 +64,9 @@ def test_layers_in_precedence_order(tmp_path):
     agent = _Agent(defaults=[{"name": "agent-default", "host": "d"}])
     out = _resolve(path, agent, auth_rules=[{"name": "auth", "host": "a"}])
     names = [r["name"] for r in out["rules"]]
-    # user -> auth -> agent defaults -> generic catch-all (evaluated last)
-    assert names == ["user", "auth", "agent-default", "default-readonly"]
+    # auth -> user -> agent defaults -> generic catch-all (evaluated last).
+    # Auth leads so a broad user rule can't shadow the agent's credential inject.
+    assert names == ["auth", "user", "agent-default", "default-readonly"]
 
 
 def test_generic_catch_all_is_last(tmp_path):
@@ -202,14 +203,31 @@ def test_kube_rules_included_even_with_no_default_rules(tmp_path):
     assert [r["name"] for r in out["rules"]] == ["kube"]
 
 
-def test_kube_rules_layer_between_user_and_auth(tmp_path):
+def test_kube_rules_layer_between_auth_and_user(tmp_path):
     path = _write(tmp_path, "rules:\n  - {name: user, host: 'u'}\n")
     agent = _Agent(defaults=[{"name": "agent-default", "host": "d"}])
     out = _resolve(path, agent, auth_rules=[{"name": "auth", "host": "a"}],
                    kube_rules=[{"name": "kube", "host": "k"}])
     names = [r["name"] for r in out["rules"]]
-    # user -> kube -> auth -> agent defaults -> generic catch-all.
-    assert names == ["user", "kube", "auth", "agent-default", "default-readonly"]
+    # auth -> kube -> user -> agent defaults -> generic catch-all. Auth and kube
+    # both inject credentials on narrow hosts, so they lead the user's allow
+    # rules to avoid being shadowed by a broad overlapping host regex.
+    assert names == ["auth", "kube", "user", "agent-default", "default-readonly"]
+
+
+def test_broad_user_aws_rule_does_not_shadow_auth(tmp_path):
+    # Regression: a broad user AWS allow rule (e.g. for SigV4 services) must not
+    # win first-match over the bedrock-style auth inject on bedrock-runtime and
+    # strip its Authorization header — that breaks bedrock auth. The auth rule
+    # must be evaluated first.
+    path = _write(tmp_path, "rules:\n  - {name: broad-aws, host: '.*\\.amazonaws\\.com'}\n")
+    auth = {
+        "name": "bedrock-auth",
+        "host": r"bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com",
+        "inject": {"headers": {"Authorization": "Bearer real-token"}},
+    }
+    out = _resolve(path, auth_rules=[auth])
+    assert [r["name"] for r in out["rules"][:2]] == ["bedrock-auth", "broad-aws"]
 
 
 # --------------------------------------------------------------------------- #

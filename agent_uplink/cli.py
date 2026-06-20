@@ -172,16 +172,28 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         "the agent; commits are then unattributed unless set in-repo",
     )
     common.add_argument(
-        "--add-dir",
+        "--mount-rw",
         type=Path,
         nargs="*",
         action="extend",
         default=[],
-        metavar="DIR",
-        help="Additional host folder(s) to mount read-write into the agent at their "
-        "identical path, for cross-repo work. The working directory is always mounted; "
-        "these add to it. Each must be under /home/<user>/ and must not overlap "
-        "(be nested within) the working directory or another --add-dir folder.",
+        metavar="PATH",
+        help="Host file(s)/dir(s) to mount read-write into the agent at their "
+        "identical path, e.g. extra repos for cross-repo work. The working "
+        "directory is always mounted; these add to it. Each must be under "
+        "/home/<user>/. Writable directories must not overlap (be nested within) "
+        "the working directory or each other.",
+    )
+    common.add_argument(
+        "--mount-ro",
+        type=Path,
+        nargs="*",
+        action="extend",
+        default=[],
+        metavar="PATH",
+        help="Host file(s)/dir(s) to mount read-only into the agent at their "
+        "identical path, e.g. ~/.ansible.cfg or a shared config dir. Each must be "
+        "under /home/<user>/.",
     )
     common.add_argument(
         "--kube-context",
@@ -291,33 +303,56 @@ def validate_cwd(username: str, cwd: Path) -> None:
             f"agent-uplink must be run from within /home/{username}, got: {cwd}")
 
 
-def validate_extra_dirs(
-    username: str, cwd: Path, add_dir: list[Path]
-) -> list[Path]:
-    """Resolve, validate, and de-duplicate --add-dir folders.
+@dataclass
+class HostMount:
+    """A host path mounted into the agent at its identical path, read-only or
+    read-write. Built from --mount-ro / --mount-rw."""
 
-    Each must be an existing directory under /home/<user>/ and must not overlap
-    (be nested within, contain, or equal) the cwd or another extra dir. Returns
-    the resolved, de-duplicated list."""
-    resolved: list[Path] = []
-    for raw in add_dir:
-        d = raw.expanduser().resolve()
-        if not d.is_dir():
-            raise ValueError(f"--add-dir {d} does not exist or is not a directory")
-        if not _under_home(username, d):
-            raise ValueError(f"--add-dir {d} must be under /home/{username}")
-        if d not in resolved:
-            resolved.append(d)
+    host_path: Path
+    read_only: bool
 
-    all_dirs = [cwd, *resolved]
-    for i, a in enumerate(all_dirs):
-        for b in all_dirs[i + 1:]:
-            if a == b:
+
+def validate_mounts(
+    username: str, cwd: Path, mount_rw: list[Path], mount_ro: list[Path]
+) -> list[HostMount]:
+    """Resolve, validate, and de-duplicate --mount-rw / --mount-ro paths.
+
+    Each must exist (file or dir) under /home/<user>/. The same path may not be
+    requested both read-write and read-only. Writable directories must not
+    overlap (be nested within, contain, or equal) the cwd or each other, so a
+    write can't land in two overlapping trees; read-only mounts and files may sit
+    anywhere. Returns the resolved, de-duplicated list (read-write first)."""
+    resolved: list[HostMount] = []
+    seen: dict[Path, bool] = {}  # host path -> read_only
+
+    def add(raw: Path, read_only: bool) -> None:
+        flag = "--mount-ro" if read_only else "--mount-rw"
+        p = raw.expanduser().resolve()
+        if not p.exists():
+            raise ValueError(f"{flag} {p} does not exist")
+        if not _under_home(username, p):
+            raise ValueError(f"{flag} {p} must be under /home/{username}")
+        if p == cwd:
+            raise ValueError(f"{flag} {p} is the working directory, already mounted")
+        if p in seen:
+            if seen[p] != read_only:
                 raise ValueError(
-                    f"--add-dir {b} is the working directory, already mounted")
+                    f"{p} is requested both read-write and read-only; pick one")
+            return
+        seen[p] = read_only
+        resolved.append(HostMount(p, read_only))
+
+    for raw in mount_rw:
+        add(raw, read_only=False)
+    for raw in mount_ro:
+        add(raw, read_only=True)
+
+    rw_dirs = [cwd] + [m.host_path for m in resolved if not m.read_only and m.host_path.is_dir()]
+    for i, a in enumerate(rw_dirs):
+        for b in rw_dirs[i + 1:]:
             if a in b.parents or b in a.parents:
                 raise ValueError(
-                    f"--add-dir paths overlap: {a} and {b} are nested; "
+                    f"writable mounts overlap: {a} and {b} are nested; "
                     "mount non-overlapping folders only")
     return resolved
 
@@ -495,7 +530,7 @@ class AgentMounts:
     ssh_key_dir: Path | None = None
     kube_config_secret: str | None = None
     git_config_secret: str | None = None
-    extra_dirs: list[Path] = field(default_factory=list)
+    extra_mounts: list[HostMount] = field(default_factory=list)
 
 
 def _agent_pod_manifest(
@@ -559,10 +594,13 @@ def _agent_pod_manifest(
                 "readOnly": True,
             }
         )
-    for i, d in enumerate(pod_mounts.extra_dirs):
-        name = f"add-dir-{i}"
-        volumes.append(hostpath_volume(name, str(d), hp_type="Directory"))
-        mounts.append({"name": name, "mountPath": str(d)})
+    for i, m in enumerate(pod_mounts.extra_mounts):
+        name = f"mount-{i}"
+        hp_type = "Directory" if m.host_path.is_dir() else "File"
+        volumes.append(hostpath_volume(name, str(m.host_path), hp_type=hp_type))
+        mounts.append(
+            {"name": name, "mountPath": str(m.host_path), "readOnly": m.read_only}
+        )
     container = container_spec(
         name=AGENT_CONTAINER_NAME,
         image=full_image,
@@ -895,7 +933,7 @@ def _assemble_manifests(
     gid: int,
     ssh_cidrs: list[str],
     ssh_key_dir: Path | None,
-    extra_dirs: list[Path],
+    extra_mounts: list[HostMount],
 ) -> list[dict]:
     """The full manifest set in apply order: namespace + mitm inputs, all
     Secrets, NetworkPolicies, support pods, then the agent pod."""
@@ -930,7 +968,7 @@ def _assemble_manifests(
                 ssh_key_dir=ssh_key_dir,
                 kube_config_secret=kube_secrets.config_secret,
                 git_config_secret=git_secret_name,
-                extra_dirs=extra_dirs,
+                extra_mounts=extra_mounts,
             ),
         )
     )
@@ -942,7 +980,7 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
     cwd = Path.cwd()
     validate_cwd(username, cwd)
     ssh_cidrs, ssh_key_dir = validate_ssh_args(args.ssh_cidr, args.ssh_key_dir)
-    extra_dirs = validate_extra_dirs(username, cwd, args.add_dir)
+    extra_mounts = validate_mounts(username, cwd, args.mount_rw, args.mount_ro)
 
     mitm_dir = STATE_DIR / "mitm"
     certs_generated = _bootstrap_infra(args, mitm_dir)
@@ -1000,7 +1038,7 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
         gid=os.getgid(),
         ssh_cidrs=ssh_cidrs,
         ssh_key_dir=ssh_key_dir,
-        extra_dirs=extra_dirs,
+        extra_mounts=extra_mounts,
     )
 
     LOGGER.info(f"applying {len(manifests)} manifests to ns/{session.namespace}")

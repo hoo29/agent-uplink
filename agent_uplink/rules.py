@@ -162,21 +162,30 @@ def resolve(
     Match priority is by LAYER, not by regex length — first match wins in the
     addon, so the order here is the precedence:
 
-      1. user-supplied YAML        (the operator's intent wins)
+      1. agent auth rules          (per-mode auth header injection, from
+                                    prepare(); attaches the agent's own credential
+                                    to a specific backend host)
       2. kube rules                (auto-generated from --kube-context; always
                                     included when kube is enabled, regardless of
                                     --no-default-rules, so k8s traffic is allowed)
-      3. agent auth rules          (per-mode auth header injection, from prepare())
+      3. user-supplied YAML        (the operator's added destinations)
       4. agents/<name>/default_rules.yaml   (per-agent)
       5. agent_uplink/default_rules.yaml    (generic catch-all, evaluated LAST)
 
     Within a layer, declaration order is preserved. Ordering by layer (rather
-    than the old sort-by-host-length heuristic) means the broad generic rule is
-    always considered last and a user rule always beats a default.
+    than the old sort-by-host-length heuristic) keeps the broad generic rule
+    last and a user rule ahead of the per-agent/generic defaults.
+
+    Auth and kube rules sit ABOVE user rules deliberately: each injects a
+    credential on a narrow host (bedrock-runtime.<region>.amazonaws.com,
+    api.anthropic.com, the k8s API server), and a broad user allow rule for an
+    overlapping host (e.g. `.*\\.amazonaws\\.com`) would otherwise win first-match
+    and strip the injected credential, breaking auth. To take over the agent's
+    auth entirely, use --no-default-rules and supply your own rule.
 
     `--no-default-rules` (or `replace_defaults: true` in the user's YAML) keeps
-    only layers 1–2 and drops the auth rule too — the user becomes responsible for
-    supplying any auth the chosen mode needs.
+    only the kube rules and the user's YAML, dropping the auth rule too — the
+    user becomes responsible for supplying any auth the chosen mode needs.
 
     `allow_exec` permits `{{exec:...}}` placeholders to run host shell commands.
     `kube_rules` are synthetic rules produced by kube.resolve(); they are always
@@ -189,12 +198,18 @@ def resolve(
 
     use_defaults = not (no_default_rules or user_config.get("replace_defaults", False))
 
-    layered: list[dict] = list(user_config.get("rules") or [])
-    # Kube rules are always included when provided — dropping them via
-    # --no-default-rules would silently block all kubectl traffic.
-    layered.extend(kube_rules or [])
+    layered: list[dict] = []
+    # Auth rules first so a broad user allow rule on an overlapping host can't
+    # win first-match and strip the agent's injected credential. Dropped by
+    # --no-default-rules, where the user takes over auth.
     if use_defaults:
         layered.extend(auth_rules)
+    # Kube rules are always included when provided — dropping them via
+    # --no-default-rules would silently block all kubectl traffic. Above user
+    # rules for the same shadow-protection reason as auth rules.
+    layered.extend(kube_rules or [])
+    layered.extend(user_config.get("rules") or [])
+    if use_defaults:
         layered.extend(agent.default_rules())
         layered.extend(_load_yaml(GENERIC_DEFAULT_RULES_PATH).get("rules") or [])
 

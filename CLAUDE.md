@@ -36,7 +36,9 @@ agent-uplink claude --anthropic --git-https-rewrite git.example.com --no-git-ide
 agent-uplink claude --anthropic --kube-context dev-cluster                                        # k8s cluster access
 agent-uplink claude --anthropic --kube-context ctx-a ctx-b --kubeconfig ~/.kube/extra.yaml        # multiple contexts
 agent-uplink claude --anthropic --deploy-context my-cluster                                       # cluster to deploy into
-agent-uplink claude --anthropic --add-dir ~/code/repo-b ~/code/repo-c                            # mount extra repos
+agent-uplink claude --anthropic --mount-rw ~/code/repo-b ~/code/repo-c                            # mount extra repos (read-write)
+agent-uplink claude --anthropic --mount-ro ~/.ansible.cfg                                         # mount a host file read-only
+agent-uplink claude --anthropic --maven                                                           # opt-in: mount ~/.m2 + Maven proxy env
 agent-uplink claude --anthropic -- --resume <id>                                                 # forward args to `claude`
 agent-uplink claude --anthropic -- -p "prompt"                                                   # non-interactive print mode
 agent-uplink claude --anthropic --debug
@@ -115,22 +117,39 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 7. `agent.prepare(session, aws_profile_names)` — host-side OAuth refresh, keyring reads, fake-creds + settings.json bytes (all in memory; no disk writes). Returns a `PreparedAgent` (the agent's auth rules + K8s Secret payloads) rather than stashing them on the instance.
 8. `bootstrap.build_and_push_agent_image(...)` — assemble a temp build context (agent dir + the **public** mitm CA cert only; the CA private key never enters the context or any image layer), `docker build`, `docker push localhost:5000/<repo>:latest`. Rebuilds also fire if certs were just regenerated, `--force-rebuild`, or the image is older than `AGENT_IMAGE_MAX_AGE_SECONDS` (24 h).
 9. Build the dummy `~/.aws/credentials` INI (deterministic AKIA per profile) as bytes, wrap in a K8s Secret (`agent-aws-creds`) for the agent pod. For each AWS profile, export real AWS env vars on the host and collect them into a single dummy-AKIA → real-credentials JSON map, wrapped in one K8s Secret (`aws-sigv4-creds`) mounted only into the mitm pod.
-10. Resolve rules: layer in precedence order user `--rules` YAML → agent auth rules (from `prepare()`) → agent default rules → generic defaults (first match wins, generic catch-all last); expand `{{keyring:...}}` (and `{{exec:...}}` only when `--allow-exec`) placeholders; wrap as Secret (`rules-json`).
+10. Resolve rules: layer in precedence order agent auth rules (from `prepare()`) → kube rules → user `--rules` YAML → agent default rules → generic defaults (first match wins, generic catch-all last); expand `{{keyring:...}}` (and `{{exec:...}}` only when `--allow-exec`) placeholders; wrap as Secret (`rules-json`).
 11. `prepared.secret_payloads` — any agent-specific Secrets (`claude-settings`, `claude-fake-creds` in anthropic mode).
 12. Assemble the full manifest set: namespace, ConfigMap (mitm-addon), Secrets, NetworkPolicies (default-deny + agent-egress + mitm-policy), mitm Pod + Service, agent Pod.
 13. `kubectl apply -f -` for everything in one call.
 14. Wait for the mitm pod Ready, then agent pod Ready (Kata cold start + nested `dockerd` warmup is the long pole).
-15. `kubectl exec -it agent -- <PodContribution.command>` — for Claude: `runuser -u <username> -- bash -lc 'cd "$WORKDIR" && exec claude --dangerously-skip-permissions'` (with `--debug`, `-d` is prepended to the `claude` flags; any args after a `--` separator on the agent-uplink command line are shell-quoted and appended, e.g. `-- --resume <id>` or `-- -p "prompt"`). PID 1 (`dockerd-entrypoint.sh`) is root so it can start the nested `dockerd` and chgrp the socket; `runuser` drops the interactive session to the host UID so hostPath writes land as the host user.
+15. `kubectl exec -it agent -- <PodContribution.command>` — for Claude: `runuser -u <username> -- bash -lc 'cd "$WORKDIR" && exec claude --allow-dangerously-skip-permissions'` (with `--debug`, `-d` is prepended to the `claude` flags; any args after a `--` separator on the agent-uplink command line are shell-quoted and appended, e.g. `-- --resume <id>` or `-- -p "prompt"`). The default permission mode is `auto`, set via `defaultMode` in the pod's `settings.json` (mounted at `~/.claude/settings.json`, the only scope from which Claude honours `defaultMode: auto`); `--allow-dangerously-skip-permissions` adds `bypassPermissions` to the `Shift+Tab` cycle without activating it, so a user can opt into bypass, and on models without `auto` support the mode falls back to `default` with bypass still reachable. On bedrock, `auto` additionally requires `CLAUDE_CODE_ENABLE_AUTO_MODE=1` (injected via settings env) and is supported only on Opus 4.7/4.8. PID 1 (`dockerd-entrypoint.sh`) is root so it can start the nested `dockerd` and chgrp the socket; `runuser` drops the interactive session to the host UID so hostPath writes land as the host user.
 16. On exit / SIGINT / SIGTERM: `kubectl delete ns <id> --wait=false` and `rmtree(session_dir)`. The cluster finishes the cascade in the background.
 
 ### Key constraints
 
-- **Working directory**: `agent-uplink` must be run from within `/home/<USER>/` (validated in Python). `--add-dir`
-  folders follow the same constraint and must not overlap (be nested within, contain, or equal) the working
-  directory or each other; startup is refused otherwise. All are mounted read-write at their identical host paths.
+- **Working directory**: `agent-uplink` must be run from within `/home/<USER>/` (validated in Python). `--mount-rw`
+  and `--mount-ro` paths follow the same constraint. Writable directories must not overlap (be nested within,
+  contain, or equal) the working directory or each other; startup is refused otherwise. Each path is mounted at its
+  identical host path (see Extra mounts).
 - **Image rebuild triggers**: rebuild + push whenever mitm certs are newly generated, `--force-rebuild` is passed, the image doesn't exist locally, or it's older than `AGENT_IMAGE_MAX_AGE_SECONDS` (24 h).
 - **Security posture (agent pod)**: `runtimeClassName: kata-clh` (microVM isolation; `kata-qemu` / `kata-fc` selectable via `--agent-runtime-class`). Container runs `privileged=true`, `allowPrivilegeEscalation=true`, `seccompProfile=Unconfined`, PID 1 as root — required so the nested `dockerd` can manage cgroups/namespaces/mounts/iptables inside the guest. `readOnlyRootFilesystem` is deliberately **off** here. On a privileged, root, seccomp-unconfined container it is not a boundary — the agent holds `CAP_SYS_ADMIN` and can remount the rootfs read-write at will — so it would only add friction (an explicit writable mount per path the agent touches). The container rootfs is writable; the trust boundary is the kata guest kernel plus the NetworkPolicy egress lock. Two paths are still memory-backed tmpfs because they require it regardless: `/var/lib/docker` (2Gi — the nested `dockerd`'s overlayfs upperdir, which kata's virtio-fs rejects) and `/run` (64Mi — holds the `dockerd` unix socket, unreliable on virtio-fs). The interactive session drops to the host UID via `runuser` in `container_command`. NetworkPolicy egress restricted to `mitm:8080` + `kube-dns` (plus TCP 22 to `--ssh-cidr` ranges if set — see SSH egress). Memory limit 4Gi (sized for the 2Gi tmpfs `/var/lib/docker` plus headroom for image layers and the agent process), CPU limit 1; requests are lower (1Gi / 250m) so the pod schedules on small nodes but can burst to the limit. Trust boundary is the kata guest kernel.
 - **Security posture (mitm pod)**: full hardened container security context (`drop=[ALL]`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation=false`, `runAsNonRoot=true`, `seccompProfile=RuntimeDefault`) under the cluster default runtime (faster cold start). Holds the real AWS credentials (mounted Secret) and the resolved rules, so it is the most secret-bearing support pod — kept off any hostPath and locked down accordingly. Egress isolation enforced by NetworkPolicy. Memory limit 512Mi, CPU limit 500m (requests 96Mi·50m).
+
+### Extra mounts
+
+The working directory is always mounted read-write at its host path. Two orchestrator-level flags (wired in `cli.py`
+via `validate_mounts` / `HostMount`; no `Agent` subclass involved) add more host paths, each mounted at its identical
+host path:
+
+- `--mount-rw <PATH> [<PATH> ...]` — host file(s)/dir(s) mounted **read-write**, e.g. extra repos for cross-repo work.
+- `--mount-ro <PATH> [<PATH> ...]` — host file(s)/dir(s) mounted **read-only**, e.g. `~/.ansible.cfg` or a shared
+  config dir.
+
+Each path must exist and be under `/home/<user>/`. The same path can't be requested both read-write and read-only.
+Writable directories must not overlap (be nested within, contain, or equal) the working directory or each other, so a
+write can't land in two trees; read-only mounts and files may sit anywhere (e.g. a read-only file inside a read-write
+dir). The hostPath type (`File`/`Directory`) is auto-detected. There is no auto-mounting by file existence — apart from
+the agent's own config (Claude's `~/.claude/*`), every host integration is explicit via a flag.
 
 ### Module layout
 
@@ -142,7 +161,7 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 | `agent_uplink/bootstrap.py` | One-time setup: local registry, k3s `registries.yaml` check, mitm CA generation, docker build+push |
 | `agent_uplink/aws.py` | AWS helpers: dummy AKIA, dummy `~/.aws/credentials` INI for the agent, real per-AKIA credentials JSON for the mitm pod, profile env export |
 | `agent_uplink/kube.py` | Kubernetes context resolution: reads host kubeconfig via `kubectl config view`, validates auth method, produces sanitized pod kubeconfig + mitm wiring (allow rules, client certs, upstream CA bundle) |
-| `agent_uplink/rules.py` | Rule resolution: layers user YAML + kube rules + agent auth rules + `agent.default_rules()` + generic defaults (in precedence order, generic last), resolves keyring/exec placeholders, returns JSON bytes |
+| `agent_uplink/rules.py` | Rule resolution: layers agent auth rules + kube rules + user YAML + `agent.default_rules()` + generic defaults (in precedence order, generic last), resolves keyring/exec placeholders, returns JSON bytes |
 | `agent_uplink/session.py` | `Session` dataclass: tracks namespace + session_dir; `cleanup()` is `kubectl delete ns --wait=false` + rmtree |
 | `agent_uplink/reaper.py` | `list` / `clean` subcommands: find session namespaces by `managed-by=agent-uplink`, filter by id/age/all, delete leftovers from killed runs |
 | `agent_uplink/process.py` | `run_command` (piped) + `run_interactive` (stdio-attached) |
@@ -178,7 +197,7 @@ The CLI picks up the new agent as a subcommand automatically. All generic infra 
 
 With no `--rules` flag, three layers apply: the agent's per-mode auth rule, agent-specific defaults (e.g. Claude's Datadog logs), and the generic catch-all (`GET`/`OPTIONS`/`HEAD` anywhere). Everything else returns `403`.
 
-When `--rules <file>` is supplied, the user's rules are added. **Match priority is by layer, not regex length** — first match wins in this order: user rules → agent auth rule → agent defaults → generic catch-all (evaluated last). So a user rule always beats a default, and the broad `GET` catch-all is always considered last. Pass `--no-default-rules`, or set `replace_defaults: true` at the top of the YAML, to use only the user's rules; the agent's auth rule is then *also* skipped — the user supplies any auth the chosen mode needs.
+When `--rules <file>` is supplied, the user's rules are added. **Match priority is by layer, not regex length** — first match wins in this order: agent auth rule → kube rules → user rules → agent defaults → generic catch-all (evaluated last). Auth and kube rules lead so a broad user allow rule on an overlapping host (e.g. `.*\.amazonaws\.com`) can't win first-match and strip an injected credential — a real failure mode for `--bedrock`, whose auth is a header inject on `bedrock-runtime.<region>.amazonaws.com`. The user's rules still beat the per-agent and generic defaults, and the broad `GET` catch-all is always considered last. Pass `--no-default-rules`, or set `replace_defaults: true` at the top of the YAML, to use only the user's rules; the agent's auth rule is then *also* skipped — the user supplies any auth the chosen mode needs.
 
 ### Rule schema
 
@@ -195,7 +214,7 @@ rules:
         Authorization: 'Bearer {{keyring:my-svc:my-user}}'
 ```
 
-Rules are evaluated in layer order (user → agent auth → agent defaults → generic catch-all; see Default behaviour above), first match wins. An empty `paths: []` is rejected (omit `paths` to allow any path). Header values may contain any number of placeholders, resolved on the host before the mitm pod starts:
+Rules are evaluated in layer order (agent auth → kube → user → agent defaults → generic catch-all; see Default behaviour above), first match wins. An empty `paths: []` is rejected (omit `paths` to allow any path). Header values may contain any number of placeholders, resolved on the host before the mitm pod starts:
 
 - `{{keyring:SERVICE:USERNAME}}` — static secret from the OS keyring (`keyring.get_password()`).
 - `{{exec:COMMAND}}` — stdout (trailing newline stripped) of a host shell command, run at startup. For short-lived dynamic credentials keyring can't hold (e.g. an AWS CodeArtifact auth token). **Requires `--allow-exec`**; without it, a rules file containing an `{{exec:...}}` placeholder aborts startup (so a rules file alone can't run host commands).
@@ -230,20 +249,23 @@ keyring get my-svc my-user           # verify
 
 ### Claude agent: Java / Maven
 
-The image bundles OpenJDK 21 + Maven. When `~/.m2` exists on the host, the agent pod gets (no flag needed):
+The image bundles OpenJDK 21 + Maven. Maven support is **opt-in via `--maven`** (a claude-agent flag, since the JDK and
+truststore bits are baked into the claude image). With `--maven` the agent pod gets:
 
 - `~/.m2/settings.xml` mounted **read-only**, `~/.m2/repository` mounted **read-write** (the agent writes downloaded artifacts straight into the host's real local repo).
 - `MAVEN_OPTS` set to point the Maven JVM at `mitm:8080` — the JVM does **not** read `HTTPS_PROXY` (dockerd does), and the pod can egress only to mitm.
 - `CODEARTIFACT_AUTH_TOKEN=placeholder` so `${env.CODEARTIFACT_AUTH_TOKEN}` in `settings.xml` expands; the real CodeArtifact auth is injected by mitm (see `examples/rules/codeartifact.yaml`), never entering the pod.
 
+`--maven` is a shortcut for `--mount-ro ~/.m2/settings.xml --mount-rw ~/.m2/repository` plus the Maven proxy env above;
+the mount half can be reproduced with the generic flags, but the env half only comes with `--maven`.
+
 The mitm CA is added to the JVM truststore at image build (the JDK pulls in `ca-certificates-java`, which `update-ca-certificates` feeds from the system store), so Maven trusts mitm's TLS interception of HTTPS dependency downloads.
 
 ### Claude agent: Ansible
 
-The image bundles `ansible` (in a venv). When `~/.ansible.cfg` exists on the host it is mounted **read-only** at the
-agent user's `~/.ansible.cfg` (no flag needed, gated on existence like Maven), so the in-pod ansible picks up the
-user's defaults. Unlike credentials, the file's contents enter the pod verbatim — it bypasses mitm — so keep inline
-secrets (or `vault_password_file` references) out of it.
+The image bundles `ansible` (in a venv). It is **not** auto-configured. To share the host's defaults, mount the config
+read-only with the generic flag: `--mount-ro ~/.ansible.cfg`. Unlike credentials, the file's contents enter the pod
+verbatim — it bypasses mitm — so keep inline secrets (or `vault_password_file` references) out of it.
 
 ### Claude agent: private docker registry auth
 

@@ -172,44 +172,66 @@ def test_validate_cwd_must_be_under_home():
 
 
 # --------------------------------------------------------------------------- #
-# --add-dir validation
+# --mount-rw / --mount-ro validation
 # --------------------------------------------------------------------------- #
 
 
-def test_validate_extra_dirs_accepts_siblings(tmp_path, monkeypatch):
+def test_validate_mounts_accepts_siblings(tmp_path, monkeypatch):
     # Siblings of cwd and of each other are all valid.
     base = tmp_path / "home" / "alice"
     cwd = base / "code" / "repo-a"
     d1 = base / "code" / "repo-b"
-    d2 = base / ".ansible"
+    d2 = base / "shared"
     for p in (cwd, d1, d2):
         p.mkdir(parents=True)
     monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
-    result = cli.validate_extra_dirs("alice", cwd, [d1, d2])
-    assert result == [d1, d2]
+    result = cli.validate_mounts("alice", cwd, [d1, d2], [])
+    assert result == [cli.HostMount(d1, False), cli.HostMount(d2, False)]
 
 
-def test_validate_extra_dirs_deduplicates(tmp_path, monkeypatch):
+def test_validate_mounts_ro_file_is_read_only(tmp_path, monkeypatch):
+    base = tmp_path / "home" / "alice"
+    cwd = base / "repo"
+    cwd.mkdir(parents=True)
+    cfg = base / ".ansible.cfg"
+    cfg.write_text("[defaults]\n")
+    monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
+    result = cli.validate_mounts("alice", cwd, [], [cfg])
+    assert result == [cli.HostMount(cfg, True)]
+
+
+def test_validate_mounts_deduplicates(tmp_path, monkeypatch):
     base = tmp_path / "home" / "alice"
     cwd = base / "repo-a"
     d = base / "repo-b"
     for p in (cwd, d):
         p.mkdir(parents=True)
     monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
-    result = cli.validate_extra_dirs("alice", cwd, [d, d])
-    assert result == [d]
+    result = cli.validate_mounts("alice", cwd, [d, d], [])
+    assert result == [cli.HostMount(d, False)]
 
 
-def test_validate_extra_dirs_rejects_cwd_duplicate(tmp_path, monkeypatch):
+def test_validate_mounts_rejects_rw_ro_conflict(tmp_path, monkeypatch):
+    base = tmp_path / "home" / "alice"
+    cwd = base / "repo-a"
+    d = base / "repo-b"
+    for p in (cwd, d):
+        p.mkdir(parents=True)
+    monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
+    with pytest.raises(ValueError, match="both read-write and read-only"):
+        cli.validate_mounts("alice", cwd, [d], [d])
+
+
+def test_validate_mounts_rejects_cwd_duplicate(tmp_path, monkeypatch):
     base = tmp_path / "home" / "alice"
     cwd = base / "repo-a"
     cwd.mkdir(parents=True)
     monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
     with pytest.raises(ValueError, match="working directory"):
-        cli.validate_extra_dirs("alice", cwd, [cwd])
+        cli.validate_mounts("alice", cwd, [cwd], [])
 
 
-def test_validate_extra_dirs_rejects_descendant_of_cwd(tmp_path, monkeypatch):
+def test_validate_mounts_rejects_descendant_of_cwd(tmp_path, monkeypatch):
     base = tmp_path / "home" / "alice"
     cwd = base / "repo"
     child = cwd / "subdir"
@@ -217,10 +239,10 @@ def test_validate_extra_dirs_rejects_descendant_of_cwd(tmp_path, monkeypatch):
         p.mkdir(parents=True)
     monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
     with pytest.raises(ValueError, match="overlap"):
-        cli.validate_extra_dirs("alice", cwd, [child])
+        cli.validate_mounts("alice", cwd, [child], [])
 
 
-def test_validate_extra_dirs_rejects_ancestor_of_cwd(tmp_path, monkeypatch):
+def test_validate_mounts_rejects_ancestor_of_cwd(tmp_path, monkeypatch):
     base = tmp_path / "home" / "alice"
     parent = base / "code"
     cwd = parent / "repo"
@@ -228,10 +250,10 @@ def test_validate_extra_dirs_rejects_ancestor_of_cwd(tmp_path, monkeypatch):
         p.mkdir(parents=True)
     monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
     with pytest.raises(ValueError, match="overlap"):
-        cli.validate_extra_dirs("alice", cwd, [parent])
+        cli.validate_mounts("alice", cwd, [parent], [])
 
 
-def test_validate_extra_dirs_rejects_nested_extras(tmp_path, monkeypatch):
+def test_validate_mounts_rejects_nested_rw_dirs(tmp_path, monkeypatch):
     base = tmp_path / "home" / "alice"
     cwd = base / "cwd"
     d1 = base / "extra"
@@ -240,10 +262,25 @@ def test_validate_extra_dirs_rejects_nested_extras(tmp_path, monkeypatch):
         p.mkdir(parents=True)
     monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
     with pytest.raises(ValueError, match="overlap"):
-        cli.validate_extra_dirs("alice", cwd, [d1, d2])
+        cli.validate_mounts("alice", cwd, [d1, d2], [])
 
 
-def test_validate_extra_dirs_rejects_outside_home(tmp_path, monkeypatch):
+def test_validate_mounts_allows_ro_file_under_rw_dir(tmp_path, monkeypatch):
+    # Only writable directories are checked for overlap; a read-only file inside
+    # a read-write dir is allowed.
+    base = tmp_path / "home" / "alice"
+    cwd = base / "cwd"
+    d1 = base / "extra"
+    d1.mkdir(parents=True)
+    cwd.mkdir(parents=True)
+    cfg = d1 / "config"
+    cfg.write_text("x\n")
+    monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
+    result = cli.validate_mounts("alice", cwd, [d1], [cfg])
+    assert cli.HostMount(cfg, True) in result
+
+
+def test_validate_mounts_rejects_outside_home(tmp_path, monkeypatch):
     cwd = tmp_path / "home" / "alice" / "repo"
     outside = tmp_path / "srv" / "data"
     for p in (cwd, outside):
@@ -252,21 +289,23 @@ def test_validate_extra_dirs_rejects_outside_home(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_under_home",
                         lambda u, p: str(p).startswith(str(tmp_path / "home" / "alice")))
     with pytest.raises(ValueError, match="must be under /home"):
-        cli.validate_extra_dirs("alice", cwd, [outside])
+        cli.validate_mounts("alice", cwd, [outside], [])
 
 
-def test_validate_extra_dirs_rejects_nonexistent(tmp_path, monkeypatch):
+def test_validate_mounts_rejects_nonexistent(tmp_path, monkeypatch):
     base = tmp_path / "home" / "alice"
     cwd = base / "repo"
     cwd.mkdir(parents=True)
     monkeypatch.setattr(cli, "_under_home", lambda u, p: str(p).startswith(str(base)))
     with pytest.raises(ValueError, match="does not exist"):
-        cli.validate_extra_dirs("alice", cwd, [base / "ghost"])
+        cli.validate_mounts("alice", cwd, [base / "ghost"], [])
 
 
-def test_agent_pod_manifest_extra_dirs_adds_volumes_and_mounts(tmp_path):
+def test_agent_pod_manifest_extra_mounts_adds_volumes_and_mounts(tmp_path):
     d1 = tmp_path / "home" / "alice" / "repo-b"
-    d2 = tmp_path / "home" / "alice" / ".ansible"
+    d1.mkdir(parents=True)
+    ro_file = tmp_path / "home" / "alice" / ".ansible.cfg"
+    ro_file.write_text("[defaults]\n")
     contribution = PodContribution(
         env={},
         volumes=[],
@@ -278,26 +317,23 @@ def test_agent_pod_manifest_extra_dirs_adds_volumes_and_mounts(tmp_path):
     )
     pod = cli._agent_pod_manifest(
         "ns", "img", contribution, tmp_path / "home" / "alice" / "cwd",
-        "alice", 1000, "", cli.AgentMounts(extra_dirs=[d1, d2]),
+        "alice", 1000, "",
+        cli.AgentMounts(
+            extra_mounts=[cli.HostMount(d1, False), cli.HostMount(ro_file, True)]
+        ),
     )
-    vol_names = [v["name"] for v in pod["spec"]["volumes"]]
-    mnt_paths = [m["mountPath"] for m in pod["spec"]["containers"][0]["volumeMounts"]]
-    assert "add-dir-0" in vol_names
-    assert "add-dir-1" in vol_names
-    assert str(d1) in mnt_paths
-    assert str(d2) in mnt_paths
-    # Verify hostPath values.
-    hp_map = {
-        v["name"]: v["hostPath"]["path"]
-        for v in pod["spec"]["volumes"]
-        if "hostPath" in v
-    }
-    assert hp_map["add-dir-0"] == str(d1)
-    assert hp_map["add-dir-1"] == str(d2)
-    # No readOnly key on extra-dir mounts.
-    for m in pod["spec"]["containers"][0]["volumeMounts"]:
-        if m["name"].startswith("add-dir-"):
-            assert not m.get("readOnly")
+    mounts = pod["spec"]["containers"][0]["volumeMounts"]
+    by_name = {m["name"]: m for m in mounts}
+    assert by_name["mount-0"]["mountPath"] == str(d1)
+    assert by_name["mount-0"]["readOnly"] is False
+    assert by_name["mount-1"]["mountPath"] == str(ro_file)
+    assert by_name["mount-1"]["readOnly"] is True
+    # hostPath type is auto-detected: Directory for the dir, File for the file.
+    hp = {v["name"]: v["hostPath"] for v in pod["spec"]["volumes"] if "hostPath" in v}
+    assert hp["mount-0"]["path"] == str(d1)
+    assert hp["mount-0"]["type"] == "Directory"
+    assert hp["mount-1"]["path"] == str(ro_file)
+    assert hp["mount-1"]["type"] == "File"
 
 
 # --------------------------------------------------------------------------- #
