@@ -22,7 +22,16 @@ debug: false
 # deploy_context: local-k8s-admin
 
 # --- Rules / credential injection (allow-list policy) ------------------------
-# rules: examples/rules/git.yaml
+# `rules` is repeatable: list items are either file paths or inline rule
+# mappings, concatenated in order (earlier entries win first-match). So you can
+# point at files, define rules inline, or mix both — no separate file required.
+# rules:
+#   - examples/rules/git.yaml          # a rules file (path)
+#   - name: jira                       # an inline rule (same schema as a file entry)
+#     host: 'mycorp\.atlassian\.net'
+#     inject:
+#       headers:
+#         Authorization: 'Basic {{keyring:jira:me}}'
 # no_default_rules: false
 # allow_exec: false        # permit {{exec:...}} placeholders in the rules file
 

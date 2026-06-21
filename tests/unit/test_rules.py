@@ -97,6 +97,47 @@ def test_no_rules_at_all_raises(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Multiple sources / inline rules
+# --------------------------------------------------------------------------- #
+
+
+def test_multiple_files_concatenated_first_first(tmp_path):
+    a = tmp_path / "a.yaml"
+    a.write_text("rules:\n  - {name: a, host: 'a'}\n")
+    b = tmp_path / "b.yaml"
+    b.write_text("rules:\n  - {name: b, host: 'b'}\n")
+    out = _resolve([a, b], no_default_rules=True)
+    # First file's rules come first, so they win first-match over the second's.
+    assert [r["name"] for r in out["rules"]] == ["a", "b"]
+
+
+def test_inline_rule_dict_source():
+    out = _resolve(
+        [{"name": "inline", "host": "h"}], no_default_rules=True
+    )
+    assert [r["name"] for r in out["rules"]] == ["inline"]
+
+
+def test_mixed_file_and_inline_preserve_order(tmp_path):
+    a = tmp_path / "a.yaml"
+    a.write_text("rules:\n  - {name: from-file, host: 'a'}\n")
+    out = _resolve(
+        [a, {"name": "inline", "host": "h"}], no_default_rules=True
+    )
+    assert [r["name"] for r in out["rules"]] == ["from-file", "inline"]
+
+
+def test_replace_defaults_in_any_file(tmp_path):
+    a = tmp_path / "a.yaml"
+    a.write_text("rules:\n  - {name: a, host: 'a'}\n")
+    b = tmp_path / "b.yaml"
+    b.write_text("replace_defaults: true\nrules:\n  - {name: b, host: 'b'}\n")
+    # replace_defaults in the second file still drops the auth + generic layers.
+    out = _resolve([a, b], auth_rules=[{"name": "auth", "host": "x"}])
+    assert [r["name"] for r in out["rules"]] == ["a", "b"]
+
+
+# --------------------------------------------------------------------------- #
 # Schema validation
 # --------------------------------------------------------------------------- #
 

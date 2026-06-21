@@ -192,9 +192,13 @@ Key points:
 - **Precedence** (lowest to highest): `~/.agent-uplink.yaml` → … → project `./.agent-uplink.yaml` → CLI args. Scalars and
   booleans: closer file wins, CLI wins over all (`--no-debug` beats a config `debug: true`).
 - **Repeatable flags are additive.** List-valued flags (`aws_profiles`, `ssh_cidr`, `mount_rw`, `mount_ro`,
-  `git_https_rewrite`, `kube_context`) accumulate across every config file *and* the CLI. This relies on argparse's
+  `git_https_rewrite`, `kube_context`, `rules`) accumulate across every config file *and* the CLI. This relies on argparse's
   `extend` action extending the `set_defaults` list default with the CLI values. The passthrough positional (`claude_args`,
   after `--`) is the exception: a CLI `-- …` replaces a config `claude_args:`.
+- **Inline rules.** The `rules` list is special-cased (`config._STRUCTURED_LIST_DESTS`): a list item that is a mapping is
+  treated as an inline rule (same schema as a rules-file entry) and passed through verbatim rather than coerced to a
+  `Path`. File paths and inline rules can be mixed in one list; `rules.resolve()` concatenates all sources in order
+  (earlier sources win first-match). So rules can be defined entirely inline in `.agent-uplink.yaml` with no separate file.
 - **store_const flags** that share a dest (`--anthropic`/`--bedrock` → `auth_mode`) are settable by option name
   (`anthropic: true`) or dest (`auth_mode: anthropic`). Because config can supply the mode, the claude subparser's mode
   group is **not** argparse-`required`; `ClaudeAgent.__init__` enforces that one was supplied by either route.
@@ -224,7 +228,7 @@ The CLI picks up the new agent as a subcommand automatically. All generic infra 
 
 With no `--rules` flag, three layers apply: the agent's per-mode auth rule, agent-specific defaults (e.g. Claude's Datadog logs), and the generic catch-all (`GET`/`OPTIONS`/`HEAD` anywhere). Everything else returns `403`.
 
-When `--rules <file>` is supplied, the user's rules are added. **Match priority is by layer, not regex length** — first match wins in this order: agent auth rule → kube rules → user rules → agent defaults → generic catch-all (evaluated last). Auth and kube rules lead so a broad user allow rule on an overlapping host (e.g. `.*\.amazonaws\.com`) can't win first-match and strip an injected credential — a real failure mode for `--bedrock`, whose auth is a header inject on `bedrock-runtime.<region>.amazonaws.com`. The user's rules still beat the per-agent and generic defaults, and the broad `GET` catch-all is always considered last. Pass `--no-default-rules`, or set `replace_defaults: true` at the top of the YAML, to use only the user's rules; the agent's auth rule is then *also* skipped — the user supplies any auth the chosen mode needs.
+When `--rules <file>` is supplied, the user's rules are added. `--rules` is repeatable (`--rules a.yaml b.yaml`) and the user layer can also be defined inline in `.agent-uplink.yaml` under the `rules:` key (file paths and inline rule mappings can be mixed). `rules.resolve()` takes a list of sources (each a `Path` to a YAML file or an inline rule `dict`) and concatenates them in order to form the single user layer — an earlier source wins first-match over a later one; a bare `Path`/`None` is still accepted as shorthand. **Match priority is by layer, not regex length** — first match wins in this order: agent auth rule → kube rules → user rules → agent defaults → generic catch-all (evaluated last). Auth and kube rules lead so a broad user allow rule on an overlapping host (e.g. `.*\.amazonaws\.com`) can't win first-match and strip an injected credential — a real failure mode for `--bedrock`, whose auth is a header inject on `bedrock-runtime.<region>.amazonaws.com`. The user's rules still beat the per-agent and generic defaults, and the broad `GET` catch-all is always considered last. Pass `--no-default-rules`, or set `replace_defaults: true` at the top of any rules file, to use only the user's rules; the agent's auth rule is then *also* skipped — the user supplies any auth the chosen mode needs.
 
 ### Rule schema
 
