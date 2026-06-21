@@ -59,6 +59,14 @@ class ClaudeAgent(Agent):
 
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__(args)
+        # The --anthropic/--bedrock group is not argparse-required so the mode
+        # can come from a .agent-uplink.yaml (auth_mode:/anthropic:/bedrock:)
+        # instead; enforce that one was supplied by either route here.
+        if args.auth_mode is None:
+            raise SystemExit(
+                "agent-uplink claude: an auth mode is required; pass --anthropic "
+                "or --bedrock, or set auth_mode in .agent-uplink.yaml"
+            )
         self._auth_mode: str = args.auth_mode
         self._claude_config: dict | None = None
 
@@ -71,7 +79,11 @@ class ClaudeAgent(Agent):
             default=cls.default_image_repo(),
             help="Claude image repo (registry endpoint + :tag added by orchestrator)",
         )
-        mode_group = parser.add_mutually_exclusive_group(required=True)
+        # Not required at the argparse level: the mode may instead come from a
+        # .agent-uplink.yaml (auth_mode/anthropic/bedrock). ClaudeAgent.__init__
+        # enforces that exactly one was supplied by either route. The group still
+        # makes --anthropic and --bedrock mutually exclusive on the CLI.
+        mode_group = parser.add_mutually_exclusive_group(required=False)
         mode_group.add_argument(
             "--anthropic",
             dest="auth_mode",

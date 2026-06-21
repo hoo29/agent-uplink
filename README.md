@@ -145,6 +145,45 @@ the default falls back to `default` mode). Pass `--permission-mode` after `--` t
 
 Each run creates a session namespace `agent-uplink-<id>`, torn down on exit.
 
+### Configuration file
+
+Every CLI flag can be set in a `.agent-uplink.yaml` file so you don't have to retype them. On an agent run, agent-uplink
+reads every `.agent-uplink.yaml` from the working directory up to and including `~/.agent-uplink.yaml`, then applies the
+CLI args on top. Precedence, lowest to highest:
+
+```
+~/.agent-uplink.yaml  <  ...  <  ./<project>/.agent-uplink.yaml  <  CLI args
+```
+
+So a home-level file holds your defaults, a project-level file overrides them, and an explicit CLI flag always wins. The
+`list` / `clean` subcommands ignore config.
+
+Keys are the flag's long name with or without dashes (`mount-rw` and `mount_rw` both work). Scalars and booleans follow
+the precedence above (closer file wins, CLI wins over all). **Repeatable flags are additive** — values from every config
+file and the CLI accumulate rather than replace:
+
+```yaml
+# ~/.agent-uplink.yaml — personal defaults for every project
+anthropic: true                 # auth mode; or `bedrock: true`, or `auth_mode: anthropic`
+debug: false
+aws_profiles: [shared-readonly] # additive across files + CLI
+mount_ro: [~/.ansible.cfg]
+```
+
+```yaml
+# ./.agent-uplink.yaml — project overrides, layered on top of the home file
+rules: examples/rules/git.yaml
+git_https_rewrite: [git.internal.example.com]
+aws_profiles: [project-deploy]  # appended -> [shared-readonly, project-deploy]
+kube_context: [dev-cluster]
+```
+
+With those two files, `agent-uplink claude` behaves as if you had passed every flag; `agent-uplink claude --bedrock -a extra`
+switches the mode and appends `extra` to the AWS profiles. A worked example lives in
+[`examples/agent-uplink.yaml`](examples/agent-uplink.yaml). Unknown keys or invalid values abort startup before any pod is
+launched. (The passthrough args after `--` are the one exception to "additive": a CLI `-- ...` replaces a config
+`claude_args:` rather than appending.)
+
 ### Managing sessions
 
 Teardown rides on the run's signal handlers, so a `kill -9`, a host crash, or a closed laptop lid can leave a session namespace
