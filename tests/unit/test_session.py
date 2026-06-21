@@ -83,7 +83,7 @@ def test_cleanup_warns_about_other_sessions_over_24h(tmp_path, monkeypatch, capl
         s.cleanup()
 
     text = caplog.text
-    assert "1 other agent-uplink session(s) still active after 24h" in text
+    assert "1 potential orphaned sessions" in text
     assert "stale1" in text
     assert "agent-uplink clean --older-than 24h" in text
     # The current namespace and the young one are not reported as stale.
