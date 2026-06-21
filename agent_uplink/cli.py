@@ -6,10 +6,12 @@ import logging
 import os
 import pwd
 import signal
+import sys
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
+from . import config
 from .agents import AGENTS, Agent
 from .agents.base import PodBuildContext, PodContribution, PreparedAgent
 from .aws import (
@@ -232,13 +234,16 @@ def _common_arg_parser() -> argparse.ArgumentParser:
     return common
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
+    """The top-level parser plus the per-agent subparsers (by name), so config
+    defaults can be applied to the right subparser before the real parse."""
     parser = argparse.ArgumentParser(
         prog="agent-uplink", description="Trust is a weakness"
     )
     sub = parser.add_subparsers(
         dest="agent_name", required=True, metavar="AGENT")
     common = _common_arg_parser()
+    agent_parsers: dict[str, argparse.ArgumentParser] = {}
     for name, agent_cls in AGENTS.items():
         agent_parser = sub.add_parser(
             name,
@@ -247,8 +252,42 @@ def parse_args() -> argparse.Namespace:
             help=f"Run the {name} agent",
         )
         agent_cls.add_cli_args(agent_parser)
+        agent_parsers[name] = agent_parser
     _add_management_commands(sub)
-    return parser.parse_args()
+    return parser, agent_parsers
+
+
+def _peek_subcommand(
+    argv: list[str], names: dict[str, argparse.ArgumentParser]
+) -> str | None:
+    """The agent subcommand on the command line, if any, found before the real
+    parse so config can be layered onto its subparser. The subcommand is the
+    first positional; anything before it would be a top-level flag (only -h)."""
+    for token in argv:
+        if token in names:
+            return token
+        if not token.startswith("-"):
+            return None
+    return None
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser, agent_parsers = build_parser()
+    # Config applies only to an agent run (not list/clean): fold every
+    # .agent-uplink.yaml from cwd up to ~ into that subparser's defaults so the
+    # subsequent parse treats them as defaults and CLI args still win.
+    name = _peek_subcommand(argv, agent_parsers)
+    if name is not None:
+        try:
+            defaults = config.load_config(
+                agent_parsers[name], Path.cwd(), Path.home()
+            )
+        except config.ConfigError as exc:
+            parser.error(str(exc))
+        if defaults:
+            agent_parsers[name].set_defaults(**defaults)
+    return parser.parse_args(argv)
 
 
 def _add_deploy_context_arg(parser: argparse.ArgumentParser) -> None:

@@ -1,0 +1,56 @@
+# Example .agent-uplink.yaml
+#
+# Copy to ~/.agent-uplink.yaml for personal defaults, or into a project
+# directory for per-project settings. agent-uplink reads every .agent-uplink.yaml
+# from the working directory up to ~/.agent-uplink.yaml; closer files override
+# farther ones, and CLI flags override all of them.
+#
+# Keys are the long CLI flag names (dashes or underscores both work). Repeatable
+# flags (aws_profiles, ssh_cidr, mount_rw, mount_ro, git_https_rewrite,
+# kube_context) are additive: values from every config file and the CLI
+# accumulate rather than replace.
+
+# --- Claude auth mode (required by one route or another) ---------------------
+# One of: `anthropic: true`, `bedrock: true`, or `auth_mode: anthropic|bedrock`.
+anthropic: true
+
+# --- Common runtime options --------------------------------------------------
+debug: false
+# force_rebuild: false
+# mitmproxy_image: mitmproxy/mitmproxy:12
+# agent_runtime_class: kata-clh
+# deploy_context: local-k8s-admin
+
+# --- Rules / credential injection (allow-list policy) ------------------------
+# rules: examples/rules/git.yaml
+# no_default_rules: false
+# allow_exec: false        # permit {{exec:...}} placeholders in the rules file
+
+# --- AWS SigV4 re-signing (additive) -----------------------------------------
+# aws_profiles:
+#   - shared-readonly
+
+# --- Extra host mounts (additive) --------------------------------------------
+# mount_ro:
+#   - ~/.ansible.cfg
+# mount_rw:
+#   - ~/code/other-repo
+
+# --- Git over HTTPS ----------------------------------------------------------
+# git_https_rewrite:
+#   - git.internal.example.com
+# no_git_identity: false
+
+# --- SSH egress (additive CIDRs) ---------------------------------------------
+# ssh_cidr:
+#   - 10.0.0.0/24
+# ssh_key_dir: ~/keys/agent
+
+# --- Kubernetes cluster access (additive contexts) ---------------------------
+# kube_context:
+#   - dev-cluster
+# kubeconfig: ~/.kube/config
+
+# --- Claude-specific ---------------------------------------------------------
+# maven: false
+# image: agent-uplink-claude
