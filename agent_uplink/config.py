@@ -15,9 +15,14 @@ and underscores are interchangeable. Values are coerced with the action's own
 
 Two value shapes get special handling:
 
-  - Repeatable flags (`--aws-profiles`, `--ssh-cidr`, `--mount-rw`, ...) are
-    *additive*: values from every config file (and then the CLI) accumulate
-    rather than replace. A scalar is accepted as a one-element list.
+  - Repeatable flags (`--aws-profiles`, `--ssh-cidr`, `--mount-rw`, `--rules`,
+    ...) are *additive*: values from every config file (and then the CLI)
+    accumulate rather than replace. A scalar is accepted as a one-element list.
+    For `rules` a list item may also be a mapping — an inline rule (same schema
+    as a rules file's `rules:` entry) defined directly in the config — which is
+    passed through verbatim instead of being coerced to a `Path` (see
+    `_STRUCTURED_LIST_DESTS`); rule files and inline rules can be mixed in one
+    list and are resolved in order.
   - store_const flags that share a dest (`--anthropic` / `--bedrock` ->
     `auth_mode`) are set either by the option name (`anthropic: true`) or by the
     dest (`auth_mode: anthropic`).
@@ -41,6 +46,12 @@ CONFIG_FILENAME = ".agent-uplink.yaml"
 
 # Never settable from a config file: the subcommand selector and the help flag.
 _EXCLUDED_DESTS = {"help", "agent_name"}
+
+# List-valued dests whose items may be structured mappings (inline rules) rather
+# than scalars. For these, a mapping item is passed through verbatim instead of
+# being run through the flag's `type` (which expects a string path); the rule
+# resolver validates the mapping later. Only `rules` accepts inline objects.
+_STRUCTURED_LIST_DESTS = {"rules"}
 
 
 class ConfigError(ValueError):
@@ -163,7 +174,11 @@ def _merge_file(merged: dict[str, Any], data: dict, spec: _Spec, file: Path) -> 
 
         if dest in spec.list_dests:
             items = value if isinstance(value, list) else [value]
-            coerced = [_coerce(action, v, file) for v in items]
+            structured = dest in _STRUCTURED_LIST_DESTS
+            coerced = [
+                v if structured and isinstance(v, dict) else _coerce(action, v, file)
+                for v in items
+            ]
             merged.setdefault(dest, []).extend(coerced)
             continue
 

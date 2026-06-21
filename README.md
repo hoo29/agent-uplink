@@ -172,11 +172,21 @@ mount_ro: [~/.ansible.cfg]
 
 ```yaml
 # ./.agent-uplink.yaml — project overrides, layered on top of the home file
-rules: examples/rules/git.yaml
+rules:
+  - examples/rules/git.yaml     # a rules file (path), additive across files + CLI
+  - name: jira                  # an inline rule, same schema as a rules file entry
+    host: 'mycorp\.atlassian\.net'
+    inject:
+      headers:
+        Authorization: 'Basic {{keyring:jira:me}}'
 git_https_rewrite: [git.internal.example.com]
 aws_profiles: [project-deploy]  # appended -> [shared-readonly, project-deploy]
 kube_context: [dev-cluster]
 ```
+
+`rules` is repeatable: list items are either file paths or inline rule mappings, concatenated in order (earlier entries
+win first-match), so you can define rules inline without a separate file. `--rules a.yaml b.yaml` on the CLI behaves the
+same way and appends after any config files.
 
 With those two files, `agent-uplink claude` behaves as if you had passed every flag; `agent-uplink claude --bedrock -a extra`
 switches the mode and appends `extra` to the AWS profiles. A worked example lives in
@@ -288,7 +298,12 @@ Real tokens and client keys never appear in the pod kubeconfig or the agent cont
 YAML allow-list, first match wins. Match priority is by **layer**, not regex length: the agent's auth rule (and any kube
 rules) first, then your rules, then agent defaults, then the generic `GET`/`OPTIONS`/`HEAD`-anywhere catch-all last. Auth
 and kube rules lead so a broad rule of yours on an overlapping host (e.g. `.*\.amazonaws\.com`) can't shadow an injected
-credential. `--no-default-rules` (or `replace_defaults: true`) keeps only your rules (and drops the auth rule).
+credential. `--no-default-rules` (or `replace_defaults: true` in any rules file) keeps only your rules (and drops the auth
+rule).
+
+`--rules` is repeatable (`--rules a.yaml b.yaml`); files are concatenated in order, an earlier file winning first-match
+over a later one. Rules can also be defined inline in `.agent-uplink.yaml` under the same `rules:` key (file paths and
+inline rule mappings can be mixed in one list) — see [Configuration file](#configuration-file).
 
 ```yaml
 rules:

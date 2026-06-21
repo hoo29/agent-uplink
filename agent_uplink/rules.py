@@ -149,7 +149,7 @@ def _validate_and_resolve_rule(rule: dict, idx: int, allow_exec: bool) -> dict:
 
 
 def resolve(
-    user_rules_path: Path | None,
+    user_rules: "Path | list[Path | dict] | None",
     no_default_rules: bool,
     agent: Agent,
     auth_rules: list[dict],
@@ -168,13 +168,23 @@ def resolve(
       2. kube rules                (auto-generated from --kube-context; always
                                     included when kube is enabled, regardless of
                                     --no-default-rules, so k8s traffic is allowed)
-      3. user-supplied YAML        (the operator's added destinations)
+      3. user-supplied rules       (the operator's added destinations)
       4. agents/<name>/default_rules.yaml   (per-agent)
       5. agent_uplink/default_rules.yaml    (generic catch-all, evaluated LAST)
 
     Within a layer, declaration order is preserved. Ordering by layer (rather
     than the old sort-by-host-length heuristic) keeps the broad generic rule
     last and a user rule ahead of the per-agent/generic defaults.
+
+    `user_rules` is a sequence of rule *sources*, concatenated in order to form
+    the user layer (so a source listed first wins first-match over a later one):
+
+      - a `Path`          a YAML rules file ({rules: [...], replace_defaults?})
+      - a `dict`          a single inline rule (same schema as a file rule),
+                          e.g. supplied directly in `.agent-uplink.yaml`
+
+    A bare `Path`/`None` is accepted as shorthand for a single-file / empty
+    source list.
 
     Auth and kube rules sit ABOVE user rules deliberately: each injects a
     credential on a narrow host (bedrock-runtime.<region>.amazonaws.com,
@@ -183,20 +193,36 @@ def resolve(
     and strip the injected credential, breaking auth. To take over the agent's
     auth entirely, use --no-default-rules and supply your own rule.
 
-    `--no-default-rules` (or `replace_defaults: true` in the user's YAML) keeps
-    only the kube rules and the user's YAML, dropping the auth rule too — the
-    user becomes responsible for supplying any auth the chosen mode needs.
+    `--no-default-rules` (or `replace_defaults: true` in any rules file) keeps
+    only the kube rules and the user rules, dropping the auth rule too — the user
+    becomes responsible for supplying any auth the chosen mode needs.
 
     `allow_exec` permits `{{exec:...}}` placeholders to run host shell commands.
     `kube_rules` are synthetic rules produced by kube.resolve(); they are always
     included when non-empty so that k8s traffic is allowed regardless of
     --no-default-rules.
     """
-    user_config: dict = {}
-    if user_rules_path is not None:
-        user_config = _load_yaml(user_rules_path)
+    if user_rules is None:
+        sources: list = []
+    elif isinstance(user_rules, (str, Path)):
+        sources = [user_rules]
+    else:
+        sources = list(user_rules)
 
-    use_defaults = not (no_default_rules or user_config.get("replace_defaults", False))
+    # Concatenate every source into the user layer, first source first.
+    # `replace_defaults` in any file source switches off the built-in layers.
+    user_layer: list[dict] = []
+    replace_defaults = False
+    for source in sources:
+        if isinstance(source, dict):
+            user_layer.append(source)
+            continue
+        cfg = _load_yaml(Path(source))
+        if cfg.get("replace_defaults", False):
+            replace_defaults = True
+        user_layer.extend(cfg.get("rules") or [])
+
+    use_defaults = not (no_default_rules or replace_defaults)
 
     layered: list[dict] = []
     # Auth rules first so a broad user allow rule on an overlapping host can't
@@ -208,7 +234,7 @@ def resolve(
     # --no-default-rules would silently block all kubectl traffic. Above user
     # rules for the same shadow-protection reason as auth rules.
     layered.extend(kube_rules or [])
-    layered.extend(user_config.get("rules") or [])
+    layered.extend(user_layer)
     if use_defaults:
         layered.extend(agent.default_rules())
         layered.extend(_load_yaml(GENERIC_DEFAULT_RULES_PATH).get("rules") or [])

@@ -126,8 +126,13 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         "-r",
         "--rules",
         type=Path,
-        default=None,
-        help="YAML rules file (allow-list policy + credential injection)",
+        nargs="*",
+        action="extend",
+        default=[],
+        metavar="FILE",
+        help="YAML rules file(s) (allow-list policy + credential injection). "
+        "Repeatable; files are concatenated in order, earlier files winning "
+        "first-match. Inline rules can also be set in .agent-uplink.yaml.",
     )
     common.add_argument(
         "--no-default-rules",
