@@ -55,7 +55,7 @@ def _parse_timestamp(value: str | None) -> datetime | None:
         return None
 
 
-def _format_age(seconds: float) -> str:
+def format_age(seconds: float) -> str:
     s = int(seconds)
     if s < 60:
         return f"{s}s"
@@ -109,7 +109,7 @@ def cmd_list() -> int:
         return 0
     print(f"{'SESSION':<14}{'STATUS':<13}{'AGE':<9}NAMESPACE")
     for s in sessions:
-        print(f"{s.id:<14}{s.phase:<13}{_format_age(s.age_seconds):<9}{s.namespace}")
+        print(f"{s.id:<14}{s.phase:<13}{format_age(s.age_seconds):<9}{s.namespace}")
     return 0
 
 
@@ -154,7 +154,7 @@ def cmd_clean(
 
     LOGGER.info("will delete:")
     for s in targets:
-        LOGGER.info(f"  {s.namespace} (age {_format_age(s.age_seconds)}, {s.phase})")
+        LOGGER.info(f"  {s.namespace} (age {format_age(s.age_seconds)}, {s.phase})")
 
     if not assume_yes and not _confirm(len(targets)):
         LOGGER.info("aborted")
