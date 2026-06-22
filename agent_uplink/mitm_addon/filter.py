@@ -48,6 +48,32 @@ _SIGV4_HEADERS_TO_STRIP = (
 
 _UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD"
 
+# Headers never included in the signature, lower-cased. Mirrors the AWS SDK
+# signers that aws-sigv4-proxy delegates to: the SDK owns `authorization`, while
+# `user-agent` / `x-amzn-trace-id` are added or rewritten by hops so AWS excludes
+# them. The hop-by-hop headers below are added/rewritten by mitmproxy on the way
+# out, so signing them would not match what AWS receives. Everything else on the
+# request IS signed — S3 rejects any `x-amz-*` (or content-*) header that is
+# present but absent from SignedHeaders ("headers present ... which were not
+# signed"), which a fixed minimal signed-header set could not satisfy.
+_UNSIGNED_HEADERS = frozenset(
+    {
+        "authorization",
+        "user-agent",
+        "x-amzn-trace-id",
+        "connection",
+        "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "expect",
+    }
+)
+
 # A region label in an AWS host: us-east-1, eu-west-2, ap-southeast-1,
 # us-gov-west-1, etc.
 _REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+(-[a-z]+)?-\d+$")
@@ -140,6 +166,37 @@ def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
+def _collect_signed_headers(req: http.Request, amz_date: str, payload_hash: str,
+                            token: str | None) -> dict[str, str]:
+    """All headers that go into the signature, lower-cased name -> trimmed value.
+
+    Signs every header on the request except the `_UNSIGNED_HEADERS` ignore-list,
+    matching the AWS SDK signers aws-sigv4-proxy delegates to. S3 enforces that
+    any header it receives appears in SignedHeaders, so a fixed minimal set is
+    not enough — `content-type`, `x-amz-*` extensions, `range`, etc. must all be
+    signed. The synthetic host / x-amz-date / x-amz-content-sha256 / security
+    token are set before collection so they're included too.
+    """
+    signed: dict[str, str] = {}
+    for name, value in req.headers.items(multi=True):
+        lname = name.lower()
+        if lname in _UNSIGNED_HEADERS:
+            continue
+        # Trim and collapse internal runs of whitespace, per the SigV4 spec.
+        trimmed = " ".join(value.split())
+        if lname in signed:
+            signed[lname] = f"{signed[lname]},{trimmed}"
+        else:
+            signed[lname] = trimmed
+    # `host` is not a normal header field on the request object; add it explicitly.
+    signed["host"] = req.host
+    signed["x-amz-date"] = amz_date
+    signed["x-amz-content-sha256"] = payload_hash
+    if token:
+        signed["x-amz-security-token"] = token
+    return signed
+
+
 def sigv4_sign(
     req: http.Request,
     creds: dict,
@@ -148,10 +205,9 @@ def sigv4_sign(
     payload_hash: str,
 ) -> None:
     """Sign `req` in place with SigV4, setting X-Amz-Date, X-Amz-Content-Sha256,
-    the session token (when present) and the Authorization header. Signs the
-    minimal header set (host, x-amz-content-sha256, x-amz-date, and the security
-    token when present) — AWS only verifies the headers listed in SignedHeaders,
-    so unsigned headers like content-type or x-amz-target ride along untouched.
+    the session token (when present) and the Authorization header. Every header
+    present on the request (minus the `_UNSIGNED_HEADERS` ignore-list) is signed,
+    so S3 never rejects a present-but-unsigned header.
     """
     access_key = creds["access_key_id"]
     secret_key = creds["secret_access_key"]
@@ -170,13 +226,7 @@ def sigv4_sign(
     if token:
         req.headers["X-Amz-Security-Token"] = token
 
-    signed = {
-        "host": req.host,
-        "x-amz-content-sha256": payload_hash,
-        "x-amz-date": amz_date,
-    }
-    if token:
-        signed["x-amz-security-token"] = token
+    signed = _collect_signed_headers(req, amz_date, payload_hash, token)
     signed_headers = ";".join(sorted(signed))
     canonical_headers = "".join(f"{k}:{signed[k]}\n" for k in sorted(signed))
 

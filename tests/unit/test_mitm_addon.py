@@ -55,6 +55,9 @@ class Headers:
     def __getitem__(self, k):
         return self._d[k.lower()][1]
 
+    def items(self, multi=False):
+        return [(orig, val) for orig, val in self._d.values()]
+
 
 def req(host, method="GET", path="/", headers=None, scheme="https", port=443,
         raw_content=b""):
@@ -180,6 +183,32 @@ def test_sigv4_sign_sets_authorization_with_real_key(monkeypatch):
     assert len(signature) == 64 and all(c in "0123456789abcdef" for c in signature)
     assert r.headers["X-Amz-Date"] == "20240102T030405Z"
     assert r.headers["X-Amz-Content-Sha256"] == "abc123"
+
+
+def test_sigv4_sign_signs_all_present_headers(monkeypatch):
+    # Regression: S3 GetObject failed with "headers present in the request which
+    # were not signed" because extra headers (content-type, x-amz-*, range) rode
+    # along unsigned. Every present header except the ignore-list must appear in
+    # SignedHeaders.
+    _freeze_time(monkeypatch)
+    r = req("s3.us-east-1.amazonaws.com", "GET", "/bucket/key",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Range": "bytes=0-1023",
+                "X-Amz-Request-Payer": "requester",
+                "User-Agent": "should-not-be-signed",
+            })
+    addon.sigv4_sign(cast(Any, r), CREDS, "s3", "us-east-1", "UNSIGNED-PAYLOAD")
+    signed_headers = r.headers["Authorization"].split("SignedHeaders=")[1].split(",")[0]
+    parts = signed_headers.split(";")
+    for h in ("content-type", "range", "x-amz-request-payer",
+              "host", "x-amz-content-sha256", "x-amz-date"):
+        assert h in parts, (h, signed_headers)
+    # Ignore-listed headers are excluded.
+    assert "user-agent" not in parts
+    assert "authorization" not in parts
+    # SignedHeaders is sorted.
+    assert parts == sorted(parts)
 
 
 def test_sigv4_sign_includes_session_token_in_signed_headers(monkeypatch):
