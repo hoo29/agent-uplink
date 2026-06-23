@@ -35,6 +35,17 @@ def test_requests_below_limits_give_burstable():
     assert c["resources"]["requests"] == {"memory": "256Mi", "cpu": "100m"}
 
 
+def test_cpu_none_omits_cpu_limit():
+    # cpu=None means no CPU limit (uncapped burst) while still reserving the
+    # request — Kubernetes leaves a container with no CPU limit uncapped.
+    c = container_spec(
+        image="x",
+        resources=Resources(memory="512Mi", cpu=None, cpu_request="500m"),
+    )
+    assert c["resources"]["limits"] == {"memory": "512Mi"}
+    assert c["resources"]["requests"] == {"memory": "512Mi", "cpu": "500m"}
+
+
 # --------------------------------------------------------------------------- #
 # network_policy_manifest policyTypes derivation
 # --------------------------------------------------------------------------- #
