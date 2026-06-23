@@ -505,6 +505,22 @@ def test_mitm_manifest_mounts_aws_creds_when_present():
     _assert_set_arg(container["args"], "aws_creds_file=/aws-creds/creds.json")
 
 
+def test_mitm_manifest_no_debug_logging_by_default():
+    pod = next(m for m in cli._mitm_manifests("ns", "img", "") if m["kind"] == "Pod")
+    args = pod["spec"]["containers"][0]["args"]
+    assert "termlog_verbosity=debug" not in args
+    assert "flow_detail=3" not in args
+
+
+def test_mitm_manifest_enables_verbose_logging_with_debug():
+    pod = next(
+        m for m in cli._mitm_manifests("ns", "img", "", debug=True) if m["kind"] == "Pod"
+    )
+    args = pod["spec"]["containers"][0]["args"]
+    _assert_set_arg(args, "termlog_verbosity=debug")
+    _assert_set_arg(args, "flow_detail=3")
+
+
 def test_mitm_manifest_kube_client_certs_and_upstream_ca():
     pod = next(
         m for m in cli._mitm_manifests(
