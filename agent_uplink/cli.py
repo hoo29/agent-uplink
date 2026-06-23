@@ -236,6 +236,14 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="Run agent in debug mode (agent-specific)",
     )
+    common.add_argument(
+        "--mitm-debug",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable verbose mitmproxy debug logging (flow details + debug level). "
+        "WARNING: may log plaintext credentials (headers, bodies, re-signed AWS "
+        "requests) to the mitm pod's stdout. Off by default.",
+    )
     return common
 
 
@@ -463,6 +471,7 @@ def _mitm_manifests(
     aws_creds_secret: str | None = None,
     kube_client_certs_secret: str | None = None,
     kube_upstream_ca_secret: str | None = None,
+    debug: bool = False,
 ) -> list[dict]:
     labels = _label("mitm")
     # uid 1000 = the `mitmproxy` user baked into the upstream image. The certs
@@ -487,6 +496,14 @@ def _mitm_manifests(
         "--set",
         "rules_file=/rules/rules.json",
     ]
+    if debug:
+        # Verbose flow logging. WARNING: flow_detail=3 dumps headers and bodies,
+        # including re-signed AWS Authorization headers and request payloads, to
+        # the mitm pod's stdout in plaintext. Off by default; opt in with
+        # --mitm-debug only when diagnosing.
+        mitm_args.extend(
+            ["--set", "termlog_verbosity=debug", "--set", "flow_detail=3"]
+        )
     volume_mounts = [
         {"name": "addon", "mountPath": "/addon", "readOnly": True},
         {"name": "rules", "mountPath": "/rules", "readOnly": True},
@@ -1159,6 +1176,7 @@ def _assemble_manifests(
             aws_creds_secret=aws_plan.creds_secret_name,
             kube_client_certs_secret=kube_secrets.client_certs_secret,
             kube_upstream_ca_secret=kube_secrets.upstream_ca_secret,
+            debug=args.mitm_debug,
         )
     )
     if ssh_plan is not None:
