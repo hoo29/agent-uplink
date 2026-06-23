@@ -1,0 +1,13 @@
+{
+  "rules": [
+    {
+      "name": "bedrock-auth",
+      "host": "bedrock-runtime\\.[a-z0-9-]+\\.amazonaws\\.com",
+      "inject": {
+        "headers": {
+          "Authorization": "Bearer REPRO-FAKE-BEARER-TOKEN-0000"
+        }
+      }
+    }
+  ]
+}
