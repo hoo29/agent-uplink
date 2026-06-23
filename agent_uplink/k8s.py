@@ -218,10 +218,12 @@ class Resources:
     scheduler reservation; when unset they default to the limit — matching
     Kubernetes' own behaviour when `requests` is omitted — so callers that only
     care about a cap are unchanged. Set a request below the limit to schedule on
-    smaller nodes while still allowing the pod to burst (Burstable QoS)."""
+    smaller nodes while still allowing the pod to burst (Burstable QoS). Set
+    `cpu=None` to omit the CPU limit entirely (uncapped burst) while still
+    reserving `cpu_request`."""
 
     memory: str = "256Mi"
-    cpu: str = "1"
+    cpu: str | None = "1"
     memory_request: str | None = None
     cpu_request: str | None = None
 
@@ -251,17 +253,18 @@ def container_spec(
 ) -> dict:
     resources = resources or Resources()
     stdio = stdio or Stdio()
+    requests: dict = {"memory": resources.memory_request or resources.memory}
+    cpu_request = resources.cpu_request or resources.cpu
+    if cpu_request is not None:
+        requests["cpu"] = cpu_request
+    limits: dict = {"memory": resources.memory}
+    if resources.cpu is not None:
+        limits["cpu"] = resources.cpu
     container: dict = {
         "name": name,
         "image": image,
         "imagePullPolicy": image_pull_policy,
-        "resources": {
-            "requests": {
-                "memory": resources.memory_request or resources.memory,
-                "cpu": resources.cpu_request or resources.cpu,
-            },
-            "limits": {"memory": resources.memory, "cpu": resources.cpu},
-        },
+        "resources": {"requests": requests, "limits": limits},
     }
     if command:
         container["command"] = command
