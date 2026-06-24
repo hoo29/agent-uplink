@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-uplink"
-version = "0.11.0"
+version = "0.11.1"
 description = "Agent Sandbox"
 readme = "README.md"
 authors = [{ name = "Huw" }]
