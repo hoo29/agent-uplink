@@ -794,11 +794,15 @@ def _agent_pod_manifest(
         env=env,
         volume_mounts=mounts,
         security_context=contribution.security_context,
-        # Reserve modestly so the pod schedules on small nodes; the limit is the
-        # real ceiling the in-pod dockerd needs (tmpfs /var/lib/docker counts
-        # against memory).
+        # Reserve modestly so the pod schedules on small nodes; the memory limit
+        # is the real ceiling the in-pod dockerd needs (tmpfs /var/lib/docker
+        # counts against memory). CPU is left uncapped so the agent (and its
+        # dockerd workloads) can burst freely.
         resources=Resources(
-            memory=contribution.memory, cpu="1", memory_request="1Gi", cpu_request="250m"
+            memory=contribution.memory,
+            cpu=None,
+            memory_request="1Gi",
+            cpu_request="500m",
         ),
         stdio=Stdio(stdin=True, tty=True),
         image_pull_policy="Always",

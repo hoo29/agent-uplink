@@ -151,7 +151,7 @@ Every CLI flag can be set in a `.agent-uplink.yaml` file so you don't have to re
 reads every `.agent-uplink.yaml` from the working directory up to and including `~/.agent-uplink.yaml`, then applies the
 CLI args on top. Precedence, lowest to highest:
 
-```
+```sh
 ~/.agent-uplink.yaml  <  ...  <  ./<project>/.agent-uplink.yaml  <  CLI args
 ```
 
