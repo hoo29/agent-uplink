@@ -138,6 +138,11 @@ def test_client_cert_pod_kubeconfig_strips_key():
     user = kc["users"][0]["user"]
     assert "client-key-data" not in user
     assert "client-certificate-data" not in user
+    # A placeholder token must remain so kubectl has a non-interactive
+    # credential — an empty user makes it prompt for a username before it ever
+    # connects through mitm (which presents the real client cert).
+    assert user["token"] == kube._BEARER_PLACEHOLDER
+    assert _FAKE_KEY_B64 not in plan.pod_kubeconfig.decode()
 
 
 def test_client_cert_pod_kubeconfig_trusts_mitm_ca():

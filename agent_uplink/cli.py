@@ -535,17 +535,32 @@ def _mitm_manifests(
         )
         volumes.append(secret_volume("kube-client-certs", kube_client_certs_secret))
         mitm_args.extend(["--set", "client_certs=/kube-client-certs"])
+    # mitmproxy's ssl_verify_upstream_trusted_ca *replaces* its default trust
+    # store (certifi) rather than adding to it — pointing it straight at the
+    # cluster CAs would make every public upstream (pypi.org, etc.) fail TLS
+    # verification. So at startup we concatenate the image's own certifi bundle
+    # (the exact public roots mitmdump would otherwise use) with the cluster CAs
+    # into the writable /tmp and trust that combined file.
+    command = ["mitmdump"]
     if kube_upstream_ca_secret:
         volume_mounts.append(
             {"name": "kube-upstream-ca", "mountPath": "/kube-upstream-ca", "readOnly": True}
         )
         volumes.append(secret_volume("kube-upstream-ca", kube_upstream_ca_secret))
-        mitm_args.extend(["--set", "ssl_verify_upstream_trusted_ca=/kube-upstream-ca/bundle.pem"])
+        combined_ca = "/tmp/upstream-ca-bundle.pem"
+        mitm_args.extend(["--set", f"ssl_verify_upstream_trusted_ca={combined_ca}"])
+        command = [
+            "sh",
+            "-c",
+            'cat "$(python -c \'import certifi; print(certifi.where())\')" '
+            f"/kube-upstream-ca/bundle.pem > {combined_ca} && exec mitmdump \"$@\"",
+            "--",
+        ]
 
     container = container_spec(
         name="mitm",
         image=image,
-        command=["mitmdump"],
+        command=command,
         args=mitm_args,
         volume_mounts=volume_mounts,
         security_context=hardened_container_security_context(uid=1000, gid=1000),

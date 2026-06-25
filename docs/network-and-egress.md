@@ -65,6 +65,8 @@ such a rule, even a public clone is denied at `git-upload-pack`.
 - A synthetic allow rule for the API server host; bearer rules carry the `Authorization` injection, cert rules carry none.
 - For client cert auth: a `<host>.pem` file (cert + key) mounted into mitm's `client_certs` directory.
 - All cluster serving CAs are combined into an upstream trust bundle (`ssl_verify_upstream_trusted_ca`) so mitmproxy can verify the API server's certificate.
+  Because that option *replaces* mitmproxy's default trust store rather than augmenting it, the mitm container concatenates its own `certifi` roots with the
+  cluster CAs at startup (into `/tmp/upstream-ca-bundle.pem`) and trusts the combined file — otherwise every public upstream (pypi.org, etc.) would fail TLS.
 
 `--kubeconfig <path>` overrides the source file (default: `$KUBECONFIG` then `~/.kube/config`).
 
