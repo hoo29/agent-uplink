@@ -543,7 +543,16 @@ def test_mitm_manifest_kube_client_certs_and_upstream_ca():
     args = container["args"]
     # Client cert presentation on the upstream TLS leg + upstream CA verification.
     _assert_set_arg(args, "client_certs=/kube-client-certs")
-    _assert_set_arg(args, "ssl_verify_upstream_trusted_ca=/kube-upstream-ca/bundle.pem")
+    # The cluster CAs are concatenated with the image's certifi bundle into the
+    # writable /tmp at startup (the option replaces, not augments, the trust
+    # store), and mitm trusts that combined file.
+    _assert_set_arg(args, "ssl_verify_upstream_trusted_ca=/tmp/upstream-ca-bundle.pem")
+    startup = container["command"]
+    assert startup[0] == "sh"
+    assert "certifi" in startup[2]
+    assert "/kube-upstream-ca/bundle.pem" in startup[2]
+    assert "/tmp/upstream-ca-bundle.pem" in startup[2]
+    assert "exec mitmdump" in startup[2]
 
 
 # --------------------------------------------------------------------------- #

@@ -197,7 +197,14 @@ def resolve(
                 "name": f"kube-{ctx_name}",
                 "host": re.escape(host),
             }
-            pod_user_data = {}
+            # mitm presents the real client cert on the upstream TLS leg, so the
+            # pod kubeconfig carries none. But an empty user makes kubectl fall
+            # back to interactive basic auth and prompt for a username *before*
+            # it ever connects — so it never reaches mitm. A placeholder bearer
+            # token gives kubectl a non-interactive credential; it's irrelevant
+            # to the API server, which authenticates via the client cert (the
+            # x509 authenticator runs ahead of the bearer-token one).
+            pod_user_data = {"token": _BEARER_PLACEHOLDER}
 
         else:
             raise ValueError(
