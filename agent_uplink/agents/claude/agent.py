@@ -12,6 +12,7 @@ from ...session import Session
 from ..base import Agent, PodBuildContext, PodContribution, PreparedAgent
 from .config import (
     HOST_CLAUDE_DIR,
+    HOST_CLAUDE_JSON,
     claude_md_bytes,
     claude_settings_bytes,
     fake_oauth_credentials_bytes,
@@ -19,6 +20,7 @@ from .config import (
     load_claude_config,
     read_anthropic_oauth_credentials,
     refresh_anthropic_oauth_if_expiring,
+    sanitized_claude_json_bytes,
 )
 
 # Settings.json env injected per auth mode. anthropic mode steers the CLI via
@@ -197,6 +199,17 @@ class ClaudeAgent(Agent):
         container_home = f"/home/{username}"
         claude_dir = f"{container_home}/.claude"
 
+        # ~/.claude.json holds MCP server config, including bearer tokens in the
+        # `Authorization` header of http/sse servers. Mounting the host file would
+        # expose those and let the agent mutate the real host config. Instead ship a
+        # copy with each MCP `Authorization` header redacted into the session scratch
+        # dir and mount it read-write: the agent's runtime writes persist for the
+        # session, the host file is untouched, and the bearer token is wired back in
+        # via the user's mitm rules. (env-based creds for stdio servers are left
+        # intact and do enter the pod — see sanitized_claude_json_bytes.)
+        session_claude_json = ctx.session_dir / ".claude.json"
+        session_claude_json.write_bytes(sanitized_claude_json_bytes(HOST_CLAUDE_JSON))
+
         volumes: list[dict] = [
             secret_volume("settings", _SETTINGS_SECRET),
             hostpath_volume("workdir", str(cwd)),
@@ -204,9 +217,7 @@ class ClaudeAgent(Agent):
                 "claude-projects", str(host_project_dir), hp_type="DirectoryOrCreate"
             ),
             hostpath_volume(
-                "claude-json-host",
-                str(Path.home() / ".claude.json"),
-                hp_type="FileOrCreate",
+                "claude-json-host", str(session_claude_json), hp_type="File"
             ),
         ]
 
