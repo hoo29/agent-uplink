@@ -9,6 +9,26 @@
 
 **Known limitation — host settings.json is copied wholesale.** `claude_settings_bytes` currently copies the host `settings.json` into the pod *as-is*: it drops only the top-level `sandbox` key, replaces `permissions`, and merges the mode's injected placeholder into `env`. It does **not** implement an allow-list, so secret-bearing keys — `apiKeyHelper` and any secret `env` entries (e.g. API tokens) — in your host `settings.json` **do** reach the agent container's `~/.claude/settings.json`. Keep secrets out of your host `settings.json` for now.
 
+## ~/.claude.json (MCP Authorization header)
+
+The host `~/.claude.json` is **not** mounted into the pod directly. `sanitized_claude_json_bytes`
+copies it into the session scratch dir with each MCP server's `Authorization` header redacted, and
+that copy is mounted read-write at `~/.claude.json`. In both the top-level `mcpServers` map and each
+`projects.<path>.mcpServers` map, an `Authorization` header value (match is case-insensitive) is
+replaced with the literal `PLACEHOLDER`. The header key is kept, so Claude still treats the server
+as configured.
+
+Consequences:
+
+- The agent's runtime writes go to the session copy — the real host `~/.claude.json` is never
+  read-write mounted or mutated.
+- Only the `Authorization` header is redacted. An http/sse MCP server that uses it works once you
+  add a mitm rule injecting the real bearer (same model as `--anthropic`/`--bedrock`).
+- Everything else is left intact and **does enter the pod**: all other headers, every `env` value
+  (so a stdio server's `env`-based token works as-is but is exposed to the agent), command-line
+  `args`, and any credential embedded in a server `url`. Keep those in mind when deciding what MCP
+  servers to configure on the host.
+
 ## Java / Maven
 
 The image bundles OpenJDK 21 + Maven. Maven support is **opt-in via `--maven`** (a claude-agent flag, since the JDK and

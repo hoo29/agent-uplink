@@ -26,6 +26,9 @@ class PodBuildContext:
     aws_creds_secret_name: str | None
     debug_host_dir: Path | None
     debug: bool
+    # Per-run host scratch dir (Session.session_dir); for transient files the
+    # agent writes host-side and then mounts (e.g. a sanitized ~/.claude.json).
+    session_dir: Path
 
 
 @dataclass

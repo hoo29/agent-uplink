@@ -1281,6 +1281,7 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
             aws_creds_secret_name=aws_plan.dummy_secret_name,
             debug_host_dir=_prepare_debug_dir(args, session),
             debug=args.debug,
+            session_dir=session.session_dir,
         )
     )
 

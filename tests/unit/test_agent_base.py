@@ -63,10 +63,11 @@ def test_default_rules_empty_when_file_absent(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_default_pod_contribution_is_hardened():
+def test_default_pod_contribution_is_hardened(tmp_path):
     ctx = PodBuildContext(
         cwd=Path("/home/u/proj"), username="u", uid=1000, gid=1000,
         aws_creds_secret_name=None, debug_host_dir=None, debug=False,
+        session_dir=tmp_path,
     )
     contribution = _agent().pod_contribution(ctx)
     sc = contribution.security_context

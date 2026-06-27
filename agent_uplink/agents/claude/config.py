@@ -14,6 +14,13 @@ from ...process import run_command
 LOGGER = logging.getLogger("agent-uplink")
 
 HOST_CLAUDE_DIR = Path.home() / ".claude"
+HOST_CLAUDE_JSON = Path.home() / ".claude.json"
+
+# An MCP server's `Authorization` header in ~/.claude.json is replaced with this
+# before the file is mounted, so its bearer token never enters the pod. Claude
+# still sees the header present; the user adds a mitm rule to inject the real
+# value. All other headers and every `env` value are left untouched.
+_MCP_PLACEHOLDER = "PLACEHOLDER"
 
 # Pin fake-oauth credentials ~10 years out so Claude never tries to refresh
 # from inside the container. Refresh lives on the host.
@@ -97,6 +104,44 @@ def claude_md_bytes() -> bytes:
     if base and not base.endswith("\n"):
         base += "\n"
     return (base + _SANDBOX_GUIDANCE).encode("utf-8")
+
+
+def sanitized_claude_json_bytes(source: Path) -> bytes:
+    """Return `source` (~/.claude.json) with each MCP server's `Authorization`
+    header value redacted.
+
+    Walks the top-level `mcpServers` map and each `projects.<path>.mcpServers`
+    map; in every server, the `Authorization` header value (if present) is
+    replaced with a placeholder. All other headers, every `env` value, and the
+    rest of the file are passed through unchanged. Returns b"{}" if `source` is
+    absent."""
+    if not source.exists():
+        return b"{}"
+    config = json.loads(source.read_text(encoding="utf8"))
+    _redact_mcp_servers(config.get("mcpServers"))
+    for project in (config.get("projects") or {}).values():
+        if isinstance(project, dict):
+            _redact_mcp_servers(project.get("mcpServers"))
+    return json.dumps(config, indent=2).encode("utf-8")
+
+
+def _redact_mcp_servers(servers: object) -> None:
+    """Replace the `Authorization` header value of each server in one mcpServers
+    map with a placeholder, in place. No-op if `servers` is not a dict or a server
+    has no `Authorization` header (match is case-insensitive). All other headers
+    and every `env` value are left untouched, so any secret they carry still
+    enters the pod."""
+    if not isinstance(servers, dict):
+        return
+    for server in servers.values():
+        if not isinstance(server, dict):
+            continue
+        headers = server.get("headers")
+        if not isinstance(headers, dict):
+            continue
+        for name in headers:
+            if name.lower() == "authorization":
+                headers[name] = _MCP_PLACEHOLDER
 
 
 def get_bedrock_aws_profile_name(claude_config: dict) -> str | None:
