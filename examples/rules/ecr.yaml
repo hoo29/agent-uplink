@@ -18,7 +18,7 @@
 
 rules:
   - name: ecr-pulls
-    host: '123456789012\.dkr\.ecr\.eu-west-2\.amazonaws\.com'
+    hosts: ['123456789012\.dkr\.ecr\.eu-west-2\.amazonaws\.com']
     inject:
       headers:
         Authorization: 'Basic {{exec:printf ''AWS:%s'' "$(aws ecr get-login-password --region eu-west-2)" | base64 -w0}}'

@@ -92,9 +92,9 @@ def _enforcer(tmp_path, monkeypatch, rules, creds=None):
 def enforcer(tmp_path, monkeypatch):
     rules = {
         "rules": [
-            {"name": "echo", "host": "echo", "methods": ["GET", "POST"],
+            {"name": "echo", "hosts": ["echo"], "methods": ["GET", "POST"],
              "inject": {"headers": {"Authorization": "Bearer X"}}},
-            {"name": "paths", "host": "p", "methods": ["POST"],
+            {"name": "paths", "hosts": ["p"], "methods": ["POST"],
              "paths": ["/allowed/.*"]},
         ],
     }
@@ -250,7 +250,7 @@ def _aws_dummy_auth(akia=DUMMY_AKIA):
 
 
 def _sigv4_enforcer(tmp_path, monkeypatch, host_regex, creds=None):
-    rules = {"rules": [{"name": "aws", "host": host_regex}]}
+    rules = {"rules": [{"name": "aws", "hosts": [host_regex]}]}
     return _enforcer(tmp_path, monkeypatch, rules, creds={DUMMY_AKIA: CREDS, **(creds or {})})
 
 
@@ -317,7 +317,7 @@ def test_unknown_akia_not_signed_but_allowed(tmp_path, monkeypatch):
 def test_non_aws_host_with_sigv4_auth_not_signed(tmp_path, monkeypatch):
     e = _enforcer(
         tmp_path, monkeypatch,
-        {"rules": [{"name": "ex", "host": "not-aws.example.com"}]},
+        {"rules": [{"name": "ex", "hosts": ["not-aws.example.com"]}]},
         creds={DUMMY_AKIA: CREDS},
     )
     r = req("not-aws.example.com", "GET", "/",
@@ -335,7 +335,7 @@ def test_aws_request_skips_header_injection(tmp_path, monkeypatch):
     e = _enforcer(
         tmp_path, monkeypatch,
         {"rules": [{
-            "name": "s3", "host": r"s3\.us-east-1\.amazonaws\.com",
+            "name": "s3", "hosts": [r"s3\.us-east-1\.amazonaws\.com"],
             "inject": {"headers": {"Authorization": "Bearer SHOULD-NOT-APPEAR"}},
         }]},
         creds={DUMMY_AKIA: CREDS},
@@ -350,7 +350,7 @@ def test_aws_request_skips_header_injection(tmp_path, monkeypatch):
 
 def test_request_denies_unmatched_host(tmp_path, monkeypatch):
     e = _enforcer(tmp_path, monkeypatch,
-                  {"rules": [{"name": "only", "host": "allowed.example"}]})
+                  {"rules": [{"name": "only", "hosts": ["allowed.example"]}]})
     r = req("blocked.example", "POST", "/x")
     flow = flow_for(r)
     e.requestheaders(cast(Any, flow))
@@ -394,3 +394,86 @@ def test_git_example_does_not_blanket_allow_post(tmp_path, monkeypatch):
     e = _git_enforcer(tmp_path, monkeypatch)
     r = cast(Any, req("github.com", "POST", "/hoo29/repo/issues"))
     assert e._match_rule(r) is None
+
+
+# --------------------------------------------------------------------------- #
+# l4_forward raw TCP passthrough
+# --------------------------------------------------------------------------- #
+
+L4_RULES = {
+    "rules": [
+        {"name": "http", "hosts": ["echo"]},  # ordinary rule, ignored by L4 matcher
+        {"name": "by-host", "l4_forward": True, "hosts": [r"secure\.corp"]},
+        {"name": "by-cidr", "l4_forward": True,
+         "cidrs": ["192.168.149.0/24", "10.1.2.3/32"]},
+    ],
+}
+
+
+def _l4_enforcer(tmp_path, monkeypatch):
+    return _enforcer(tmp_path, monkeypatch, L4_RULES)
+
+
+def test_l4_only_l4_rules_compiled(tmp_path, monkeypatch):
+    e = _l4_enforcer(tmp_path, monkeypatch)
+    # The ordinary "http" rule stays in the HTTP list, not the L4 list.
+    assert len(e._l4_rules) == 2
+    assert {r.name for r in e._l4_rules} == {"by-host", "by-cidr"}
+    assert any(r.name == "http" for r in e._compiled)
+
+
+def test_l4_match_by_hostname(tmp_path, monkeypatch):
+    e = _l4_enforcer(tmp_path, monkeypatch)
+    assert e._match_l4("secure.corp") == "by-host"
+    assert e._match_l4("insecure.corp") is None
+
+
+def test_l4_match_literal_ip_in_cidr(tmp_path, monkeypatch):
+    e = _l4_enforcer(tmp_path, monkeypatch)
+    assert e._match_l4("192.168.149.50") == "by-cidr"
+    assert e._match_l4("10.1.2.3") == "by-cidr"
+    assert e._match_l4("10.1.2.4") is None
+
+
+def test_l4_ip_not_matched_against_host_regex(tmp_path, monkeypatch):
+    # A host rule must never match a literal IP, and a cidr rule must never
+    # match a hostname — the two match spaces are kept disjoint.
+    rules = {"rules": [{"name": "h", "l4_forward": True, "hosts": [r".*"]}]}
+    e = _enforcer(tmp_path, monkeypatch, rules)
+    assert e._match_l4("anything.example.com") == "h"
+    assert e._match_l4("192.168.1.1") is None
+
+
+def test_next_layer_installs_tcp_layer_on_match(tmp_path, monkeypatch):
+    e = _l4_enforcer(tmp_path, monkeypatch)
+    sentinel = object()
+    monkeypatch.setattr(addon, "TCPLayer", lambda ctx: sentinel)
+    nl = SimpleNamespace(
+        layer=None,
+        context=SimpleNamespace(server=SimpleNamespace(address=("192.168.149.50", 6443))),
+    )
+    e.next_layer(cast(Any, nl))
+    assert nl.layer is sentinel
+
+
+def test_next_layer_no_op_on_miss(tmp_path, monkeypatch):
+    e = _l4_enforcer(tmp_path, monkeypatch)
+    monkeypatch.setattr(addon, "TCPLayer", lambda ctx: object())
+    nl = SimpleNamespace(
+        layer=None,
+        context=SimpleNamespace(server=SimpleNamespace(address=("8.8.8.8", 443))),
+    )
+    e.next_layer(cast(Any, nl))
+    assert nl.layer is None
+
+
+def test_next_layer_respects_prior_decision(tmp_path, monkeypatch):
+    e = _l4_enforcer(tmp_path, monkeypatch)
+    monkeypatch.setattr(addon, "TCPLayer", lambda ctx: object())
+    existing = object()
+    nl = SimpleNamespace(
+        layer=existing,
+        context=SimpleNamespace(server=SimpleNamespace(address=("192.168.149.50", 6443))),
+    )
+    e.next_layer(cast(Any, nl))
+    assert nl.layer is existing

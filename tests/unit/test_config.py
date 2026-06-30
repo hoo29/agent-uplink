@@ -113,19 +113,19 @@ def test_rules_files_additive_across_files(tmp_path):
 def test_rules_inline_mappings_pass_through(tmp_path):
     _write(
         tmp_path / config.CONFIG_FILENAME,
-        "rules:\n  - name: inline\n    host: 'example\\.com'\n",
+        "rules:\n  - name: inline\n    hosts: ['example\\.com']\n",
     )
     val = _load(tmp_path, tmp_path)["rules"]
-    assert val == [{"name": "inline", "host": "example\\.com"}]
+    assert val == [{"name": "inline", "hosts": ["example\\.com"]}]
 
 
 def test_rules_mixed_files_and_inline_preserve_order(tmp_path):
     _write(
         tmp_path / config.CONFIG_FILENAME,
-        "rules:\n  - ~/a.yaml\n  - {name: inline, host: 'h'}\n",
+        "rules:\n  - ~/a.yaml\n  - {name: inline, hosts: ['h']}\n",
     )
     val = _load(tmp_path, tmp_path)["rules"]
-    assert val == [Path.home() / "a.yaml", {"name": "inline", "host": "h"}]
+    assert val == [Path.home() / "a.yaml", {"name": "inline", "hosts": ["h"]}]
 
 
 def test_mount_list_paths_are_coerced(tmp_path):

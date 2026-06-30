@@ -555,6 +555,76 @@ def test_mitm_manifest_kube_client_certs_and_upstream_ca():
     assert "exec mitmdump" in startup[2]
 
 
+def test_mitm_manifest_disables_http2():
+    pod = next(m for m in cli._mitm_manifests("ns", "img", "") if m["kind"] == "Pod")
+    _assert_set_arg(pod["spec"]["containers"][0]["args"], "http2=false")
+
+
+def test_mitm_manifest_secure_upstream_by_default():
+    pod = next(m for m in cli._mitm_manifests("ns", "img", "") if m["kind"] == "Pod")
+    assert "ssl_insecure=true" not in pod["spec"]["containers"][0]["args"]
+
+
+def test_mitm_manifest_insecure_disables_upstream_verification():
+    pod = next(
+        m for m in cli._mitm_manifests("ns", "img", "", insecure=True)
+        if m["kind"] == "Pod"
+    )
+    _assert_set_arg(pod["spec"]["containers"][0]["args"], "ssl_insecure=true")
+
+
+def test_mitm_manifest_custom_ca_added_to_trust_bundle():
+    pod = next(
+        m for m in cli._mitm_manifests("ns", "img", "", custom_ca_secret="custom-ca")
+        if m["kind"] == "Pod"
+    )
+    container = pod["spec"]["containers"][0]
+    assert _volume_by_name(pod, "custom-ca")["secret"]["secretName"] == "custom-ca"
+    mount = _mount_by_name(container, "custom-ca")
+    assert mount["mountPath"] == "/custom-ca" and mount["readOnly"] is True
+    _assert_set_arg(container["args"], "ssl_verify_upstream_trusted_ca=/tmp/upstream-ca-bundle.pem")
+    startup = container["command"]
+    assert "certifi" in startup[2]
+    assert "/custom-ca/bundle.pem" in startup[2]
+    assert "exec mitmdump" in startup[2]
+
+
+def test_mitm_manifest_custom_ca_concatenated_with_kube_ca():
+    pod = next(
+        m for m in cli._mitm_manifests(
+            "ns", "img", "",
+            kube_upstream_ca_secret="kube-upstream-ca",
+            custom_ca_secret="custom-ca",
+        )
+        if m["kind"] == "Pod"
+    )
+    startup = pod["spec"]["containers"][0]["command"][2]
+    assert "/kube-upstream-ca/bundle.pem" in startup
+    assert "/custom-ca/bundle.pem" in startup
+
+
+def test_read_custom_ca_none_when_empty():
+    assert cli._read_custom_ca([]) is None
+
+
+def test_read_custom_ca_concatenates_pem_files(tmp_path):
+    a = tmp_path / "a.pem"
+    b = tmp_path / "b.pem"
+    a.write_bytes(b"-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----")
+    b.write_bytes(b"-----BEGIN CERTIFICATE-----\nBBB\n-----END CERTIFICATE-----\n")
+    out = cli._read_custom_ca([a, b])
+    assert out is not None
+    assert out.count(b"BEGIN CERTIFICATE") == 2
+    assert out.endswith(b"\n")
+
+
+def test_read_custom_ca_rejects_non_pem(tmp_path):
+    bad = tmp_path / "bad.pem"
+    bad.write_bytes(b"not a cert")
+    with pytest.raises(ValueError, match="no PEM certificate"):
+        cli._read_custom_ca([bad])
+
+
 # --------------------------------------------------------------------------- #
 # Agent pod optional mounts (ssh keys + kubeconfig)
 # --------------------------------------------------------------------------- #

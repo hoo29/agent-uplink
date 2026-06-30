@@ -9,7 +9,7 @@ rules:
   # (raw.githubusercontent.com) and claude-downloads (downloads.claude.ai) rules
   # were redundant and have been removed.
   - name: claude-logs
-    host: .*\.datadoghq\.com
+    hosts: [.*\.datadoghq\.com]
     methods: ["POST"]
     paths:
       - /api/v2/logs

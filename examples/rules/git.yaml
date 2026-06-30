@@ -23,7 +23,7 @@
 
 rules:
   - name: github-git-https
-    host: 'github\.com'
+    hosts: ['github\.com']
     methods: [GET, POST]
     paths:
       - '.*/info/refs(\?.*)?'
@@ -34,7 +34,7 @@ rules:
         Authorization: "Basic {{keyring:github:git-https}}"
 
   - name: gitlab-git-https
-    host: 'gitlab\.com'
+    hosts: ['gitlab\.com']
     methods: [GET, POST]
     paths:
       - '.*/info/refs(\?.*)?'
@@ -45,7 +45,7 @@ rules:
         Authorization: "Basic {{keyring:gitlab:git-https}}"
 
   - name: bitbucket-git-https
-    host: 'bitbucket\.org'
+    hosts: ['bitbucket\.org']
     methods: [GET, POST]
     paths:
       - '.*/info/refs(\?.*)?'

@@ -60,9 +60,9 @@ def _resolve(path, agent=None, *, no_default_rules=False, auth_rules=None,
 
 
 def test_layers_in_precedence_order(tmp_path):
-    path = _write(tmp_path, "rules:\n  - {name: user, host: 'u'}\n")
-    agent = _Agent(defaults=[{"name": "agent-default", "host": "d"}])
-    out = _resolve(path, agent, auth_rules=[{"name": "auth", "host": "a"}])
+    path = _write(tmp_path, "rules:\n  - {name: user, hosts: ['u']}\n")
+    agent = _Agent(defaults=[{"name": "agent-default", "hosts": ["d"]}])
+    out = _resolve(path, agent, auth_rules=[{"name": "auth", "hosts": ["a"]}])
     names = [r["name"] for r in out["rules"]]
     # auth -> user -> agent defaults -> generic catch-all (evaluated last).
     # Auth leads so a broad user rule can't shadow the agent's credential inject.
@@ -72,21 +72,21 @@ def test_layers_in_precedence_order(tmp_path):
 def test_generic_catch_all_is_last(tmp_path):
     out = _resolve(None)  # defaults only
     assert out["rules"][-1]["name"] == "default-readonly"
-    assert out["rules"][-1]["host"] == ".*"
+    assert out["rules"][-1]["hosts"] == [".*"]
 
 
 def test_no_default_rules_keeps_only_user_layer(tmp_path):
-    path = _write(tmp_path, "rules:\n  - {name: user, host: 'u'}\n")
+    path = _write(tmp_path, "rules:\n  - {name: user, hosts: ['u']}\n")
     out = _resolve(path, no_default_rules=True,
-                   auth_rules=[{"name": "auth", "host": "a"}])
+                   auth_rules=[{"name": "auth", "hosts": ["a"]}])
     assert [r["name"] for r in out["rules"]] == ["user"]
 
 
 def test_replace_defaults_in_yaml(tmp_path):
     path = _write(
-        tmp_path, "replace_defaults: true\nrules:\n  - {name: only, host: 'h'}\n"
+        tmp_path, "replace_defaults: true\nrules:\n  - {name: only, hosts: ['h']}\n"
     )
-    out = _resolve(path, auth_rules=[{"name": "auth", "host": "a"}])
+    out = _resolve(path, auth_rules=[{"name": "auth", "hosts": ["a"]}])
     assert [r["name"] for r in out["rules"]] == ["only"]
 
 
@@ -103,9 +103,9 @@ def test_no_rules_at_all_raises(tmp_path):
 
 def test_multiple_files_concatenated_first_first(tmp_path):
     a = tmp_path / "a.yaml"
-    a.write_text("rules:\n  - {name: a, host: 'a'}\n")
+    a.write_text("rules:\n  - {name: a, hosts: ['a']}\n")
     b = tmp_path / "b.yaml"
-    b.write_text("rules:\n  - {name: b, host: 'b'}\n")
+    b.write_text("rules:\n  - {name: b, hosts: ['b']}\n")
     out = _resolve([a, b], no_default_rules=True)
     # First file's rules come first, so they win first-match over the second's.
     assert [r["name"] for r in out["rules"]] == ["a", "b"]
@@ -113,27 +113,27 @@ def test_multiple_files_concatenated_first_first(tmp_path):
 
 def test_inline_rule_dict_source():
     out = _resolve(
-        [{"name": "inline", "host": "h"}], no_default_rules=True
+        [{"name": "inline", "hosts": ["h"]}], no_default_rules=True
     )
     assert [r["name"] for r in out["rules"]] == ["inline"]
 
 
 def test_mixed_file_and_inline_preserve_order(tmp_path):
     a = tmp_path / "a.yaml"
-    a.write_text("rules:\n  - {name: from-file, host: 'a'}\n")
+    a.write_text("rules:\n  - {name: from-file, hosts: ['a']}\n")
     out = _resolve(
-        [a, {"name": "inline", "host": "h"}], no_default_rules=True
+        [a, {"name": "inline", "hosts": ["h"]}], no_default_rules=True
     )
     assert [r["name"] for r in out["rules"]] == ["from-file", "inline"]
 
 
 def test_replace_defaults_in_any_file(tmp_path):
     a = tmp_path / "a.yaml"
-    a.write_text("rules:\n  - {name: a, host: 'a'}\n")
+    a.write_text("rules:\n  - {name: a, hosts: ['a']}\n")
     b = tmp_path / "b.yaml"
-    b.write_text("replace_defaults: true\nrules:\n  - {name: b, host: 'b'}\n")
+    b.write_text("replace_defaults: true\nrules:\n  - {name: b, hosts: ['b']}\n")
     # replace_defaults in the second file still drops the auth + generic layers.
-    out = _resolve([a, b], auth_rules=[{"name": "auth", "host": "x"}])
+    out = _resolve([a, b], auth_rules=[{"name": "auth", "hosts": ["x"]}])
     assert [r["name"] for r in out["rules"]] == ["a", "b"]
 
 
@@ -142,28 +142,101 @@ def test_replace_defaults_in_any_file(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_missing_host_rejected(tmp_path):
+def test_missing_hosts_rejected(tmp_path):
     path = _write(tmp_path, "rules:\n  - {name: bad, methods: [GET]}\n")
-    with pytest.raises(ValueError, match="missing required field 'host'"):
+    with pytest.raises(ValueError, match="missing required field 'hosts'"):
         _resolve(path)
 
 
+def test_hosts_must_be_a_list(tmp_path):
+    path = _write(tmp_path, "rules:\n  - {name: bad, hosts: 'h'}\n")
+    with pytest.raises(ValueError, match="'hosts' must be a list"):
+        _resolve(path)
+
+
+def test_empty_hosts_list_rejected(tmp_path):
+    path = _write(tmp_path, "rules:\n  - {name: bad, hosts: []}\n")
+    with pytest.raises(ValueError, match="'hosts' is an empty list"):
+        _resolve(path)
+
+
+def test_multiple_hosts_preserved(tmp_path):
+    path = _write(tmp_path, "rules:\n  - {name: multi, hosts: ['a\\.com', 'b\\.com']}\n")
+    out = _resolve(path, no_default_rules=True)
+    assert out["rules"][0]["hosts"] == ["a\\.com", "b\\.com"]
+
+
 def test_empty_paths_list_rejected(tmp_path):
-    path = _write(tmp_path, "rules:\n  - {name: bad, host: 'h', paths: []}\n")
+    path = _write(tmp_path, "rules:\n  - {name: bad, hosts: ['h'], paths: []}\n")
     with pytest.raises(ValueError, match="empty list"):
         _resolve(path)
 
 
 def test_invalid_method_rejected(tmp_path):
-    path = _write(tmp_path, "rules:\n  - {name: bad, host: 'h', methods: [FETCH]}\n")
+    path = _write(tmp_path, "rules:\n  - {name: bad, hosts: ['h'], methods: [FETCH]}\n")
     with pytest.raises(ValueError, match="invalid method"):
         _resolve(path)
 
 
 def test_invalid_host_regex_rejected(tmp_path):
-    path = _write(tmp_path, "rules:\n  - {name: bad, host: '('}\n")
+    path = _write(tmp_path, "rules:\n  - {name: bad, hosts: ['(']}\n")
     with pytest.raises(ValueError, match="invalid host regex"):
         _resolve(path)
+
+
+# --------------------------------------------------------------------------- #
+# l4_forward (raw TCP passthrough) rules
+# --------------------------------------------------------------------------- #
+
+
+def test_l4_forward_host_and_cidrs_resolved(tmp_path):
+    path = _write(
+        tmp_path,
+        "rules:\n"
+        "  - name: mtls\n"
+        "    l4_forward: true\n"
+        "    hosts: ['secure\\.corp']\n"
+        "    cidrs: ['192.168.149.0/24', '10.1.2.3/32']\n",
+    )
+    out = _resolve(path, no_default_rules=True)
+    rule = out["rules"][0]
+    assert rule["l4_forward"] is True
+    assert rule["hosts"] == ["secure\\.corp"]
+    assert rule["cidrs"] == ["192.168.149.0/24", "10.1.2.3/32"]
+    assert "methods" not in rule and "inject" not in rule
+
+
+def test_l4_forward_cidr_host_bits_normalised(tmp_path):
+    path = _write(
+        tmp_path,
+        "rules:\n  - {name: m, l4_forward: true, cidrs: ['192.168.149.50/24']}\n",
+    )
+    out = _resolve(path, no_default_rules=True)
+    assert out["rules"][0]["cidrs"] == ["192.168.149.0/24"]
+
+
+def test_l4_forward_requires_host_or_cidrs(tmp_path):
+    path = _write(tmp_path, "rules:\n  - {name: bad, l4_forward: true}\n")
+    with pytest.raises(ValueError, match="needs 'hosts' and/or 'cidrs'"):
+        _resolve(path, no_default_rules=True)
+
+
+def test_l4_forward_rejects_http_fields(tmp_path):
+    path = _write(
+        tmp_path,
+        "rules:\n  - {name: bad, l4_forward: true, hosts: ['h'], methods: [GET]}\n",
+    )
+    with pytest.raises(ValueError, match="cannot set 'methods'"):
+        _resolve(path, no_default_rules=True)
+
+
+def test_l4_forward_invalid_cidr_rejected(tmp_path):
+    path = _write(
+        tmp_path,
+        "rules:\n  - {name: bad, l4_forward: true, cidrs: ['not-a-cidr']}\n",
+    )
+    with pytest.raises(ValueError, match="invalid CIDR"):
+        _resolve(path, no_default_rules=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -178,7 +251,7 @@ def test_keyring_placeholder_resolved(tmp_path, monkeypatch):
     )
     path = _write(
         tmp_path,
-        "rules:\n  - name: r\n    host: 'h'\n    inject:\n      headers:\n"
+        "rules:\n  - name: r\n    hosts: ['h']\n    inject:\n      headers:\n"
         "        Authorization: 'Basic {{keyring:svc:u}}'\n",
     )
     out = _resolve(path)
@@ -189,7 +262,7 @@ def test_keyring_missing_entry_aborts(tmp_path, monkeypatch):
     monkeypatch.setattr(rules.keyring, "get_password", lambda s, u: None)
     path = _write(
         tmp_path,
-        "rules:\n  - name: r\n    host: 'h'\n    inject:\n      headers:\n"
+        "rules:\n  - name: r\n    hosts: ['h']\n    inject:\n      headers:\n"
         "        Authorization: '{{keyring:svc:u}}'\n",
     )
     with pytest.raises(RuntimeError, match="keyring entry not found"):
@@ -199,7 +272,7 @@ def test_keyring_missing_entry_aborts(tmp_path, monkeypatch):
 def test_exec_placeholder_blocked_without_allow_exec(tmp_path):
     path = _write(
         tmp_path,
-        "rules:\n  - name: r\n    host: 'h'\n    inject:\n      headers:\n"
+        "rules:\n  - name: r\n    hosts: ['h']\n    inject:\n      headers:\n"
         "        X: '{{exec:echo hi}}'\n",
     )
     with pytest.raises(RuntimeError, match="--allow-exec"):
@@ -209,7 +282,7 @@ def test_exec_placeholder_blocked_without_allow_exec(tmp_path):
 def test_exec_placeholder_runs_with_allow_exec(tmp_path):
     path = _write(
         tmp_path,
-        "rules:\n  - name: r\n    host: 'h'\n    inject:\n      headers:\n"
+        "rules:\n  - name: r\n    hosts: ['h']\n    inject:\n      headers:\n"
         "        X: '{{exec:printf hello}}'\n",
     )
     out = _resolve(path, allow_exec=True)
@@ -224,7 +297,7 @@ def test_resolution_is_single_pass(tmp_path, monkeypatch):
     )
     path = _write(
         tmp_path,
-        "rules:\n  - name: r\n    host: 'h'\n    inject:\n      headers:\n"
+        "rules:\n  - name: r\n    hosts: ['h']\n    inject:\n      headers:\n"
         "        X: '{{keyring:svc:u}}'\n",
     )
     out = _resolve(path, allow_exec=True)
@@ -238,17 +311,17 @@ def test_resolution_is_single_pass(tmp_path, monkeypatch):
 
 def test_kube_rules_included_even_with_no_default_rules(tmp_path):
     out = _resolve(None, no_default_rules=True,
-                   kube_rules=[{"name": "kube", "host": "k8s.example.com"}])
+                   kube_rules=[{"name": "kube", "hosts": ["k8s.example.com"]}])
     # kube rules survive --no-default-rules so k8s traffic is never silently
     # blocked, even when every other default layer is dropped.
     assert [r["name"] for r in out["rules"]] == ["kube"]
 
 
 def test_kube_rules_layer_between_auth_and_user(tmp_path):
-    path = _write(tmp_path, "rules:\n  - {name: user, host: 'u'}\n")
-    agent = _Agent(defaults=[{"name": "agent-default", "host": "d"}])
-    out = _resolve(path, agent, auth_rules=[{"name": "auth", "host": "a"}],
-                   kube_rules=[{"name": "kube", "host": "k"}])
+    path = _write(tmp_path, "rules:\n  - {name: user, hosts: ['u']}\n")
+    agent = _Agent(defaults=[{"name": "agent-default", "hosts": ["d"]}])
+    out = _resolve(path, agent, auth_rules=[{"name": "auth", "hosts": ["a"]}],
+                   kube_rules=[{"name": "kube", "hosts": ["k"]}])
     names = [r["name"] for r in out["rules"]]
     # auth -> kube -> user -> agent defaults -> generic catch-all. Auth and kube
     # both inject credentials on narrow hosts, so they lead the user's allow
@@ -261,10 +334,10 @@ def test_broad_user_aws_rule_does_not_shadow_auth(tmp_path):
     # win first-match over the bedrock-style auth inject on bedrock-runtime and
     # strip its Authorization header — that breaks bedrock auth. The auth rule
     # must be evaluated first.
-    path = _write(tmp_path, "rules:\n  - {name: broad-aws, host: '.*\\.amazonaws\\.com'}\n")
+    path = _write(tmp_path, "rules:\n  - {name: broad-aws, hosts: ['.*\\.amazonaws\\.com']}\n")
     auth = {
         "name": "bedrock-auth",
-        "host": r"bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com",
+        "hosts": [r"bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com"],
         "inject": {"headers": {"Authorization": "Bearer real-token"}},
     }
     out = _resolve(path, auth_rules=[auth])
@@ -276,7 +349,7 @@ def test_broad_user_aws_rule_does_not_shadow_auth(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("text", ["- {name: r, host: h}\n", "just a string\n", "42\n"])
+@pytest.mark.parametrize("text", ["- {name: r, hosts: [h]}\n", "just a string\n", "42\n"])
 def test_non_mapping_yaml_rejected(tmp_path, text):
     path = _write(tmp_path, text)
     with pytest.raises(ValueError, match="expected a YAML mapping"):
@@ -290,7 +363,7 @@ def test_multiple_placeholders_in_one_value(tmp_path, monkeypatch):
     )
     path = _write(
         tmp_path,
-        "rules:\n  - name: r\n    host: 'h'\n    inject:\n      headers:\n"
+        "rules:\n  - name: r\n    hosts: ['h']\n    inject:\n      headers:\n"
         "        X: '{{keyring:svc:u}} and {{exec:printf secret}}'\n",
     )
     out = _resolve(path, allow_exec=True)
@@ -301,7 +374,7 @@ def test_multiple_placeholders_in_one_value(tmp_path, monkeypatch):
 def test_exec_nonzero_exit_aborts(tmp_path):
     path = _write(
         tmp_path,
-        "rules:\n  - name: r\n    host: 'h'\n    inject:\n      headers:\n"
+        "rules:\n  - name: r\n    hosts: ['h']\n    inject:\n      headers:\n"
         "        X: '{{exec:sh -c \"exit 42\"}}'\n",
     )
     # A failed command aborts startup rather than injecting an empty/partial cred.

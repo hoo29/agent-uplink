@@ -143,7 +143,7 @@ class ClaudeAgent(Agent):
             auth_rules.append(
                 {
                     "name": "anthropic-auth",
-                    "host": r"api\.anthropic\.com",
+                    "hosts": [r"api\.anthropic\.com"],
                     "inject": {"headers": {"Authorization": f"Bearer {oauth_token}"}},
                 }
             )
@@ -157,7 +157,7 @@ class ClaudeAgent(Agent):
             auth_rules.append(
                 {
                     "name": "bedrock-auth",
-                    "host": r"bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com",
+                    "hosts": [r"bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com"],
                     "inject": {"headers": {"Authorization": f"Bearer {token}"}},
                 }
             )

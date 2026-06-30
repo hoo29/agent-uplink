@@ -84,7 +84,7 @@ def test_bearer_rule_injects_real_token():
 def test_bearer_host_regex_escapes_dots():
     plan = _run_resolve(["my-ctx"], [_kubectl_view_bearer()])
     # api.example.com -> re.escape -> api\.example\.com
-    assert plan.rules[0]["host"] == r"api\.example\.com"
+    assert plan.rules[0]["hosts"] == [r"api\.example\.com"]
 
 
 def test_bearer_pod_kubeconfig_strips_real_token():

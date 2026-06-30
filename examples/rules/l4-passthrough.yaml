@@ -1,0 +1,32 @@
+# L4 (raw TCP) passthrough for upstreams that need end-to-end TLS.
+#
+# By default mitm terminates TLS: it decrypts every connection, applies the
+# allow-list, and re-encrypts to the upstream. That breaks mutual TLS — the
+# agent's client certificate is consumed by mitm and never reaches the server,
+# and mitm has no key to present one itself.
+#
+# An `l4_forward` rule tells mitm to tunnel the matched connection as raw TCP
+# instead: it relays encrypted bytes without decrypting, so the agent's TLS
+# (including any `curl --cert`/`--key` client cert) goes straight through to the
+# upstream. The trade-off is that mitm sees nothing inside the tunnel — these
+# connections BYPASS the allow-list, header injection, and AWS re-signing. Match
+# them as narrowly as possible.
+#
+# Matching uses the CONNECT target — the host or IP the client asked for, before
+# any DNS resolution:
+#   - `hosts` : list of regexes, each matched (re.fullmatch) only when the target
+#               is a hostname; the rule matches if any entry matches.
+#   - `cidrs` : list of CIDRs, matched only when the target is a literal IP in
+#               the request (a resolved hostname is NOT matched against these).
+# Set hosts, cidrs, or both. An l4_forward rule takes no methods/paths/inject.
+
+rules:
+  - name: corp-mtls-host
+    l4_forward: true
+    hosts: ['secure\.corp\.example\.com']
+
+  - name: corp-mtls-ip
+    l4_forward: true
+    cidrs:
+      - '192.168.149.0/24'
+      - '10.1.2.3/32'

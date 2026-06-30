@@ -15,7 +15,7 @@
 
 rules:
   - name: codeartifact-maven
-    host: 'ABC\.d\.codeartifact\.eu-west-2\.amazonaws\.com'
+    hosts: ['ABC\.d\.codeartifact\.eu-west-2\.amazonaws\.com']
     inject:
       headers:
         Authorization: 'Basic {{exec:printf ''aws:%s'' "$(aws codeartifact get-authorization-token --region eu-west-2 --domain-owner ACCOUNT_ID --domain DOMAIN --query authorizationToken --output text)" | base64 -w0}}'

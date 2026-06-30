@@ -178,7 +178,7 @@ def resolve(
                 token = Path(token_file).read_text(encoding="utf-8").strip()
             rule: dict[str, Any] = {
                 "name": f"kube-{ctx_name}",
-                "host": re.escape(host),
+                "hosts": [re.escape(host)],
                 "inject": {"headers": {"Authorization": f"Bearer {token}"}},
             }
             pod_user_data: dict[str, Any] = {"token": _BEARER_PLACEHOLDER}
@@ -195,7 +195,7 @@ def resolve(
             client_certs[cert_filename] = cert_pem + key_pem
             rule = {
                 "name": f"kube-{ctx_name}",
-                "host": re.escape(host),
+                "hosts": [re.escape(host)],
             }
             # mitm presents the real client cert on the upstream TLS leg, so the
             # pod kubeconfig carries none. But an empty user makes kubectl fall

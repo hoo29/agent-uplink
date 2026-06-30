@@ -131,6 +131,8 @@ agent-uplink claude --anthropic --deploy-context my-cluster                     
 agent-uplink claude --anthropic --mount-rw ~/code/repo-b ~/code/repo-c             # mount extra repos (read-write)
 agent-uplink claude --anthropic --mount-ro ~/.ansible.cfg                          # mount a host file read-only
 agent-uplink claude --anthropic --maven                                            # opt-in: mount ~/.m2 + Maven proxy env
+agent-uplink claude --anthropic --mitm-ca-cert ~/certs/corp-root.pem               # trust an extra upstream CA
+agent-uplink claude --anthropic --mitm-insecure                                    # accept any upstream cert (no TLS verify)
 agent-uplink claude --anthropic -- --resume <session-id>             # extra args forwarded to `claude`
 agent-uplink claude --anthropic -- -p "summarise the build failure"
 ```
@@ -175,7 +177,7 @@ mount_ro: [~/.ansible.cfg]
 rules:
   - examples/rules/git.yaml     # a rules file (path), additive across files + CLI
   - name: jira                  # an inline rule, same schema as a rules file entry
-    host: 'mycorp\.atlassian\.net'
+    hosts: ['mycorp\.atlassian\.net']
     inject:
       headers:
         Authorization: 'Basic {{keyring:jira:me}}'
@@ -293,6 +295,18 @@ Real tokens and client keys never appear in the pod kubeconfig or the agent cont
 
 `--kubeconfig <path>` overrides the source file (default: `$KUBECONFIG` then `~/.kube/config`).
 
+### Upstream TLS trust
+
+mitmproxy verifies upstream certificates against its built-in roots (the image's `certifi` bundle). Two flags adjust that
+for upstreams those roots don't cover (a corporate proxy, an internal service with a private CA):
+
+- `--mitm-ca-cert <file> [<file> ...]` trusts extra CA(s) **on top of** the defaults. Each file is PEM-encoded and may hold
+  multiple concatenated certs; the flag is repeatable. mitmproxy's trust option *replaces* rather than augments its store,
+  so agent-uplink concatenates the default roots, any kube cluster CAs, and your CA(s) into one bundle the mitm pod trusts.
+  Prefer this over `--mitm-insecure`.
+- `--mitm-insecure` disables upstream certificate verification entirely (`ssl_insecure`). It accepts any cert, including
+  self-signed, and **removes protection against an upstream MITM** — use only as a last resort. Off by default.
+
 ## Rules
 
 YAML allow-list, first match wins. Match priority is by **layer**, not regex length: the agent's auth rule (and any kube
@@ -308,7 +322,7 @@ inline rule mappings can be mixed in one list) — see [Configuration file](#con
 ```yaml
 rules:
   - name: my-rule
-    host: '<regex>'             # required
+    hosts: ['<regex>']          # required; list of host regexes (any match)
     methods: [GET, POST]        # optional
     paths: ['<regex>']          # optional
     inject:                     # optional
@@ -321,6 +335,24 @@ Header values support two placeholder forms, both resolved on the host before th
 - `{{keyring:SERVICE:USERNAME}}` — static secret from the OS keyring (`keyring set my-service my-user`).
 - `{{exec:COMMAND}}` — stdout (trailing newline stripped) of a host shell command, for short-lived dynamic credentials the
   keyring can't hold (e.g. an AWS CodeArtifact auth token). Off unless you pass `--allow-exec`.
+
+### Raw TCP passthrough (mTLS)
+
+mitm normally terminates TLS, which makes upstream mutual TLS impossible — the agent's client cert is consumed by mitm and
+never reaches the server. An `l4_forward` rule instead tunnels a matched connection as raw TCP so the agent's TLS (incl. a
+`curl --cert/--key` client cert) runs end-to-end:
+
+```yaml
+rules:
+  - name: corp-mtls
+    l4_forward: true
+    hosts: ['secure\.corp\.example\.com']   # matched only when the target is a hostname
+    cidrs: ['192.168.149.0/24']             # matched only when the target is a literal IP in the request
+```
+
+Matching is on the CONNECT target before DNS resolution; `hosts` matches hostnames, `cidrs` matches literal-IP requests (a
+hostname that resolves into the range is not matched). Such connections **bypass the allow-list and injection** — mitm can't
+see inside the tunnel — so scope them narrowly. See `docs/rules.md` and `examples/rules/l4-passthrough.yaml`.
 
 See `examples/rules/`.
 
