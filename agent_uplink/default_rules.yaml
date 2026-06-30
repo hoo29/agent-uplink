@@ -4,5 +4,5 @@
 
 rules:
   - name: default-readonly
-    host: ".*"
+    hosts: [".*"]
     methods: [GET, OPTIONS, HEAD]

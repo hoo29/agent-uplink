@@ -39,6 +39,8 @@ agent-uplink claude --bedrock --aws-profiles profile1 profile2
 agent-uplink claude --anthropic --force-rebuild
 agent-uplink claude --anthropic --image my-image
 agent-uplink claude --anthropic --mitmproxy-image mitmproxy/mitmproxy:12
+agent-uplink claude --anthropic --mitm-insecure                                                   # accept any upstream cert (no TLS verify)
+agent-uplink claude --anthropic --mitm-ca-cert ~/certs/corp-root.pem                              # trust extra PEM CA(s) upstream
 agent-uplink claude --anthropic --rules examples/rules/atlassian.yaml
 agent-uplink claude --anthropic --rules my.yaml --no-default-rules
 agent-uplink claude --anthropic --agent-runtime-class kata-qemu  # override default kata-clh

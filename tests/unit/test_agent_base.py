@@ -46,10 +46,10 @@ def _agent(image=None, dir_override=None) -> _BaseAgent:
 
 def test_default_rules_loads_from_yaml(tmp_path):
     (tmp_path / "default_rules.yaml").write_text(
-        "rules:\n  - {name: test_rule, host: example.com}\n"
+        "rules:\n  - {name: test_rule, hosts: [example.com]}\n"
     )
     assert _agent(dir_override=tmp_path).default_rules() == [
-        {"name": "test_rule", "host": "example.com"}
+        {"name": "test_rule", "hosts": ["example.com"]}
     ]
 
 

@@ -244,6 +244,25 @@ def _common_arg_parser() -> argparse.ArgumentParser:
         "WARNING: may log plaintext credentials (headers, bodies, re-signed AWS "
         "requests) to the mitm pod's stdout. Off by default.",
     )
+    common.add_argument(
+        "--mitm-insecure",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Disable upstream TLS certificate verification in mitmproxy "
+        "(ssl_insecure). Accepts self-signed/untrusted upstream certs. "
+        "WARNING: removes protection against upstream MITM. Off by default.",
+    )
+    common.add_argument(
+        "--mitm-ca-cert",
+        type=Path,
+        nargs="*",
+        action="extend",
+        default=[],
+        metavar="FILE",
+        help="Extra PEM CA file(s) to trust for upstream TLS, added on top of "
+        "mitmproxy's default roots (and any kube cluster CAs). A file may hold "
+        "multiple concatenated PEM certs. Repeatable.",
+    )
     return common
 
 
@@ -471,7 +490,9 @@ def _mitm_manifests(
     aws_creds_secret: str | None = None,
     kube_client_certs_secret: str | None = None,
     kube_upstream_ca_secret: str | None = None,
+    custom_ca_secret: str | None = None,
     debug: bool = False,
+    insecure: bool = False,
 ) -> list[dict]:
     labels = _label("mitm")
     # uid 1000 = the `mitmproxy` user baked into the upstream image. The certs
@@ -495,6 +516,15 @@ def _mitm_manifests(
         "/addon/filter.py",
         "--set",
         "rules_file=/rules/rules.json",
+        # Proxy over HTTP/1.1, not HTTP/2. mitmproxy's h2 stack mis-parses the
+        # framing some upstreams emit — notably the Go net/http2 kube-apiserver,
+        # which fails with "Invalid input ConnectionInputs.RECV_HEADERS in state
+        # ConnectionState.CLOSED". All upstreams the agent talks to support
+        # HTTP/1.1, and the addon only inspects/injects headers, so dropping h2
+        # multiplexing costs nothing here. (kubectl exec/port-forward use an
+        # HTTP/1.1 upgrade and are unaffected.)
+        "--set",
+        "http2=false",
     ]
     if debug:
         # Verbose flow logging. WARNING: flow_detail=3 dumps headers and bodies,
@@ -504,6 +534,8 @@ def _mitm_manifests(
         mitm_args.extend(
             ["--set", "termlog_verbosity=debug", "--set", "flow_detail=3"]
         )
+    if insecure:
+        mitm_args.extend(["--set", "ssl_insecure=true"])
     volume_mounts = [
         {"name": "addon", "mountPath": "/addon", "readOnly": True},
         {"name": "rules", "mountPath": "/rules", "readOnly": True},
@@ -536,24 +568,34 @@ def _mitm_manifests(
         volumes.append(secret_volume("kube-client-certs", kube_client_certs_secret))
         mitm_args.extend(["--set", "client_certs=/kube-client-certs"])
     # mitmproxy's ssl_verify_upstream_trusted_ca *replaces* its default trust
-    # store (certifi) rather than adding to it — pointing it straight at the
-    # cluster CAs would make every public upstream (pypi.org, etc.) fail TLS
+    # store (certifi) rather than adding to it — pointing it straight at extra
+    # CAs would make every public upstream (pypi.org, etc.) fail TLS
     # verification. So at startup we concatenate the image's own certifi bundle
-    # (the exact public roots mitmdump would otherwise use) with the cluster CAs
-    # into the writable /tmp and trust that combined file.
+    # (the exact public roots mitmdump would otherwise use) with each extra CA
+    # source (cluster serving CAs, user-supplied trust) into the writable /tmp
+    # and trust that combined file.
     command = ["mitmdump"]
+    extra_ca_paths: list[str] = []
     if kube_upstream_ca_secret:
         volume_mounts.append(
             {"name": "kube-upstream-ca", "mountPath": "/kube-upstream-ca", "readOnly": True}
         )
         volumes.append(secret_volume("kube-upstream-ca", kube_upstream_ca_secret))
+        extra_ca_paths.append("/kube-upstream-ca/bundle.pem")
+    if custom_ca_secret:
+        volume_mounts.append(
+            {"name": "custom-ca", "mountPath": "/custom-ca", "readOnly": True}
+        )
+        volumes.append(secret_volume("custom-ca", custom_ca_secret))
+        extra_ca_paths.append("/custom-ca/bundle.pem")
+    if extra_ca_paths:
         combined_ca = "/tmp/upstream-ca-bundle.pem"
         mitm_args.extend(["--set", f"ssl_verify_upstream_trusted_ca={combined_ca}"])
         command = [
             "sh",
             "-c",
             'cat "$(python -c \'import certifi; print(certifi.where())\')" '
-            f"/kube-upstream-ca/bundle.pem > {combined_ca} && exec mitmdump \"$@\"",
+            f"{' '.join(extra_ca_paths)} > {combined_ca} && exec mitmdump \"$@\"",
             "--",
         ]
 
@@ -1055,6 +1097,21 @@ def _read_mitm_certs(mitm_dir: Path) -> MitmCerts:
     )
 
 
+def _read_custom_ca(ca_files: list[Path]) -> bytes | None:
+    """Concatenate the user-supplied PEM CA file(s) into one bundle for the mitm
+    pod's upstream trust store, or None when none were given. Each file may hold
+    multiple PEM certs; they're joined verbatim (newline-separated)."""
+    if not ca_files:
+        return None
+    chunks: list[bytes] = []
+    for f in ca_files:
+        data = f.read_bytes()
+        if b"-----BEGIN CERTIFICATE-----" not in data:
+            raise ValueError(f"--mitm-ca-cert {f}: no PEM certificate found")
+        chunks.append(data if data.endswith(b"\n") else data + b"\n")
+    return b"".join(chunks)
+
+
 def _kube_secrets(session: Session, kube_plan: KubePlan | None) -> KubeSecrets:
     """Wrap the KubePlan's products as Secrets, recording the names the agent and
     mitm pods mount them under. Empty KubeSecrets when --kube-context is unset."""
@@ -1182,6 +1239,13 @@ def _assemble_manifests(
     for name, files in prepared.secret_payloads.items():
         manifests.append(secret_manifest(name, ns, files))
     manifests.extend(kube_secrets.manifests)
+    custom_ca_bundle = _read_custom_ca(args.mitm_ca_cert)
+    custom_ca_secret: str | None = None
+    if custom_ca_bundle is not None:
+        custom_ca_secret = "custom-ca"
+        manifests.append(
+            secret_manifest(custom_ca_secret, ns, {"bundle.pem": custom_ca_bundle})
+        )
     if git_manifest is not None:
         manifests.append(git_manifest)
     manifests.extend(
@@ -1195,7 +1259,9 @@ def _assemble_manifests(
             aws_creds_secret=aws_plan.creds_secret_name,
             kube_client_certs_secret=kube_secrets.client_certs_secret,
             kube_upstream_ca_secret=kube_secrets.upstream_ca_secret,
+            custom_ca_secret=custom_ca_secret,
             debug=args.mitm_debug,
+            insecure=args.mitm_insecure,
         )
     )
     if ssh_plan is not None:

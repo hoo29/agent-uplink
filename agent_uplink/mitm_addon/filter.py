@@ -19,6 +19,7 @@ it cannot depend on botocore. SigV4 is implemented from the AWS reference.
 import datetime
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import re
@@ -27,6 +28,8 @@ from urllib.parse import quote, unquote
 
 from mitmproxy import ctx, http
 from mitmproxy.addonmanager import Loader
+from mitmproxy.proxy import layer
+from mitmproxy.proxy.layers import TCPLayer
 
 # This addon runs inside the mitmproxy container as its own process, so it logs
 # under the module name (not agent-uplink's host-side "agent-uplink" logger).
@@ -264,16 +267,27 @@ class CompiledRule(NamedTuple):
     """A rule with its regexes pre-compiled, kept as named fields so the match
     loop reads by name instead of by tuple index."""
 
-    host: re.Pattern
+    hosts: list  # list[re.Pattern]; request host matches if ANY fullmatches
     methods: set
     paths: list
     inject_headers: dict
     name: str
 
 
+class CompiledL4Rule(NamedTuple):
+    """An l4_forward rule: match the connection's CONNECT target by hostname
+    regex and/or literal-IP CIDR, and if matched tunnel it raw (no TLS
+    termination, no allow-list, no injection)."""
+
+    hosts: list  # list[re.Pattern]; CONNECT hostname matches if ANY fullmatches
+    cidrs: list  # list[ipaddress.IPv4Network | IPv6Network]
+    name: str
+
+
 class RuleEnforcer:
     def __init__(self) -> None:
         self._compiled: list[CompiledRule] = []
+        self._l4_rules: list[CompiledL4Rule] = []
         # dummy AKIA -> {access_key_id, secret_access_key, session_token?}
         self._aws_creds: dict[str, dict] = {}
 
@@ -297,15 +311,30 @@ class RuleEnforcer:
                 data = json.load(f)
             self._compiled = [
                 CompiledRule(
-                    host=re.compile(r["host"]),
+                    hosts=[re.compile(h) for h in (r.get("hosts") or [])],
                     methods=set(r.get("methods") or []),
                     paths=[re.compile(p) for p in (r.get("paths") or [])],
                     inject_headers=r.get("inject", {}).get("headers", {}),
                     name=r.get("name", "<unnamed>"),
                 )
                 for r in data["rules"]
+                if not r.get("l4_forward")
             ]
-            logger.info(f"agent-uplink: loaded {len(self._compiled)} rules")
+            self._l4_rules = [
+                CompiledL4Rule(
+                    hosts=[re.compile(h) for h in (r.get("hosts") or [])],
+                    cidrs=[
+                        ipaddress.ip_network(c) for c in (r.get("cidrs") or [])
+                    ],
+                    name=r.get("name", "<unnamed>"),
+                )
+                for r in data["rules"]
+                if r.get("l4_forward")
+            ]
+            logger.info(
+                f"agent-uplink: loaded {len(self._compiled)} rules, "
+                f"{len(self._l4_rules)} l4_forward rules"
+            )
         if "aws_creds_file" in updates and ctx.options.aws_creds_file:
             with open(ctx.options.aws_creds_file) as f:
                 self._aws_creds = json.load(f)
@@ -313,13 +342,55 @@ class RuleEnforcer:
                 f"agent-uplink: loaded {len(self._aws_creds)} AWS signing identities"
             )
 
+    def _match_l4(self, target_host: str) -> "str | None":
+        """Return the name of the first l4_forward rule matching the CONNECT
+        target, else None. `target_host` is the literal host the client put in
+        the request (the CONNECT authority) — NOT a DNS-resolved address. A
+        literal IP is matched against `cidrs`; anything else against `host`.
+        """
+        literal_ip = None
+        try:
+            literal_ip = ipaddress.ip_address(target_host)
+        except ValueError:
+            pass
+        for rule in self._l4_rules:
+            if literal_ip is not None:
+                if any(literal_ip in net for net in rule.cidrs):
+                    return rule.name
+            elif any(h.fullmatch(target_host) for h in rule.hosts):
+                return rule.name
+        return None
+
+    def next_layer(self, nextlayer: layer.NextLayer) -> None:
+        """Before any TLS is terminated, decide whether this connection should be
+        tunnelled raw. mitm runs as an explicit HTTP proxy, so the CONNECT target
+        is in context.server.address — the host/IP the client asked for, before
+        DNS resolution. On an l4_forward match we install a raw TCPLayer: mitm
+        relays bytes without decrypting, so the agent's TLS (incl. any client
+        cert / mTLS) goes end-to-end to the upstream. Such connections bypass the
+        allow-list and header injection entirely.
+        """
+        if nextlayer.layer is not None:
+            return  # another layer already decided
+        address = nextlayer.context.server.address
+        if not address:
+            return
+        target_host = address[0]
+        matched = self._match_l4(target_host)
+        if matched is not None:
+            logger.info(
+                f"agent-uplink L4-FORWARD [{matched}] {target_host}:{address[1]} "
+                "(raw TCP tunnel, TLS end-to-end, allow-list bypassed)"
+            )
+            nextlayer.layer = TCPLayer(nextlayer.context)
+
     def _match_rule(self, req: http.Request):
         """Return (name, inject_headers) for the first allow rule that matches,
-        else None. Matching is host (fullmatch) + optional method + optional
-        path. First match wins; rules are pre-ordered by the host (layer order).
+        else None. Matching is host (any of `hosts` fullmatch) + optional method
+        + optional path. First match wins; rules are pre-ordered by layer.
         """
         for rule in self._compiled:
-            if not rule.host.fullmatch(req.host):
+            if not any(h.fullmatch(req.host) for h in rule.hosts):
                 continue
             if rule.methods and req.method not in rule.methods:
                 continue

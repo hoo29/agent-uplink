@@ -10,7 +10,7 @@
 
 rules:
   - name: gitlab-api-read
-    host: 'gitlab\.com'
+    hosts: ['gitlab\.com']
     methods: [GET, OPTIONS]
     paths:
       - "/api/v4/.*"

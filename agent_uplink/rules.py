@@ -14,6 +14,7 @@ It exists for short-lived dynamic credentials (e.g. an AWS CodeArtifact auth
 token) that keyring can't hold. The command can't contain a literal `}}`.
 """
 
+import ipaddress
 import json
 import logging
 import re
@@ -88,16 +89,64 @@ def _resolve_placeholders(value: str, allow_exec: bool) -> str:
     return _PLACEHOLDER_RE.sub(sub, value)
 
 
+def _validate_hosts(rule: dict, name: str) -> list[str]:
+    """Validate the required `hosts` field: a non-empty list of regex strings,
+    each a valid pattern. Returns the list unchanged."""
+    hosts = rule.get("hosts")
+    if not isinstance(hosts, list) or not all(isinstance(h, str) for h in hosts):
+        raise ValueError(f"{name}: 'hosts' must be a list of regex strings")
+    if not hosts:
+        raise ValueError(f"{name}: 'hosts' is an empty list; list at least one host")
+    for h in hosts:
+        try:
+            re.compile(h)
+        except re.error as e:
+            raise ValueError(f"{name}: invalid host regex {h!r}: {e}")
+    return hosts
+
+
+def _validate_l4_forward_rule(rule: dict, name: str) -> dict:
+    """An l4_forward rule is an L4 (TCP) passthrough decision, not an HTTP allow
+    rule: mitm tunnels the raw connection without terminating TLS, so the agent's
+    client cert reaches the upstream end-to-end. It carries no methods/paths/
+    inject (mitm never sees the plaintext), and matches on either `hosts` (a list
+    of regexes, for connections to a hostname) or `cidrs` (when the request
+    target is a literal IP). At least one must be present."""
+    hosts = rule.get("hosts")
+    cidrs = rule.get("cidrs")
+    if hosts is None and cidrs is None:
+        raise ValueError(f"{name}: l4_forward rule needs 'hosts' and/or 'cidrs'")
+    for forbidden in ("methods", "paths", "inject"):
+        if forbidden in rule:
+            raise ValueError(
+                f"{name}: l4_forward rule cannot set {forbidden!r} — mitm tunnels "
+                "the raw connection and never sees the plaintext request"
+            )
+    out: dict[str, Any] = {"name": name, "l4_forward": True}
+    if hosts is not None:
+        out["hosts"] = _validate_hosts(rule, name)
+    if cidrs is not None:
+        if not isinstance(cidrs, list) or not all(isinstance(c, str) for c in cidrs):
+            raise ValueError(f"{name}: 'cidrs' must be a list of CIDR strings")
+        if not cidrs:
+            raise ValueError(f"{name}: 'cidrs' is an empty list; omit it instead")
+        normalised: list[str] = []
+        for c in cidrs:
+            try:
+                normalised.append(str(ipaddress.ip_network(c, strict=False)))
+            except ValueError as e:
+                raise ValueError(f"{name}: invalid CIDR {c!r}: {e}")
+        out["cidrs"] = normalised
+    return out
+
+
 def _validate_and_resolve_rule(rule: dict, idx: int, allow_exec: bool) -> dict:
     name = rule.get("name", f"<rule[{idx}]>")
-    if "host" not in rule:
-        raise ValueError(f"{name}: missing required field 'host'")
-    if not isinstance(rule["host"], str):
-        raise ValueError(f"{name}: 'host' must be a string regex")
-    try:
-        re.compile(rule["host"])
-    except re.error as e:
-        raise ValueError(f"{name}: invalid host regex {rule['host']!r}: {e}")
+    if rule.get("l4_forward"):
+        return _validate_l4_forward_rule(rule, name)
+    if "hosts" not in rule:
+        raise ValueError(f"{name}: missing required field 'hosts'")
+    hosts = _validate_hosts(rule, name)
 
     methods = rule.get("methods")
     if methods is not None:
@@ -138,7 +187,7 @@ def _validate_and_resolve_rule(rule: dict, idx: int, allow_exec: bool) -> dict:
                     raise ValueError(f"{name}: header {k!r} must be a string")
                 resolved_headers[k] = _resolve_placeholders(v, allow_exec)
 
-    out: dict[str, Any] = {"name": name, "host": rule["host"]}
+    out: dict[str, Any] = {"name": name, "hosts": hosts}
     if methods is not None:
         out["methods"] = methods
     if paths is not None:

@@ -28,7 +28,7 @@ debug: false
 # rules:
 #   - examples/rules/git.yaml          # a rules file (path)
 #   - name: jira                       # an inline rule (same schema as a file entry)
-#     host: 'mycorp\.atlassian\.net'
+#     hosts: ['mycorp\.atlassian\.net']
 #     inject:
 #       headers:
 #         Authorization: 'Basic {{keyring:jira:me}}'

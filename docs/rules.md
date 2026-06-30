@@ -15,7 +15,8 @@ replace_defaults: false   # optional; CLI --no-default-rules takes precedence
 
 rules:
   - name: my-rule         # human-readable label, shown in mitm logs
-    host: '<regex>'       # required; matched against request host with re.fullmatch
+    hosts: ['<regex>']    # required; list of regexes, each re.fullmatch'ed against
+                          #   the request host; the rule matches if ANY entry matches
     methods: [GET, POST]  # optional; default = allow any method
     paths: ['<regex>']    # optional; default = allow any path (any matches)
     inject:               # optional
@@ -32,6 +33,40 @@ Resolution is single-pass, so a resolved secret value is never re-scanned for pl
 
 The resolved JSON is stored as a K8s `Secret` (`rules-json`) and mounted read-only into the mitm pod; the agent pod never sees it.
 
+## L4 (raw TCP) passthrough — `l4_forward`
+
+By default mitm **terminates** TLS: it decrypts each connection, applies the allow-list, optionally injects headers, then re-encrypts to the
+upstream. That makes mutual TLS impossible — the agent's client certificate is consumed by mitm during the agent→mitm handshake and never
+reaches the server, and mitm has no private key to present one upstream itself (it only ever saw the public cert). This is inherent to any
+terminating proxy, not a missing feature.
+
+An `l4_forward` rule switches a matched connection to a **raw TCP tunnel**: mitm relays encrypted bytes without decrypting, so the agent's TLS
+— including any `curl --cert/--key` client certificate — runs end-to-end to the upstream.
+
+```yaml
+rules:
+  - name: corp-mtls
+    l4_forward: true
+    hosts: ['secure\.corp\.example\.com']   # regexes; matched only when the CONNECT target is a hostname
+    cidrs:                               # matched only when the target is a literal IP in the request
+      - '192.168.149.0/24'
+      - '10.1.2.3/32'
+```
+
+Matching is on the **CONNECT target** — the host or IP the client asked for, *before* any DNS resolution — decided in mitmproxy's `next_layer`
+hook before TLS is touched:
+
+- `hosts` — list of regexes, each `re.fullmatch`ed only when the target is a hostname; the rule matches if any entry matches.
+- `cidrs` — list of CIDRs (host bits are normalised), matched only when the target is a **literal IP** in the request. A hostname that would
+  *resolve* to an IP in the range is **not** matched — only an IP the client put in the request directly.
+
+Set `hosts`, `cidrs`, or both; at least one is required. An `l4_forward` rule must not set `methods`, `paths`, or `inject` — mitm never sees the
+plaintext, so those have no meaning (supplying any is a startup error).
+
+> **Security:** an `l4_forward` connection **bypasses the allow-list, header injection, and AWS re-signing entirely** — mitm cannot see inside
+> the tunnel. The egress perimeter still holds (traffic flows through the mitm pod and the NetworkPolicy is unchanged), but the request content
+> is no longer inspected. Match as narrowly as possible. See `examples/rules/l4-passthrough.yaml`.
+
 ## Populating the keyring
 
 ```bash
@@ -46,3 +81,4 @@ keyring get my-svc my-user           # verify
 ## Examples
 
 `examples/rules/atlassian.yaml` and `examples/rules/gitlab.yaml` show worked configurations for Atlassian Cloud (Basic auth) and GitLab (PRIVATE-TOKEN), including the `keyring set ...` command for each. `examples/rules/codeartifact.yaml` shows `{{exec:...}}` generating a CodeArtifact auth token on the host and injecting it as Maven Basic auth.
+`examples/rules/l4-passthrough.yaml` shows `l4_forward` raw-TCP passthrough for an mTLS upstream (by hostname and by IP CIDR).

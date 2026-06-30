@@ -157,14 +157,14 @@ def core_session(cluster, test_image, mitm_certs_dir):
     rules_yaml = f"""
 rules:
   - name: echo-inject
-    host: 'echo'
+    hosts: ['echo']
     methods: [GET, POST]
     inject:
       headers:
         Authorization: 'Bearer {harness.INJECT_SENTINEL}'
         X-Injected: 'sentinel'
   - name: pathsvc-rule
-    host: 'pathsvc'
+    hosts: ['pathsvc']
     methods: [POST]
     paths:
       - '/allowed/.*'
