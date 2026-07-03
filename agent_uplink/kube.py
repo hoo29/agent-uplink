@@ -105,6 +105,7 @@ def resolve(
     client_certs: dict[str, bytes] = {}
     ca_pems: list[bytes] = []
     seen_hosts: dict[str, str] = {}  # host -> context name (for clash detection)
+    mitm_ca_b64 = base64.b64encode(mitm_ca_cert).decode("ascii")
 
     for ctx_name in context_names:
         data = _kubectl_view(ctx_name, kubeconfig_path)
@@ -175,7 +176,12 @@ def resolve(
 
         if token or token_file:
             if token_file and not token:
-                token = Path(token_file).read_text(encoding="utf-8").strip()
+                tf = Path(token_file)
+                if not tf.is_file():
+                    raise ValueError(
+                        f"context {ctx_name!r}: tokenFile {token_file!r} not found"
+                    )
+                token = tf.read_text(encoding="utf-8").strip()
             rule: dict[str, Any] = {
                 "name": f"kube-{ctx_name}",
                 "hosts": [re.escape(host)],
@@ -186,13 +192,8 @@ def resolve(
         elif client_cert_data and client_key_data:
             cert_pem = base64.b64decode(client_cert_data)
             key_pem = base64.b64decode(client_key_data)
-            cert_filename = f"{host}.pem"
-            if cert_filename in client_certs and client_certs[cert_filename] != cert_pem + key_pem:
-                raise ValueError(
-                    f"context {ctx_name!r}: host {host!r} already has a different "
-                    f"client certificate from context {seen_hosts[host]!r}"
-                )
-            client_certs[cert_filename] = cert_pem + key_pem
+            # One cert per host is guaranteed by the seen_hosts clash check above.
+            client_certs[f"{host}.pem"] = cert_pem + key_pem
             rule = {
                 "name": f"kube-{ctx_name}",
                 "hosts": [re.escape(host)],
@@ -215,7 +216,6 @@ def resolve(
         rules.append(rule)
         ca_pems.append(ca_pem)
 
-        mitm_ca_b64 = base64.b64encode(mitm_ca_cert).decode("ascii")
         clusters_out.append({
             "name": cluster_name,
             "cluster": {

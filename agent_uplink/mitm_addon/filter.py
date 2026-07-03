@@ -346,7 +346,7 @@ class RuleEnforcer:
         """Return the name of the first l4_forward rule matching the CONNECT
         target, else None. `target_host` is the literal host the client put in
         the request (the CONNECT authority) — NOT a DNS-resolved address. A
-        literal IP is matched against `cidrs`; anything else against `host`.
+        literal IP is matched against `cidrs`; anything else against `hosts`.
         """
         literal_ip = None
         try:

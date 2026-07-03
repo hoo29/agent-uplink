@@ -72,8 +72,28 @@ def test_mitm_policy_ingress_from_agent_only():
     ingress = mitm["spec"]["ingress"][0]
     assert ingress["from"][0]["podSelector"]["matchLabels"]["app"] == "agent"
     assert ingress["ports"][0]["port"] == cli.PROXY_PORT
-    # Egress unrestricted so mitm can reach the real AWS endpoints it re-signs for.
-    assert mitm["spec"]["egress"] == [{}]
+
+
+def test_mitm_egress_blocks_link_local_metadata():
+    # mitm must reach the public internet but NOT the node's cloud-metadata
+    # service (169.254.169.254), or the agent could pivot through the proxy to
+    # steal the instance's IAM role credentials.
+    mitm = _by_name(cli._network_policies("ns"))["mitm-policy"]
+    blocks = [
+        t["ipBlock"]
+        for e in mitm["spec"]["egress"]
+        for t in e.get("to", [])
+        if "ipBlock" in t
+    ]
+    v4 = next(b for b in blocks if b["cidr"] == "0.0.0.0/0")
+    assert "169.254.0.0/16" in v4["except"]
+    # 169.254.169.254 (all clouds) falls inside the excepted range.
+    import ipaddress
+    assert ipaddress.ip_address("169.254.169.254") in ipaddress.ip_network(
+        "169.254.0.0/16"
+    )
+    v6 = next(b for b in blocks if b["cidr"] == "::/0")
+    assert "fe80::/10" in v6["except"]
 
 
 # --------------------------------------------------------------------------- #
@@ -623,6 +643,11 @@ def test_read_custom_ca_rejects_non_pem(tmp_path):
     bad.write_bytes(b"not a cert")
     with pytest.raises(ValueError, match="no PEM certificate"):
         cli._read_custom_ca([bad])
+
+
+def test_read_custom_ca_rejects_missing_file(tmp_path):
+    with pytest.raises(ValueError, match="file not found"):
+        cli._read_custom_ca([tmp_path / "absent.pem"])
 
 
 # --------------------------------------------------------------------------- #

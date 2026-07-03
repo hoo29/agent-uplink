@@ -75,6 +75,17 @@ AGENT_CONTAINER_NAME = "main"
 
 ADDON_PATH = Path(__file__).resolve().parent / "mitm_addon" / "filter.py"
 
+# Link-local ranges denied to the mitm pod at L3. mitm forwards on the agent's
+# behalf with unrestricted egress otherwise, and the default GET rule allows any
+# host — so without this an agent could reach the node's cloud-metadata service
+# (169.254.169.254, all clouds) through the proxy and steal the instance's IAM
+# role credentials. Blocking at the NetworkPolicy layer also defeats a hostname
+# that resolves to a metadata IP (DNS rebinding), which the addon can't see.
+# Private ranges are deliberately not blocked — a private kube API server is a
+# supported destination.
+_MITM_EGRESS_DENY_V4 = "169.254.0.0/16"
+_MITM_EGRESS_DENY_V6 = "fe80::/10"
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -939,8 +950,11 @@ def _network_policies(
             pod_selector={"matchLabels": {"app": "agent"}},
             egress=agent_egress,
         ),
-        # mitm: accepts ingress from agent on 8080; egress unrestricted (out to
-        # the internet, including the real AWS endpoints it re-signs for).
+        # mitm: accepts ingress from agent on 8080; egress to the whole internet
+        # (incl. the real AWS endpoints it re-signs for) EXCEPT link-local, so the
+        # agent can't pivot through the proxy to the node's cloud-metadata service
+        # (see _MITM_EGRESS_DENY_*). Two ipBlocks (v4 + v6) replace a blanket
+        # allow; a v6-less cluster simply never matches the v6 entry.
         network_policy_manifest(
             "mitm-policy",
             ns,
@@ -951,7 +965,10 @@ def _network_policies(
                     "ports": [{"protocol": "TCP", "port": PROXY_PORT}],
                 }
             ],
-            egress=[{}],
+            egress=[
+                {"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": [_MITM_EGRESS_DENY_V4]}}]},
+                {"to": [{"ipBlock": {"cidr": "::/0", "except": [_MITM_EGRESS_DENY_V6]}}]},
+            ],
         ),
     ]
     # ssh-agent holder: accepts the signing bridge from the agent only; no egress
@@ -1105,6 +1122,9 @@ def _read_custom_ca(ca_files: list[Path]) -> bytes | None:
         return None
     chunks: list[bytes] = []
     for f in ca_files:
+        f = f.expanduser()
+        if not f.is_file():
+            raise ValueError(f"--mitm-ca-cert {f}: file not found")
         data = f.read_bytes()
         if b"-----BEGIN CERTIFICATE-----" not in data:
             raise ValueError(f"--mitm-ca-cert {f}: no PEM certificate found")
@@ -1223,6 +1243,7 @@ def _assemble_manifests(
     kube_secrets: KubeSecrets,
     git_manifest: dict | None,
     git_secret_name: str | None,
+    custom_ca_bundle: bytes | None,
     cwd: Path,
     username: str,
     uid: int,
@@ -1239,7 +1260,6 @@ def _assemble_manifests(
     for name, files in prepared.secret_payloads.items():
         manifests.append(secret_manifest(name, ns, files))
     manifests.extend(kube_secrets.manifests)
-    custom_ca_bundle = _read_custom_ca(args.mitm_ca_cert)
     custom_ca_secret: str | None = None
     if custom_ca_bundle is not None:
         custom_ca_secret = "custom-ca"
@@ -1295,12 +1315,13 @@ def _assemble_manifests(
 
 
 def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
-    username = os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
+    uid, gid = os.getuid(), os.getgid()
+    username = os.environ.get("USER") or pwd.getpwuid(uid).pw_name
     cwd = Path.cwd()
     validate_cwd(username, cwd)
     ssh_cidrs, ssh_key_dir = validate_ssh_args(args.ssh_cidr, args.ssh_key_dir)
     ssh_plan = sshagent.prepare(ssh_key_dir) if ssh_key_dir is not None else None
-    if ssh_plan is not None and os.getuid() == 0:
+    if ssh_plan is not None and uid == 0:
         raise ValueError(
             "--ssh-key-dir is unsupported when running agent-uplink as root: the "
             "hardened holder/relay pods run runAsNonRoot with runAsUser=0, which "
@@ -1312,6 +1333,9 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
             ssh_key_dir,
         )
     extra_mounts = validate_mounts(username, cwd, args.mount_rw, args.mount_ro)
+    # Read + validate --mitm-ca-cert files now, before any cluster work, so a
+    # bad file can't abort a run after the (slow) bootstrap and image build.
+    custom_ca_bundle = _read_custom_ca(args.mitm_ca_cert)
 
     mitm_dir = STATE_DIR / "mitm"
     certs_generated = _bootstrap_infra(args, mitm_dir)
@@ -1342,8 +1366,10 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
         PodBuildContext(
             cwd=cwd,
             username=username,
-            uid=os.getuid(),
-            gid=os.getgid(),
+            uid=uid,
+            gid=gid,
+            proxy_host="mitm",
+            proxy_port=PROXY_PORT,
             aws_creds_secret_name=aws_plan.dummy_secret_name,
             debug_host_dir=_prepare_debug_dir(args, session),
             debug=args.debug,
@@ -1365,10 +1391,11 @@ def run(session: Session, args: argparse.Namespace, agent: Agent) -> int:
         kube_secrets=kube_secrets,
         git_manifest=git_manifest,
         git_secret_name=git_secret_name,
+        custom_ca_bundle=custom_ca_bundle,
         cwd=cwd,
         username=username,
-        uid=os.getuid(),
-        gid=os.getgid(),
+        uid=uid,
+        gid=gid,
         ssh_cidrs=ssh_cidrs,
         ssh_plan=ssh_plan,
         extra_mounts=extra_mounts,

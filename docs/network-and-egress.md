@@ -6,8 +6,10 @@
 |---|---|---|
 | `default-deny` | all pods | Deny all ingress + egress unless another policy allows it |
 | `agent-egress` | `app=agent` | Egress only to `app=mitm` on TCP 8080 + `kube-system/kube-dns` on UDP/TCP 53, plus TCP 22 to any `--ssh-cidr` ranges and the `app=ssh-agent` holder on TCP 8765 when `--ssh-key-dir` is set (see SSH egress) |
-| `mitm-policy` | `app=mitm` | Ingress from `app=agent` on TCP 8080; egress unrestricted (out to the internet, including the real AWS endpoints it re-signs for) |
+| `mitm-policy` | `app=mitm` | Ingress from `app=agent` on TCP 8080; egress to the whole internet (incl. the real AWS endpoints it re-signs for) **except link-local** (`169.254.0.0/16`, `fe80::/10`) |
 | `ssh-agent-policy` | `app=ssh-agent` | Present only with `--ssh-key-dir`: ingress from `app=agent` on TCP 8765 (the signing bridge); no egress (the holder does pure crypto) |
+
+The mitm pod forwards on the agent's behalf, so its egress is where an agent-driven request actually leaves the perimeter. The default rules allow `GET` to any host, so the link-local `except` is what stops an agent from pivoting through the proxy to the node's **cloud-metadata service** (`169.254.169.254`, common to all clouds) and reading the instance's IAM role credentials. Blocking at L3 also defeats a hostname that resolves to a metadata IP (DNS rebinding), which the mitm addon can't see. Private ranges (`10/8`, `172.16/12`, `192.168/16`) are deliberately **not** blocked — a private-IP kube API server is a supported destination — so an agent running under the default rules can still reach other in-cluster/VPC services by IP over `GET`; for untrusted workloads pair `--no-default-rules` with an explicit host allow-list.
 
 ## SSH egress
 

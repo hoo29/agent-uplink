@@ -101,7 +101,7 @@ def _validate_hosts(rule: dict, name: str) -> list[str]:
         try:
             re.compile(h)
         except re.error as e:
-            raise ValueError(f"{name}: invalid host regex {h!r}: {e}")
+            raise ValueError(f"{name}: invalid host regex {h!r}: {e}") from e
     return hosts
 
 
@@ -135,7 +135,7 @@ def _validate_l4_forward_rule(rule: dict, name: str) -> dict:
             try:
                 normalised.append(str(ipaddress.ip_network(c, strict=False)))
             except ValueError as e:
-                raise ValueError(f"{name}: invalid CIDR {c!r}: {e}")
+                raise ValueError(f"{name}: invalid CIDR {c!r}: {e}") from e
         out["cidrs"] = normalised
     return out
 
@@ -173,7 +173,7 @@ def _validate_and_resolve_rule(rule: dict, idx: int, allow_exec: bool) -> dict:
             try:
                 re.compile(p)
             except re.error as e:
-                raise ValueError(f"{name}: invalid path regex {p!r}: {e}")
+                raise ValueError(f"{name}: invalid path regex {p!r}: {e}") from e
 
     resolved_headers: dict[str, str] = {}
     inject = rule.get("inject")

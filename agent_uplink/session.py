@@ -30,7 +30,9 @@ class Session:
     def create(cls, state_dir: Path) -> Session:
         session_id = uuid.uuid4().hex[:12]
         session_dir = state_dir / "sessions" / session_id
-        session_dir.mkdir(parents=True, exist_ok=True)
+        # 0700: the scratch dir holds per-run files derived from host secrets
+        # (e.g. the sanitized ~/.claude.json, which keeps MCP env values).
+        session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         namespace = f"agent-uplink-{session_id}"
         return cls(session_dir=session_dir, namespace=namespace)
 

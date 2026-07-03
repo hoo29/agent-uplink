@@ -89,9 +89,17 @@ def select_for_clean(
     all_sessions: bool,
     older_than_seconds: float | None,
 ) -> list[SessionNamespace]:
-    """Pick which sessions to delete. Exactly one selector applies, in priority
-    order all > older-than > ids. Raises ValueError if none is given (so `clean`
-    with no arguments can't wipe everything by accident)."""
+    """Pick which sessions to delete. Exactly one selector must be given:
+    combining them is refused rather than silently picking one (ids alongside
+    --older-than could otherwise delete far more than the named sessions), and
+    so is giving none (a bare `clean` can't wipe everything by accident)."""
+    given = sum(
+        (bool(all_sessions), older_than_seconds is not None, bool(ids))
+    )
+    if given > 1:
+        raise ValueError(
+            "clean takes exactly one of SESSION id(s), --all, or --older-than"
+        )
     if all_sessions:
         return list(sessions)
     if older_than_seconds is not None:
