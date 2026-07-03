@@ -3,6 +3,8 @@ OAuth token out of the container."""
 
 import json
 
+import pytest
+
 from agent_uplink.agents.claude import config
 from agent_uplink.agents.claude.agent import _AUTH_MODE_ENV
 
@@ -38,6 +40,30 @@ def test_fake_oauth_preserves_non_secret_fields():
     fake = json.loads(fake_bytes)
     assert fake["claudeAiOauth"]["subscriptionType"] == "pro"
     assert fake["claudeAiOauth"]["scopes"] == ["user:inference"]
+
+
+# --------------------------------------------------------------------------- #
+# Missing / malformed host files -> actionable errors, not raw tracebacks
+# --------------------------------------------------------------------------- #
+
+
+def test_load_claude_config_missing_settings_is_actionable(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "HOST_CLAUDE_DIR", tmp_path)
+    with pytest.raises(RuntimeError, match="settings.json.*not found"):
+        config.load_claude_config()
+
+
+def test_read_oauth_credentials_missing_file_is_actionable(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "HOST_CLAUDE_DIR", tmp_path)
+    with pytest.raises(RuntimeError, match="log in with `claude`"):
+        config.read_anthropic_oauth_credentials()
+
+
+def test_refresh_oauth_missing_expiry_is_actionable(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "HOST_CLAUDE_DIR", tmp_path)
+    (tmp_path / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {}}))
+    with pytest.raises(RuntimeError, match="expiresAt"):
+        config.refresh_anthropic_oauth_if_expiring()
 
 
 # --------------------------------------------------------------------------- #

@@ -47,6 +47,7 @@ def _build_pod(
     session_dir.mkdir()
     ctx = PodBuildContext(
         cwd=Path("/home/u/proj"), username="u", uid=1000, gid=1000,
+        proxy_host="mitm", proxy_port=8080,
         aws_creds_secret_name=aws_secret, debug_host_dir=None, debug=False,
         session_dir=session_dir,
     )
@@ -159,7 +160,12 @@ def test_maven_not_mounted_without_flag(tmp_path, monkeypatch):
     assert _mount(pod, "m2-repo") is None
     assert _mount(pod, "m2-settings") is None
     assert "MAVEN_OPTS" not in _agent("anthropic", maven=False)._container_env(
-        Path("/home/u/proj")
+        PodBuildContext(
+            cwd=Path("/home/u/proj"), username="u", uid=1000, gid=1000,
+            proxy_host="mitm", proxy_port=8080,
+            aws_creds_secret_name=None, debug_host_dir=None, debug=False,
+            session_dir=tmp_path,
+        )
     )
 
 
@@ -186,6 +192,7 @@ def test_maven_flag_sets_proxy_env(tmp_path, monkeypatch):
     contribution = _agent("anthropic", maven=True).pod_contribution(
         PodBuildContext(
             cwd=Path("/home/u/proj"), username="u", uid=1000, gid=1000,
+            proxy_host="mitm", proxy_port=8080,
             aws_creds_secret_name=None, debug_host_dir=None, debug=False,
             session_dir=session_dir,
         )

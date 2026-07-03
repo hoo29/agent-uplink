@@ -28,7 +28,13 @@ _FAKE_OAUTH_TTL_SECONDS = 10 * 365 * 24 * 3600
 
 
 def load_claude_config() -> dict:
-    return json.loads((HOST_CLAUDE_DIR / "settings.json").read_text(encoding="utf8"))
+    path = HOST_CLAUDE_DIR / "settings.json"
+    if not path.is_file():
+        raise RuntimeError(
+            f"{path} not found; run `claude` on the host once so it creates its "
+            "settings before starting agent-uplink"
+        )
+    return json.loads(path.read_text(encoding="utf8"))
 
 
 def refresh_anthropic_oauth_if_expiring(threshold_seconds: int = 300) -> None:
@@ -36,10 +42,14 @@ def refresh_anthropic_oauth_if_expiring(threshold_seconds: int = 300) -> None:
     about to expire. The real token is read from this file and injected by
     mitmproxy; refreshing here avoids allow-listing the OAuth refresh endpoint
     inside the container."""
-    creds_path = HOST_CLAUDE_DIR / ".credentials.json"
-    creds = json.loads(creds_path.read_text(encoding="utf8"))
-    expires_at_ms = creds["claudeAiOauth"]["expiresAt"]
-    seconds_left = expires_at_ms / 1000 - time.time()
+    creds = read_anthropic_oauth_credentials()
+    oauth = creds.get("claudeAiOauth")
+    if not isinstance(oauth, dict) or "expiresAt" not in oauth:
+        raise RuntimeError(
+            "~/.claude/.credentials.json has no 'claudeAiOauth.expiresAt'; "
+            "log in with `claude` on the host first"
+        )
+    seconds_left = oauth["expiresAt"] / 1000 - time.time()
     if seconds_left > threshold_seconds:
         return
     LOGGER.info("refreshing claude oauth token")
@@ -48,9 +58,13 @@ def refresh_anthropic_oauth_if_expiring(threshold_seconds: int = 300) -> None:
 
 def read_anthropic_oauth_credentials() -> dict:
     """Return host's ~/.claude/.credentials.json contents. Raises if missing."""
-    return json.loads(
-        (HOST_CLAUDE_DIR / ".credentials.json").read_text(encoding="utf8")
-    )
+    path = HOST_CLAUDE_DIR / ".credentials.json"
+    if not path.is_file():
+        raise RuntimeError(
+            f"{path} not found; --anthropic needs the host's Claude OAuth "
+            "credentials — log in with `claude` on the host first"
+        )
+    return json.loads(path.read_text(encoding="utf8"))
 
 
 def fake_oauth_credentials_bytes(real_creds: dict) -> tuple[bytes, str]:

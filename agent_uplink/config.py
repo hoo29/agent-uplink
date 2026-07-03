@@ -140,6 +140,15 @@ def discover_config_files(cwd: Path, home: Path) -> list[Path]:
     return found
 
 
+def _require_bool(raw_key: str, value: Any, file: Path) -> None:
+    """Flags take only real YAML booleans. A quoted string would coerce by
+    truthiness (`"false"` -> True), silently inverting the user's intent."""
+    if not isinstance(value, bool):
+        raise ConfigError(
+            f"{file}: {raw_key!r} expects a boolean (true/false), got {value!r}"
+        )
+
+
 def _merge_file(merged: dict[str, Any], data: dict, spec: _Spec, file: Path) -> None:
     for raw_key, value in data.items():
         if not isinstance(raw_key, str):
@@ -149,6 +158,7 @@ def _merge_file(merged: dict[str, Any], data: dict, spec: _Spec, file: Path) -> 
         # Option-form key for a store_const flag, e.g. `anthropic: true`.
         if nk in spec.const_keys:
             dest, const = spec.const_keys[nk]
+            _require_bool(raw_key, value, file)
             if value:
                 merged[dest] = const
             continue
@@ -184,7 +194,8 @@ def _merge_file(merged: dict[str, Any], data: dict, spec: _Spec, file: Path) -> 
 
         # Plain flag (store_true/store_false/BooleanOptionalAction) has nargs 0.
         if action.nargs == 0:
-            merged[dest] = bool(value)
+            _require_bool(raw_key, value, file)
+            merged[dest] = value
             continue
 
         merged[dest] = _coerce(action, value, file)

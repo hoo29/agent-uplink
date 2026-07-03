@@ -133,6 +133,18 @@ def test_select_with_no_selector_raises():
         )
 
 
+def test_select_with_combined_selectors_raises():
+    # ids alongside --older-than must error, not silently delete by age.
+    with pytest.raises(ValueError, match="exactly one"):
+        select_for_clean(
+            SESSIONS, ids=["new"], all_sessions=False, older_than_seconds=3600
+        )
+    with pytest.raises(ValueError, match="exactly one"):
+        select_for_clean(
+            SESSIONS, ids=[], all_sessions=True, older_than_seconds=3600
+        )
+
+
 # --------------------------------------------------------------------------- #
 # cmd_clean
 # --------------------------------------------------------------------------- #

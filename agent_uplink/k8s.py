@@ -88,14 +88,33 @@ def delete_namespace(name: str, *, wait: bool = False) -> None:
 
 
 def wait_for_pod_ready(namespace: str, pod_name: str, *, timeout: int = 180) -> None:
-    kubectl(
-        "wait",
-        "--for=condition=Ready",
-        f"pod/{pod_name}",
-        "-n",
-        namespace,
-        f"--timeout={timeout}s",
-    )
+    try:
+        kubectl(
+            "wait",
+            "--for=condition=Ready",
+            f"pod/{pod_name}",
+            "-n",
+            namespace,
+            f"--timeout={timeout}s",
+        )
+    except RuntimeError as exc:
+        # kubectl wait's own error says only "timed out"; the cause (image pull
+        # failure, runtime error, scheduling) is in the pod status and events —
+        # capture them now, since teardown deletes the namespace right after.
+        status = kubectl(
+            "get", "pod", pod_name, "-n", namespace, "-o", "wide",
+            raise_error=False,
+        ).strip()
+        events = kubectl(
+            "get", "events", "-n", namespace,
+            "--field-selector", f"involvedObject.name={pod_name}",
+            raise_error=False,
+        ).strip()
+        detail = "\n\n".join(part for part in (status, events) if part)
+        raise RuntimeError(
+            f"pod {pod_name} in {namespace} not Ready after {timeout}s"
+            + (f":\n{detail}" if detail else "")
+        ) from exc
 
 
 def wait_for_pod_succeeded(

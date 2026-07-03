@@ -142,6 +142,19 @@ def test_boolean_flag(tmp_path):
     assert out["maven"] is False
 
 
+def test_boolean_flag_rejects_quoted_string(tmp_path):
+    # bool("false") is True — a quoted string must error, not invert intent.
+    _write(tmp_path / config.CONFIG_FILENAME, 'debug: "false"\n')
+    with pytest.raises(config.ConfigError, match="expects a boolean"):
+        _load(tmp_path, tmp_path)
+
+
+def test_const_option_rejects_quoted_string(tmp_path):
+    _write(tmp_path / config.CONFIG_FILENAME, 'anthropic: "false"\n')
+    with pytest.raises(config.ConfigError, match="expects a boolean"):
+        _load(tmp_path, tmp_path)
+
+
 # --------------------------------------------------------------------------- #
 # store_const (auth mode)
 # --------------------------------------------------------------------------- #

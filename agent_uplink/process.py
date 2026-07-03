@@ -38,8 +38,10 @@ def run(
         stderr=stderr,
         check=False,
     )
-    out = res.stdout.decode("utf8") if res.stdout is not None else ""
-    err = res.stderr.decode("utf8") if res.stderr is not None else ""
+    # errors="replace": tool output is only logged/parsed leniently here, and a
+    # stray non-UTF-8 byte must not turn into a UnicodeDecodeError mid-run.
+    out = res.stdout.decode("utf-8", errors="replace") if res.stdout is not None else ""
+    err = res.stderr.decode("utf-8", errors="replace") if res.stderr is not None else ""
     return CommandResult(res.returncode, out, err)
 
 

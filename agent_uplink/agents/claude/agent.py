@@ -175,7 +175,7 @@ class ClaudeAgent(Agent):
     def pod_contribution(self, ctx: PodBuildContext) -> PodContribution:
         volumes, mounts = self._volumes_and_mounts(ctx)
         return PodContribution(
-            env=self._container_env(ctx.cwd),
+            env=self._container_env(ctx),
             volumes=volumes,
             mounts=mounts,
             security_context=self._container_security_context(),
@@ -208,6 +208,9 @@ class ClaudeAgent(Agent):
         # via the user's mitm rules. (env-based creds for stdio servers are left
         # intact and do enter the pod — see sanitized_claude_json_bytes.)
         session_claude_json = ctx.session_dir / ".claude.json"
+        # 0600 like the original: redaction only covers MCP Authorization
+        # headers; env values (stdio server secrets) are still in this copy.
+        session_claude_json.touch(mode=0o600)
         session_claude_json.write_bytes(sanitized_claude_json_bytes(HOST_CLAUDE_JSON))
 
         volumes: list[dict] = [
@@ -344,17 +347,17 @@ class ClaudeAgent(Agent):
 
         return volumes, mounts
 
-    def _container_env(self, cwd: Path) -> dict[str, str]:
+    def _container_env(self, ctx: PodBuildContext) -> dict[str, str]:
         # Only relevant with --maven; otherwise no-op.
         if not getattr(self.args, "maven", False):
             return {}
         # The Maven JVM does not read HTTPS_PROXY (unlike dockerd), and the pod
         # can egress only to mitm. Point Maven's HTTP client at mitm explicitly.
-        # Host mitm:8080 mirrors cli.PROXY_PORT.
+        host, port = ctx.proxy_host, ctx.proxy_port
         return {
             "MAVEN_OPTS": (
-                "-Dhttp.proxyHost=mitm -Dhttp.proxyPort=8080 "
-                "-Dhttps.proxyHost=mitm -Dhttps.proxyPort=8080 "
+                f"-Dhttp.proxyHost={host} -Dhttp.proxyPort={port} "
+                f"-Dhttps.proxyHost={host} -Dhttps.proxyPort={port} "
                 "-Dhttp.nonProxyHosts=localhost|127.0.0.1"
             ),
             # Lets ${env.CODEARTIFACT_AUTH_TOKEN} in settings.xml expand cleanly;

@@ -47,7 +47,14 @@ def export_aws_profile_env(profile_name: str) -> dict[str, str]:
     ]
     try:
         creds_raw = run_command(cmd)
-    except Exception:
+    except Exception as exc:
+        # Surface the original failure before the fallback: `aws sso login`
+        # fails for non-SSO problems (e.g. a typo'd profile name) with an error
+        # that would otherwise mask the real cause.
+        LOGGER.info(
+            f"aws export-credentials failed for profile {profile_name!r} "
+            f"({exc}); attempting `aws sso login`"
+        )
         run_command(["aws", "sso", "login", "--profile", profile_name])
         creds_raw = run_command(cmd)
     env: dict[str, str] = {}

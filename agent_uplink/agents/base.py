@@ -23,6 +23,11 @@ class PodBuildContext:
     username: str
     uid: int
     gid: int
+    # The mitm proxy the pod egresses through, for agents whose tooling needs
+    # explicit proxy config (the generic HTTP(S)_PROXY env is set by the
+    # orchestrator). Single source: cli wires these from its own constants.
+    proxy_host: str
+    proxy_port: int
     aws_creds_secret_name: str | None
     debug_host_dir: Path | None
     debug: bool

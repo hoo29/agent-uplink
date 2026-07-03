@@ -66,6 +66,7 @@ def test_default_rules_empty_when_file_absent(tmp_path):
 def test_default_pod_contribution_is_hardened(tmp_path):
     ctx = PodBuildContext(
         cwd=Path("/home/u/proj"), username="u", uid=1000, gid=1000,
+        proxy_host="mitm", proxy_port=8080,
         aws_creds_secret_name=None, debug_host_dir=None, debug=False,
         session_dir=tmp_path,
     )
