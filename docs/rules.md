@@ -67,6 +67,11 @@ plaintext, so those have no meaning (supplying any is a startup error).
 > the tunnel. The egress perimeter still holds (traffic flows through the mitm pod and the NetworkPolicy is unchanged), but the request content
 > is no longer inspected. Match as narrowly as possible. See `examples/rules/l4-passthrough.yaml`.
 
+Tunnelled connections are relayed without being recorded (`TCPLayer(ignore=True)`). mitm logs one `L4-FORWARD` line per connection with
+the matching rule and target, but the relayed bytes are never buffered or dumped — not even under `--mitm-debug`. That is what keeps a
+tunnelled transfer flat in memory: a recording tunnel retains every relayed byte for the life of the mitm process, so streaming a 1.5GB
+file would cost 1.5GB of pod RAM permanently, and the next transfer would add its own. The bytes are ciphertext, so nothing is lost.
+
 ## Populating the keyring
 
 ```bash

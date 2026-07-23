@@ -447,18 +447,27 @@ def test_l4_ip_not_matched_against_host_regex(tmp_path, monkeypatch):
 def test_next_layer_installs_tcp_layer_on_match(tmp_path, monkeypatch):
     e = _l4_enforcer(tmp_path, monkeypatch)
     sentinel = object()
-    monkeypatch.setattr(addon, "TCPLayer", lambda ctx: sentinel)
+    seen = {}
+
+    def fake_tcp_layer(ctx, **kwargs):
+        seen.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(addon, "TCPLayer", fake_tcp_layer)
     nl = SimpleNamespace(
         layer=None,
         context=SimpleNamespace(server=SimpleNamespace(address=("192.168.149.50", 6443))),
     )
     e.next_layer(cast(Any, nl))
     assert nl.layer is sentinel
+    # Recording the tunnel would retain every relayed byte in flow.messages for
+    # the life of the process, and the bytes are ciphertext regardless.
+    assert seen == {"ignore": True}
 
 
 def test_next_layer_no_op_on_miss(tmp_path, monkeypatch):
     e = _l4_enforcer(tmp_path, monkeypatch)
-    monkeypatch.setattr(addon, "TCPLayer", lambda ctx: object())
+    monkeypatch.setattr(addon, "TCPLayer", lambda ctx, **kw: object())
     nl = SimpleNamespace(
         layer=None,
         context=SimpleNamespace(server=SimpleNamespace(address=("8.8.8.8", 443))),
@@ -469,7 +478,7 @@ def test_next_layer_no_op_on_miss(tmp_path, monkeypatch):
 
 def test_next_layer_respects_prior_decision(tmp_path, monkeypatch):
     e = _l4_enforcer(tmp_path, monkeypatch)
-    monkeypatch.setattr(addon, "TCPLayer", lambda ctx: object())
+    monkeypatch.setattr(addon, "TCPLayer", lambda ctx, **kw: object())
     existing = object()
     nl = SimpleNamespace(
         layer=existing,

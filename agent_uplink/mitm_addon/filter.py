@@ -369,6 +369,15 @@ class RuleEnforcer:
         relays bytes without decrypting, so the agent's TLS (incl. any client
         cert / mTLS) goes end-to-end to the upstream. Such connections bypass the
         allow-list and header injection entirely.
+
+        `ignore=True` relays without constructing a TCPFlow. A recording
+        TCPLayer appends every relayed chunk to `flow.messages` and mitmproxy
+        holds that flow for the rest of the process, so a tunnelled transfer
+        costs its full size in RAM permanently — 1.5GB streamed pins 1.5GB, and
+        the next transfer adds its own. The recorded bytes are TLS ciphertext
+        here in any case, so there is nothing to inspect. It also skips a
+        per-chunk hook dispatch (~24k round trips per GB), which is most of the
+        relay's CPU cost.
         """
         if nextlayer.layer is not None:
             return  # another layer already decided
@@ -382,7 +391,7 @@ class RuleEnforcer:
                 f"agent-uplink L4-FORWARD [{matched}] {target_host}:{address[1]} "
                 "(raw TCP tunnel, TLS end-to-end, allow-list bypassed)"
             )
-            nextlayer.layer = TCPLayer(nextlayer.context)
+            nextlayer.layer = TCPLayer(nextlayer.context, ignore=True)
 
     def _match_rule(self, req: http.Request):
         """Return (name, inject_headers) for the first allow rule that matches,
