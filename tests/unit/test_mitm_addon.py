@@ -397,6 +397,108 @@ def test_git_example_does_not_blanket_allow_post(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# body streaming
+# --------------------------------------------------------------------------- #
+
+def _stream_enforcer(tmp_path, monkeypatch):
+    rules = {"rules": [{"name": "echo", "hosts": ["echo"]}]}
+    return _enforcer(tmp_path, monkeypatch, rules)
+
+
+@pytest.mark.parametrize(
+    "content_length, streams",
+    [
+        (None, True),  # chunked: size unknown, so never buffer it
+        ("0", False),  # empty body: nothing to hold, nothing to stream
+        (str(addon._STREAM_THRESHOLD), False),
+        (str(addon._STREAM_THRESHOLD + 1), True),
+        ("not-a-number", True),
+        (str(4 * 1024 * 1024 * 1024), True),
+    ],
+)
+def test_request_streaming_decided_by_declared_size(
+    tmp_path, monkeypatch, content_length, streams
+):
+    e = _stream_enforcer(tmp_path, monkeypatch)
+    headers = {} if content_length is None else {"Content-Length": content_length}
+    r = req("echo", "POST", "/", headers=headers)
+    e.requestheaders(cast(Any, flow_for(r)))
+    assert r.stream is streams
+
+
+def test_response_streaming_decided_by_declared_size(tmp_path, monkeypatch):
+    e = _stream_enforcer(tmp_path, monkeypatch)
+    big = req("echo", headers={"Content-Length": str(addon._STREAM_THRESHOLD + 1)})
+    small = req("echo", headers={"Content-Length": "10"})
+    for resp, expected in ((big, True), (small, False)):
+        flow = SimpleNamespace(request=req("echo"), response=resp, metadata={})
+        e.responseheaders(cast(Any, flow))
+        assert resp.stream is expected
+
+
+def test_responseheaders_tolerates_missing_response(tmp_path, monkeypatch):
+    e = _stream_enforcer(tmp_path, monkeypatch)
+    e.responseheaders(cast(Any, flow_for(req("echo"))))
+
+
+def test_denied_request_is_not_marked_for_streaming(tmp_path, monkeypatch):
+    e = _stream_enforcer(tmp_path, monkeypatch)
+    r = req("blocked", "POST", "/", headers={"Content-Length": "999999999"})
+    flow = flow_for(r)
+    e.requestheaders(cast(Any, flow))
+    assert flow.response.status_code == 403
+    assert r.stream is None
+
+
+def test_aws_body_over_stream_threshold_still_buffers_to_sign(tmp_path, monkeypatch):
+    # The whole point of the per-flow decision: an AWS body large enough that
+    # mitmproxy's own stream_large_bodies would have streamed it (sending the
+    # request on unsigned) must still be buffered so `request` can hash it.
+    _freeze_time(monkeypatch)
+    e = _sigv4_enforcer(tmp_path, monkeypatch, r"ssm\.eu-west-2\.amazonaws\.com")
+    size = addon._STREAM_THRESHOLD * 4
+    r = req("ssm.eu-west-2.amazonaws.com", "POST", "/", raw_content=b"x" * size,
+            headers={"Authorization": _aws_dummy_auth(),
+                     "Content-Length": str(size)})
+    flow = flow_for(r)
+    e.requestheaders(cast(Any, flow))
+    assert flow.response is None
+    assert r.stream is False
+    assert flow.metadata["aws_sign"]["service"] == "ssm"
+
+
+def test_large_aws_body_is_buffered_and_logged(tmp_path, monkeypatch, caplog):
+    # Buffering a large body is the only way to sign it, but it should not be
+    # silent — an unexplained spike in the mitm pod's memory is hard to diagnose.
+    _freeze_time(monkeypatch)
+    e = _sigv4_enforcer(tmp_path, monkeypatch, r"ssm\.eu-west-2\.amazonaws\.com")
+    size = addon._LARGE_SIGNABLE_BODY + 1
+    r = req("ssm.eu-west-2.amazonaws.com", "POST", "/",
+            headers={"Authorization": _aws_dummy_auth(),
+                     "Content-Length": str(size)})
+    flow = flow_for(r)
+    with caplog.at_level("WARNING"):
+        e.requestheaders(cast(Any, flow))
+    assert flow.response is None
+    assert r.stream is False
+    assert f"buffering {size}B" in caplog.text
+
+
+def test_s3_body_of_any_size_still_streams(tmp_path, monkeypatch):
+    # S3 signs with UNSIGNED-PAYLOAD at headers time, so object size is no limit.
+    _freeze_time(monkeypatch)
+    e = _sigv4_enforcer(tmp_path, monkeypatch, r"s3\.us-east-1\.amazonaws\.com")
+    r = req("s3.us-east-1.amazonaws.com", "PUT", "/bucket/key",
+            headers={"Authorization": _aws_dummy_auth(),
+                     "Content-Length": str(4 * 1024 * 1024 * 1024)})
+    flow = flow_for(r)
+    e.requestheaders(cast(Any, flow))
+    assert flow.response is None
+    assert r.stream is True
+    assert r.headers["X-Amz-Content-Sha256"] == "UNSIGNED-PAYLOAD"
+
+
+# --------------------------------------------------------------------------- #
 # l4_forward raw TCP passthrough
 # --------------------------------------------------------------------------- #
 

@@ -6,6 +6,15 @@ The allow-list is checked **first**, on the original AWS host. Only if a rule pe
 
 S3 is signed with `x-amz-content-sha256: UNSIGNED-PAYLOAD` at headers time so large objects keep streaming; every other service buffers the body and signs the real SHA256 payload hash (AWS API bodies are small). The SigV4 implementation is stdlib-only (the addon ships as a ConfigMap into the stock mitmproxy image, so it can't use botocore).
 
+That buffering is why the addon, not mitmproxy, decides which bodies stream. mitmproxy's `stream_large_bodies` option
+reruns its check as body bytes arrive — after `requestheaders` has returned — and switches a flow to streaming once the
+buffered body passes the limit. On a non-S3 AWS request that silently undid the buffering signing depends on: the dummy
+signature had already been stripped, the stripped headers went upstream the moment streaming began, and the re-signing
+in the `request` hook landed after they were on the wire, so anything over the limit reached AWS with no `Authorization`
+header at all while the log claimed success. The option is therefore left unset and `_apply_streaming` makes the call
+per flow, before the headers are flushed: bodies over 1MB or of unknown length stream, everything else buffers, and a
+flow awaiting SigV4 always buffers. A signable body over 8MB is logged, since it is held in the pod whole.
+
 So an AWS host is reachable **only if an allow rule matches it** (e.g. a rule with `hosts: ['s3\.eu-west-2\.amazonaws\.com']`); the mere presence of an AWS signature grants nothing. A request to `*.amazonaws.com` that no rule allows returns `403`. A matched AWS host signed with an unknown AKIA is forwarded unchanged (and fails at AWS with the dummy signature); a non-`AWS4-HMAC-SHA256` request to a matched host is handled normally (e.g. anonymous `GET`).
 
 **Security note:** re-signing uses the real profile credentials and is not scoped to a single service, so any *allowed* AWS request runs with that profile's full IAM permissions. Scope both the profile you pass and the host rules you write — don't pass broad admin profiles.
