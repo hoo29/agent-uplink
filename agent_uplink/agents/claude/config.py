@@ -15,6 +15,11 @@ LOGGER = logging.getLogger("agent-uplink")
 
 HOST_CLAUDE_DIR = Path.home() / ".claude"
 HOST_CLAUDE_JSON = Path.home() / ".claude.json"
+# Enterprise managed settings. Optional — most hosts have no such file. Claude
+# reads it from this same path inside the container, where it outranks the user
+# settings.json, so the pod's copy is mounted at the identical location and the
+# merge behaves exactly as it does on the host.
+HOST_MANAGED_SETTINGS = Path("/etc/claude-code/managed-settings.json")
 
 # An MCP server's `Authorization` header in ~/.claude.json is replaced with this
 # before the file is mounted, so its bearer token never enters the pod. Claude
@@ -35,6 +40,16 @@ def load_claude_config() -> dict:
             "settings before starting agent-uplink"
         )
     return json.loads(path.read_text(encoding="utf8"))
+
+
+def load_managed_settings() -> dict | None:
+    """The host's /etc/claude-code/managed-settings.json, or None when absent.
+
+    Unlike the user settings.json this file is optional — a host with no
+    enterprise policy simply has none, which is not an error."""
+    if not HOST_MANAGED_SETTINGS.is_file():
+        return None
+    return json.loads(HOST_MANAGED_SETTINGS.read_text(encoding="utf8"))
 
 
 def refresh_anthropic_oauth_if_expiring(threshold_seconds: int = 300) -> None:
@@ -174,6 +189,31 @@ def claude_settings_bytes(claude_config: dict, auth_env: dict[str, str]) -> byte
     in bedrock mode, CLAUDE_CODE_ENABLE_AUTO_MODE) is merged into env and wins."""
     settings = dict(claude_config)
     settings.pop("sandbox", None)
+    if auth_env:
+        settings["env"] = {**(settings.get("env") or {}), **auth_env}
+    settings["permissions"] = {
+        "defaultMode": "auto",
+        "skipDangerousModePermissionPrompt": True,
+    }
+    settings["skipDangerousModePermissionPrompt"] = True
+    return json.dumps(settings, indent=2).encode("utf-8")
+
+
+def managed_settings_bytes(managed: dict, auth_env: dict[str, str]) -> bytes:
+    """Build the in-pod managed-settings.json from the host's copy.
+
+    Same treatment as the user settings.json: the top-level `sandbox` key is
+    dropped (the pod is the sandbox), `permissions` is replaced with the
+    sandbox's own `defaultMode: auto` policy, and `auth_env` is merged into env
+    and wins. Managed settings outrank the user settings in Claude's merge, so
+    if the host policy's `permissions` were left intact it would override the
+    `auto` mode set on the user settings.json and the agent would prompt inside
+    the pod; and a real credential in the host policy's `env` would likewise
+    outrank the placeholder there and reach the agent container. Any MCP
+    `Authorization` header is redacted, as in sanitized_claude_json_bytes."""
+    settings = dict(managed)
+    settings.pop("sandbox", None)
+    _redact_mcp_servers(settings.get("mcpServers"))
     if auth_env:
         settings["env"] = {**(settings.get("env") or {}), **auth_env}
     settings["permissions"] = {

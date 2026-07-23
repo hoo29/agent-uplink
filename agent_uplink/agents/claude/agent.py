@@ -13,11 +13,14 @@ from ..base import Agent, PodBuildContext, PodContribution, PreparedAgent
 from .config import (
     HOST_CLAUDE_DIR,
     HOST_CLAUDE_JSON,
+    HOST_MANAGED_SETTINGS,
     claude_md_bytes,
     claude_settings_bytes,
     fake_oauth_credentials_bytes,
     get_bedrock_aws_profile_name,
     load_claude_config,
+    load_managed_settings,
+    managed_settings_bytes,
     read_anthropic_oauth_credentials,
     refresh_anthropic_oauth_if_expiring,
     sanitized_claude_json_bytes,
@@ -43,6 +46,11 @@ _AUTH_MODE_ENV: dict[str, dict[str, str]] = {
 _SETTINGS_SECRET = "claude-settings"
 _FAKE_CREDS_SECRET = "claude-fake-creds"
 _CLAUDE_MD_SECRET = "claude-md"
+_MANAGED_SETTINGS_SECRET = "claude-managed-settings"
+# Where the pod's managed settings mount. Fixed, and identical to the host path
+# HOST_MANAGED_SETTINGS reads from: Claude looks the file up here, and mounting
+# it anywhere else would leave its precedence over the user settings unapplied.
+_MANAGED_SETTINGS_PATH = "/etc/claude-code/managed-settings.json"
 
 
 class ClaudeAgent(Agent):
@@ -166,6 +174,16 @@ class ClaudeAgent(Agent):
         settings = claude_settings_bytes(self._config(), auth_env)
         secret_payloads[_SETTINGS_SECRET] = {"settings.json": settings}
 
+        # Enterprise managed settings, when the host has them. Shipped via
+        # Secret like the user settings (the host file is left untouched) and
+        # mounted at the path Claude reads them from, so its own precedence
+        # rules apply unchanged. See _volumes_and_mounts.
+        managed = load_managed_settings()
+        if managed is not None:
+            secret_payloads[_MANAGED_SETTINGS_SECRET] = {
+                "managed-settings.json": managed_settings_bytes(managed, auth_env)
+            }
+
         # CLAUDE.md = host's copy + appended sandbox guidance, shipped via Secret
         # so the host file is left untouched (see _volumes_and_mounts).
         secret_payloads[_CLAUDE_MD_SECRET] = {"CLAUDE.md": claude_md_bytes()}
@@ -258,6 +276,21 @@ class ClaudeAgent(Agent):
                     "name": "aws-creds",
                     "mountPath": f"{container_home}/.aws/credentials",
                     "subPath": "credentials",
+                    "readOnly": True,
+                }
+            )
+
+        # Managed settings only exist when the host has an enterprise policy;
+        # prepare() ships the Secret under the same condition.
+        if HOST_MANAGED_SETTINGS.is_file():
+            volumes.append(
+                secret_volume("managed-settings", _MANAGED_SETTINGS_SECRET)
+            )
+            mounts.append(
+                {
+                    "name": "managed-settings",
+                    "mountPath": _MANAGED_SETTINGS_PATH,
+                    "subPath": "managed-settings.json",
                     "readOnly": True,
                 }
             )
