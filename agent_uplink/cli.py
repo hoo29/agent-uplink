@@ -517,12 +517,11 @@ def _mitm_manifests(
         f"--listen-port={PROXY_PORT}",
         "--set",
         f"confdir={confdir}",
-        # Stream bodies over 1MB instead of buffering them whole in memory.
-        # Large git packs (clone/fetch over HTTPS) would otherwise hold the
-        # entire response in RAM and OOM the pod. The addon only inspects and
-        # injects headers, so streaming bodies is safe.
-        "--set",
-        "stream_large_bodies=1m",
+        # NOTE: `stream_large_bodies` is deliberately NOT set. The addon decides
+        # streaming per flow in its requestheaders/responseheaders hooks (see
+        # `_apply_streaming`), because mitmproxy's own switch reruns after those
+        # hooks and would override the buffering AWS re-signing depends on,
+        # sending the request upstream unsigned. Large bodies still stream.
         "-s",
         "/addon/filter.py",
         "--set",

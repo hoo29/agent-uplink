@@ -51,6 +51,18 @@ _SIGV4_HEADERS_TO_STRIP = (
 
 _UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD"
 
+# Bodies at or below this are buffered; anything larger (or of unknown length)
+# is relayed chunk by chunk. Streaming is decided here, per flow, rather than
+# with mitmproxy's `stream_large_bodies` option — see `_apply_streaming`.
+_STREAM_THRESHOLD = 1024 * 1024
+
+# A signable body this size is logged: SigV4 outside S3 covers the payload hash,
+# so the whole body is held in the pod to compute it, and that is worth being
+# able to explain. AWS's own per-request limits bound it (~50MB for the largest,
+# a direct Lambda code upload); S3, the service with no such ceiling, signs with
+# an unsigned payload and streams instead.
+_LARGE_SIGNABLE_BODY = 8 * 1024 * 1024
+
 # Headers never included in the signature, lower-cased. Mirrors the AWS SDK
 # signers that aws-sigv4-proxy delegates to: the SDK owns `authorization`, while
 # `user-agent` / `x-amzn-trace-id` are added or rewritten by hops so AWS excludes
@@ -284,6 +296,38 @@ class CompiledL4Rule(NamedTuple):
     name: str
 
 
+def _declared_body_size(msg) -> int | None:
+    """The body size from `Content-Length`, or None when it is absent or
+    unparseable (chunked transfers, which have no declared size)."""
+    raw = msg.headers.get("Content-Length")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _apply_streaming(flow: http.HTTPFlow, msg) -> None:
+    """Decide, before the headers are flushed, whether this body streams.
+
+    mitmproxy's own `stream_large_bodies` option cannot be used here. It reruns
+    its check as body bytes accumulate — after this hook has returned — and
+    flips a flow to streaming the moment the buffered body passes the limit
+    (`proxy/layers/http/__init__.py`, `check_body_size`). That silently undid the
+    non-streaming choice AWS signing depends on: the dummy signature had already
+    been stripped, the stripped headers went upstream the instant streaming
+    began, and the re-signing in the `request` hook landed after they were on the
+    wire — so a non-S3 AWS request with a body over the limit reached AWS with no
+    Authorization header at all, while the log claimed it was signed.
+
+    Deciding per flow here keeps that override switched off (the option is left
+    unset, so `check_body_size` returns immediately) and makes the choice final.
+    """
+    size = _declared_body_size(msg)
+    msg.stream = size is None or size > _STREAM_THRESHOLD
+
+
 class RuleEnforcer:
     def __init__(self) -> None:
         self._compiled: list[CompiledRule] = []
@@ -437,8 +481,16 @@ class RuleEnforcer:
             )
             return
 
-        # Force the body to buffer so the request hook can hash it; this also
-        # keeps mitmproxy from flushing headers upstream before we re-sign.
+        declared = _declared_body_size(req)
+        if declared is not None and declared > _LARGE_SIGNABLE_BODY:
+            logger.warning(
+                f"agent-uplink sigv4 buffering {declared}B to sign {req.method} "
+                f"{req.host}{req.path} ({service}) — the payload hash is signed, "
+                "so the body cannot stream"
+            )
+
+        # Buffer the body so the request hook can hash it, and keep the headers
+        # pending until then so the real signature goes out with them.
         flow.request.stream = False
         flow.metadata["aws_sign"] = {
             "akia": akia,
@@ -448,12 +500,11 @@ class RuleEnforcer:
         }
 
     def requestheaders(self, flow: http.HTTPFlow) -> None:
-        # Enforce + inject at headers time, not in the `request` hook. With
-        # `stream_large_bodies` set, mitmproxy flushes the request headers
-        # upstream as soon as they arrive and streams the body behind them, so
-        # the `request` hook is too late to overwrite headers on a streamed flow.
-        # AWS signing that needs the body forces the flow non-streaming first
-        # (see _begin_sigv4), which keeps the headers pending until `request`.
+        # Enforce + inject at headers time, not in the `request` hook. A streamed
+        # request has its headers flushed upstream as soon as they arrive, with
+        # the body behind them, so the `request` hook is too late to change a
+        # header. AWS signing that needs the body keeps the flow non-streaming
+        # (see _begin_sigv4), which holds the headers back until `request`.
         req = flow.request
         matched = self._match_rule(req)
         if matched is None:
@@ -464,6 +515,7 @@ class RuleEnforcer:
                 {"Content-Type": "text/plain"},
             )
             return
+        _apply_streaming(flow, req)
         name, inject_headers = matched
         # A matched AWS request signed with a known dummy AKIA is re-signed with
         # real credentials. inject.headers and re-signing are mutually exclusive
@@ -485,6 +537,13 @@ class RuleEnforcer:
         for k, v in inject_headers.items():
             req.headers[k] = v
         logger.info(f"agent-uplink ALLOW [{name}] {req.method} {req.host}{req.path}")
+
+    def responseheaders(self, flow: http.HTTPFlow) -> None:
+        # Nothing in this addon inspects response bodies, so a large download (a
+        # git pack, an image layer, an S3 object) is relayed chunk by chunk
+        # instead of being held in the pod.
+        if flow.response is not None:
+            _apply_streaming(flow, flow.response)
 
     def request(self, flow: http.HTTPFlow) -> None:
         # Second hook, reached only for AWS flows _begin_sigv4 deferred: the body
