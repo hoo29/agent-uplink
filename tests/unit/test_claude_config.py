@@ -103,3 +103,78 @@ def test_settings_injects_bedrock_placeholder_over_non_secret_env():
     assert out["env"]["CLAUDE_CODE_ENABLE_AUTO_MODE"] == "1"
     # Non-secret config still passes through.
     assert out["env"]["AWS_REGION"] == "us-east-1"
+
+
+# --------------------------------------------------------------------------- #
+# managed settings (/etc/claude-code/managed-settings.json)
+# --------------------------------------------------------------------------- #
+
+
+def _host_managed():
+    return {
+        "sandbox": {"enabled": True},
+        "permissions": {"defaultMode": "plan", "deny": ["Bash(curl:*)"]},
+        "model": "opus",
+        "env": {"CORP_PROXY": "http://proxy.corp:3128"},
+    }
+
+
+def test_load_managed_settings_absent_is_none(tmp_path, monkeypatch):
+    # No enterprise policy on the host is the common case, not an error — unlike
+    # the user settings.json, whose absence raises.
+    monkeypatch.setattr(
+        config, "HOST_MANAGED_SETTINGS", tmp_path / "managed-settings.json"
+    )
+    assert config.load_managed_settings() is None
+
+
+def test_load_managed_settings_reads_host_file(tmp_path, monkeypatch):
+    path = tmp_path / "managed-settings.json"
+    path.write_text(json.dumps(_host_managed()), encoding="utf8")
+    monkeypatch.setattr(config, "HOST_MANAGED_SETTINGS", path)
+    assert config.load_managed_settings() == _host_managed()
+
+
+def test_managed_settings_drops_sandbox_and_forces_auto_mode():
+    out = json.loads(config.managed_settings_bytes(_host_managed(), {}))
+    assert "sandbox" not in out
+    # permissions is replaced exactly as for the user settings.json — managed
+    # settings outrank it in Claude's merge, so leaving the host's `plan` mode
+    # would override the sandbox's `auto` and make the agent prompt in the pod.
+    assert out["permissions"] == {
+        "defaultMode": "auto",
+        "skipDangerousModePermissionPrompt": True,
+    }
+    assert out["skipDangerousModePermissionPrompt"] is True
+    # Non-permissions policy still passes through.
+    assert out["model"] == "opus"
+
+
+def test_managed_settings_auth_env_outranks_the_host_value():
+    # Managed settings beat user settings in Claude's merge, so a real
+    # credential in the host policy would otherwise reach the agent container
+    # and defeat the placeholder shipped in settings.json.
+    managed = {**_host_managed(), "env": {"AWS_BEARER_TOKEN_BEDROCK": "REAL-SECRET"}}
+    out = json.loads(
+        config.managed_settings_bytes(managed, _AUTH_MODE_ENV["bedrock"])
+    )
+    assert out["env"]["AWS_BEARER_TOKEN_BEDROCK"] == "placeholder"
+    assert "REAL-SECRET" not in json.dumps(out)
+
+
+def test_managed_settings_passes_through_non_secret_env():
+    out = json.loads(
+        config.managed_settings_bytes(_host_managed(), _AUTH_MODE_ENV["bedrock"])
+    )
+    assert out["env"]["CORP_PROXY"] == "http://proxy.corp:3128"
+    assert out["env"]["CLAUDE_CODE_ENABLE_AUTO_MODE"] == "1"
+
+
+def test_managed_settings_redacts_mcp_authorization():
+    managed = {
+        "mcpServers": {
+            "corp": {"url": "https://mcp.corp", "headers": {"Authorization": "Bearer S"}}
+        }
+    }
+    out = json.loads(config.managed_settings_bytes(managed, {}))
+    assert out["mcpServers"]["corp"]["headers"]["Authorization"] == "PLACEHOLDER"

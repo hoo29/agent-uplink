@@ -22,6 +22,9 @@ SAFE_SECRET_NAMES = {
     "claude-fake-creds",
     "claude-md",
     "agent-aws-creds",
+    # Host's enterprise policy, sanitized (sandbox key dropped, MCP auth
+    # redacted, auth placeholders merged) — see managed_settings_bytes.
+    "claude-managed-settings",
     # git overlay: host identity + SSH->HTTPS rewrites, no secrets — see git.py.
     "git-config",
 }
@@ -36,13 +39,19 @@ def _agent(auth_mode, claude_args=None, maven=False):
 
 def _build_pod(
     tmp_path, monkeypatch, auth_mode, *, aws_secret: str | None = "agent-aws-creds",
-    git_config_secret=None, maven=False,
+    git_config_secret=None, maven=False, managed_settings: dict | None = None,
 ):
     # Point the agent's host-probing at a tmp dir so pod_contribution is hermetic
     # (it mkdir's a per-project dir, reads ~/.claude.json, and conditionally mounts
-    # ~/.claude/*; --maven adds the ~/.m2 mounts).
+    # ~/.claude/*; --maven adds the ~/.m2 mounts). /etc/claude-code is probed the
+    # same way, so it is redirected too — a developer machine that happens to
+    # carry an enterprise policy must not change what these tests assert.
     monkeypatch.setattr(claude_agent_mod, "HOST_CLAUDE_DIR", tmp_path / ".claude")
     monkeypatch.setattr(claude_agent_mod, "HOST_CLAUDE_JSON", tmp_path / ".claude.json")
+    managed_path = tmp_path / "managed-settings.json"
+    if managed_settings is not None:
+        managed_path.write_text(json.dumps(managed_settings), encoding="utf8")
+    monkeypatch.setattr(claude_agent_mod, "HOST_MANAGED_SETTINGS", managed_path)
     session_dir = tmp_path / "session"
     session_dir.mkdir()
     ctx = PodBuildContext(
@@ -113,6 +122,31 @@ def test_git_config_overlay_mounts_at_include_path(tmp_path, monkeypatch):
 def _mount(pod, name):
     container = pod["spec"]["containers"][0]
     return next((m for m in container["volumeMounts"] if m["name"] == name), None)
+
+
+# --------------------------------------------------------------------------- #
+# managed settings (/etc/claude-code/managed-settings.json)
+# --------------------------------------------------------------------------- #
+
+
+def test_managed_settings_not_mounted_without_host_policy(tmp_path, monkeypatch):
+    pod = _build_pod(tmp_path, monkeypatch, "anthropic")
+    assert _mount(pod, "managed-settings") is None
+    assert "claude-managed-settings" not in _secret_names(pod)
+
+
+def test_managed_settings_mount_at_the_path_claude_reads(tmp_path, monkeypatch):
+    # Mounting anywhere else would leave the file's precedence over the user
+    # settings.json unapplied, which is the whole point of shipping it.
+    pod = _build_pod(
+        tmp_path, monkeypatch, "anthropic", managed_settings={"model": "opus"}
+    )
+    assert "claude-managed-settings" in _secret_names(pod)
+    mount = _mount(pod, "managed-settings")
+    assert mount is not None
+    assert mount["mountPath"] == "/etc/claude-code/managed-settings.json"
+    assert mount["subPath"] == "managed-settings.json"
+    assert mount["readOnly"] is True
 
 
 def _claude_invocation(agent):
