@@ -75,14 +75,11 @@ AGENT_CONTAINER_NAME = "main"
 
 ADDON_PATH = Path(__file__).resolve().parent / "mitm_addon" / "filter.py"
 
-# Link-local ranges denied to the mitm pod at L3. mitm forwards on the agent's
-# behalf with unrestricted egress otherwise, and the default GET rule allows any
-# host — so without this an agent could reach the node's cloud-metadata service
-# (169.254.169.254, all clouds) through the proxy and steal the instance's IAM
-# role credentials. Blocking at the NetworkPolicy layer also defeats a hostname
-# that resolves to a metadata IP (DNS rebinding), which the addon can't see.
-# Private ranges are deliberately not blocked — a private kube API server is a
-# supported destination.
+# Link-local ranges denied to the mitm pod at L3, blocking the agent from
+# reaching the node's cloud-metadata service (169.254.169.254) through the proxy
+# to steal IAM credentials. At the NetworkPolicy layer it also defeats a hostname
+# that resolves to a metadata IP (DNS rebinding). Private ranges stay allowed —
+# a private kube API server is a supported destination.
 _MITM_EGRESS_DENY_V4 = "169.254.0.0/16"
 _MITM_EGRESS_DENY_V6 = "fe80::/10"
 
@@ -317,9 +314,8 @@ def _peek_subcommand(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser, agent_parsers = build_parser()
-    # Config applies only to an agent run (not list/clean): fold every
-    # .agent-uplink.yaml from cwd up to ~ into that subparser's defaults so the
-    # subsequent parse treats them as defaults and CLI args still win.
+    # Config applies only to an agent run: fold every .agent-uplink.yaml into the
+    # subparser's defaults so CLI args still win.
     name = _peek_subcommand(argv, agent_parsers)
     if name is not None:
         try:
@@ -404,13 +400,10 @@ class HostMount:
 def validate_mounts(
     username: str, cwd: Path, mount_rw: list[Path], mount_ro: list[Path]
 ) -> list[HostMount]:
-    """Resolve, validate, and de-duplicate --mount-rw / --mount-ro paths.
-
-    Each must exist (file or dir) under /home/<user>/. The same path may not be
-    requested both read-write and read-only. Writable directories must not
-    overlap (be nested within, contain, or equal) the cwd or each other, so a
-    write can't land in two overlapping trees; read-only mounts and files may sit
-    anywhere. Returns the resolved, de-duplicated list (read-write first)."""
+    """Resolve, validate, and de-duplicate --mount-rw / --mount-ro paths. Each
+    must exist under /home/<user>/ and can't be both rw and ro. Writable
+    directories may not overlap the cwd or each other; read-only mounts and files
+    may sit anywhere. Returns the list, read-write first."""
     resolved: list[HostMount] = []
     seen: dict[Path, bool] = {}  # host path -> read_only
 
@@ -449,11 +442,9 @@ def validate_mounts(
 def validate_ssh_args(
     ssh_cidr: list[str], ssh_key_dir: Path | None
 ) -> tuple[list[str], Path | None]:
-    """Validate + normalise the SSH egress options. Returns (cidrs, key_dir).
-
-    CIDRs are normalised to their network address (a bare IP becomes /32) so the
-    ipBlock the NetworkPolicy emits is always canonical. A missing key dir or a
-    malformed CIDR aborts startup before any pod is launched."""
+    """Validate + normalise the SSH egress options, returning (cidrs, key_dir).
+    CIDRs are normalised (a bare IP becomes /32) so the emitted ipBlock is
+    canonical. A missing key dir or malformed CIDR aborts startup."""
     cidrs: list[str] = []
     for raw in ssh_cidr:
         try:
@@ -506,10 +497,8 @@ def _mitm_manifests(
     insecure: bool = False,
 ) -> list[dict]:
     labels = _label("mitm")
-    # uid 1000 = the `mitmproxy` user baked into the upstream image. The certs
-    # Secret is mounted at the confdir path so mitmproxy picks up the existing CA
-    # as its signing CA instead of trying to generate one (which would fail
-    # writing into the read-only root filesystem).
+    # The certs Secret mounts at confdir so mitmproxy uses the existing CA as its
+    # signing CA instead of generating one (which the read-only rootfs blocks).
     confdir = "/mitm-confdir"
 
     mitm_args = [
@@ -517,30 +506,23 @@ def _mitm_manifests(
         f"--listen-port={PROXY_PORT}",
         "--set",
         f"confdir={confdir}",
-        # NOTE: `stream_large_bodies` is deliberately NOT set. The addon decides
-        # streaming per flow in its requestheaders/responseheaders hooks (see
-        # `_apply_streaming`), because mitmproxy's own switch reruns after those
-        # hooks and would override the buffering AWS re-signing depends on,
-        # sending the request upstream unsigned. Large bodies still stream.
+        # `stream_large_bodies` is deliberately unset: the addon decides
+        # streaming per flow (see `_apply_streaming`), because mitmproxy's switch
+        # reruns after the hooks and would override the buffering AWS signing
+        # needs. Large bodies still stream.
         "-s",
         "/addon/filter.py",
         "--set",
         "rules_file=/rules/rules.json",
-        # Proxy over HTTP/1.1, not HTTP/2. mitmproxy's h2 stack mis-parses the
-        # framing some upstreams emit — notably the Go net/http2 kube-apiserver,
-        # which fails with "Invalid input ConnectionInputs.RECV_HEADERS in state
-        # ConnectionState.CLOSED". All upstreams the agent talks to support
-        # HTTP/1.1, and the addon only inspects/injects headers, so dropping h2
-        # multiplexing costs nothing here. (kubectl exec/port-forward use an
-        # HTTP/1.1 upgrade and are unaffected.)
+        # HTTP/1.1, not HTTP/2: mitmproxy's h2 stack mis-parses the framing some
+        # upstreams emit (notably the Go kube-apiserver). All our upstreams speak
+        # HTTP/1.1 and the addon only touches headers, so this costs nothing.
         "--set",
         "http2=false",
     ]
     if debug:
-        # Verbose flow logging. WARNING: flow_detail=3 dumps headers and bodies,
-        # including re-signed AWS Authorization headers and request payloads, to
-        # the mitm pod's stdout in plaintext. Off by default; opt in with
-        # --mitm-debug only when diagnosing.
+        # WARNING: flow_detail=3 dumps headers and bodies — including re-signed
+        # AWS Authorization headers — to stdout in plaintext.
         mitm_args.extend(
             ["--set", "termlog_verbosity=debug", "--set", "flow_detail=3"]
         )
@@ -559,8 +541,7 @@ def _mitm_manifests(
         emptydir_volume("tmp", "32Mi"),
     ]
 
-    # When AWS profiles are configured, mount the real-credentials map (keyed by
-    # dummy AKIA) so the addon can re-sign requests. It lives only in this pod.
+    # Real-credentials map for re-signing; lives only in this pod.
     if aws_creds_secret:
         volume_mounts.append(
             {"name": "aws-creds", "mountPath": "/aws-creds", "readOnly": True}
@@ -568,22 +549,17 @@ def _mitm_manifests(
         volumes.append(secret_volume("aws-creds", aws_creds_secret))
         mitm_args.extend(["--set", "aws_creds_file=/aws-creds/creds.json"])
 
-    # When k8s contexts are configured, mount the client certs directory (one
-    # <host>.pem per cluster) and the combined upstream CA bundle so mitmproxy
-    # presents the right client cert and trusts each cluster's serving CA.
+    # Per-cluster client certs so mitmproxy presents the right one upstream.
     if kube_client_certs_secret:
         volume_mounts.append(
             {"name": "kube-client-certs", "mountPath": "/kube-client-certs", "readOnly": True}
         )
         volumes.append(secret_volume("kube-client-certs", kube_client_certs_secret))
         mitm_args.extend(["--set", "client_certs=/kube-client-certs"])
-    # mitmproxy's ssl_verify_upstream_trusted_ca *replaces* its default trust
-    # store (certifi) rather than adding to it — pointing it straight at extra
-    # CAs would make every public upstream (pypi.org, etc.) fail TLS
-    # verification. So at startup we concatenate the image's own certifi bundle
-    # (the exact public roots mitmdump would otherwise use) with each extra CA
-    # source (cluster serving CAs, user-supplied trust) into the writable /tmp
-    # and trust that combined file.
+    # ssl_verify_upstream_trusted_ca *replaces* mitmproxy's default trust store
+    # rather than extending it, so pointing it at extra CAs alone would break
+    # every public upstream. Concatenate the image's certifi bundle with each
+    # extra CA into /tmp and trust the combined file.
     command = ["mitmdump"]
     extra_ca_paths: list[str] = []
     if kube_upstream_ca_secret:
@@ -635,23 +611,15 @@ def _ssh_agent_manifests(
     ns: str, image: str, runtime_class: str, *, uid: int, gid: int
 ) -> list[dict]:
     """The SSH key holder: a hardened pod running `ssh-agent` with the private
-    keys (mounted as the `ssh-agent-keys` Secret), its socket bridged to TCP by
-    socat so the agent pod can request signatures without seeing the keys. Reuses
-    the agent image purely for its `ssh-agent`/`ssh-add`/`socat` binaries; the
-    container itself runs unprivileged, non-root, read-only-root like mitm."""
+    keys, its socket bridged to TCP by socat so the agent pod can request
+    signatures without seeing the keys. Hardened like mitm."""
     labels = _label("ssh-agent")
     sock = "/run/ssh-agent/agent.sock"
-    # ssh-agent daemonises onto `sock`; load every key the Secret provides (the
-    # `*` glob skips the Secret's dotfile bookkeeping, and nullglob makes an empty
-    # dir a no-op rather than a literal `/keys/*`), then bridge the socket to TCP
-    # for the agent pod. Keys are piped via `ssh-add -` (stdin) because ssh-add
-    # refuses a key file that is group/world-readable, and the Secret mount is
-    # mode 0644 — reading from stdin skips that permission check while the key
-    # bytes still never leave this pod. A per-key failure is logged and skipped
-    # so one bad key cannot strand the others; the pod fails (and is retried) only
-    # if no key loads at all. `rm -f` clears any socket left by a prior container
-    # start (the tmpfs survives in-place restarts), which would otherwise make
-    # `ssh-agent -a` fail to bind.
+    # Load every key, then bridge the socket to TCP. Keys are piped via `ssh-add
+    # -` (stdin) because ssh-add refuses the group-readable 0644 Secret mount, and
+    # stdin skips that check without the bytes leaving the pod. A per-key failure
+    # is logged and skipped; the pod fails only if no key loads. `rm -f` clears a
+    # socket left by a prior start (tmpfs survives in-place restarts).
     script = (
         "set -e\n"
         "shopt -s nullglob\n"
@@ -684,10 +652,8 @@ def _ssh_agent_manifests(
         ports=[{"containerPort": SSH_AGENT_PORT, "protocol": "TCP"}],
         image_pull_policy="Always",
     )
-    # Ready only once the agent is reachable and holds at least one key; `ssh-add
-    # -l` exits 0 only then. An exec probe is used (not tcpSocket) so the kubelet
-    # check is not blocked by ssh-agent-policy's ingress restriction. This makes a
-    # key-load failure surface as a readiness timeout rather than silently later.
+    # Ready only once the agent holds a key (`ssh-add -l` exits 0). An exec probe,
+    # not tcpSocket, so the ingress restriction doesn't block the kubelet check.
     container["readinessProbe"] = {
         "exec": {"command": ["sh", "-c", f"SSH_AUTH_SOCK={sock} ssh-add -l >/dev/null"]},
         "initialDelaySeconds": 1,
@@ -697,8 +663,7 @@ def _ssh_agent_manifests(
         container=container,
         volumes=[
             secret_volume("keys", "ssh-agent-keys"),
-            # Unix socket on tmpfs: virtio-fs-backed emptyDir is unreliable for
-            # sockets, and the root fs is read-only.
+            # tmpfs: virtio-fs emptyDir is unreliable for sockets, rootfs is ro.
             tmpfs_volume("sock", "8Mi"),
         ],
         runtime_class=runtime_class or None,
@@ -712,11 +677,9 @@ def _ssh_agent_manifests(
 
 
 def _ssh_relay_sidecar(image: str, uid: int, gid: int) -> dict:
-    """Sidecar in the agent pod that presents a local unix socket bridged to the
-    holder's ssh-agent over TCP. Holds no secret (it only relays), so a hardened
-    context is enough even next to the privileged agent container."""
-    # `unlink-early` clears any socket left by a prior container start (the tmpfs
-    # survives in-place restarts), which would otherwise make the bind fail.
+    """Sidecar presenting a local unix socket bridged to the holder's ssh-agent
+    over TCP. Holds no secret, so a hardened context suffices."""
+    # `unlink-early` clears a socket left by a prior start so the bind can't fail.
     script = (
         f"exec socat UNIX-LISTEN:{SSH_AUTH_SOCK_PATH},fork,unlink-early,perm=0666 "
         f"TCP-CONNECT:ssh-agent:{SSH_AGENT_PORT}\n"
@@ -743,17 +706,15 @@ def _ssh_relay_sidecar(image: str, uid: int, gid: int) -> dict:
 
 
 def _agent_env(cwd: Path, username: str) -> dict[str, str]:
-    """Universal env for the agent pod: force every client through mitm. Built
-    from a single proxy address so the upper/lower-case pairs can't drift."""
+    """Universal agent-pod env forcing every client through mitm. Built from a
+    single proxy address so the upper/lower-case pairs can't drift."""
     proxy = f"http://mitm:{PROXY_PORT}"
     no_proxy = "localhost,127.0.0.1,::1,.local"
     env: dict[str, str] = {
         "WORKDIR": str(cwd),
         "USERNAME": username,
-        # mitm injects git auth, so a credential prompt is never useful; fail
-        # fast on unconfigured/denied auth instead of hanging the agent.
+        # mitm injects git auth, so fail fast instead of prompting.
         "GIT_TERMINAL_PROMPT": "0",
-        # dockerd reads the upper-case DOCKER_* forms.
         "DOCKER_HTTP_PROXY": proxy,
         "DOCKER_HTTPS_PROXY": proxy,
         # gcloud SDK uses its own proxy vars.
@@ -769,9 +730,8 @@ def _agent_env(cwd: Path, username: str) -> dict[str, str]:
 
 @dataclass
 class AgentMounts:
-    """Optional, orchestrator-level mounts layered onto the agent pod on top of
-    the agent's own PodContribution. Grouped so the manifest builder takes one
-    argument instead of a tail of nullable secret names."""
+    """Orchestrator-level mounts layered onto the agent pod on top of its own
+    PodContribution, grouped so the builder takes one argument."""
 
     ssh_pub_secret: str | None = None
     ssh_pub_files: list[str] = field(default_factory=list)
@@ -820,9 +780,8 @@ def _agent_pod_manifest(
         mounts.append({"name": "ssh-sock", "mountPath": "/ssh-agent"})
         env["SSH_AUTH_SOCK"] = SSH_AUTH_SOCK_PATH
         extra_containers.append(_ssh_relay_sidecar(full_image, uid, gid))
-    # Sanitized kubeconfig: trusts mitm CA, carries placeholder creds. Mounted
-    # outside the home dir so readOnlyRootFilesystem doesn't block the mount.
-    # kubectl's cache writes (~/.kube/cache) are non-fatal when they fail.
+    # Sanitized kubeconfig (mitm CA, placeholder creds), mounted outside the home
+    # dir so readOnlyRootFilesystem doesn't block it.
     if pod_mounts.kube_config_secret is not None:
         volumes.append(secret_volume("kube-config", pod_mounts.kube_config_secret))
         mounts.append(
@@ -833,10 +792,8 @@ def _agent_pod_manifest(
             }
         )
         env["KUBECONFIG"] = "/etc/agent-uplink/kube/config"
-    # git overlay (host identity + --git-https-rewrite hosts): pulled in by the
-    # include.path in the baked /etc/gitconfig. Mounted read-only at that path;
-    # carries no secrets, so it's safe in the agent pod. The agent's ~/.gitconfig
-    # is untouched and stays writable.
+    # git overlay pulled in by the include.path in the baked /etc/gitconfig;
+    # read-only, no secrets. The agent's ~/.gitconfig stays writable.
     if pod_mounts.git_config_secret is not None:
         volumes.append(secret_volume("git-config", pod_mounts.git_config_secret))
         mounts.append(
@@ -861,10 +818,8 @@ def _agent_pod_manifest(
         env=env,
         volume_mounts=mounts,
         security_context=contribution.security_context,
-        # Reserve modestly so the pod schedules on small nodes; the memory limit
-        # is the real ceiling the in-pod dockerd needs (tmpfs /var/lib/docker
-        # counts against memory). CPU is left uncapped so the agent (and its
-        # dockerd workloads) can burst freely.
+        # Reserve modestly to schedule on small nodes; the memory limit is the
+        # real ceiling (tmpfs /var/lib/docker counts against it). CPU uncapped.
         resources=Resources(
             memory=contribution.memory,
             cpu=None,
@@ -888,8 +843,7 @@ def _network_policies(
     ns: str, ssh_cidrs: list[str] | None = None, *, ssh_relay: bool = False
 ) -> list[dict]:
     """Default-deny + agent-egress + mitm-ingress (+ ssh-agent holder ingress)."""
-    # Agent egress: mitm:8080 and kube-dns by default; optionally TCP 22 to an
-    # explicit CIDR set.
+    # Agent egress: mitm:8080 and kube-dns; optionally TCP 22 to explicit CIDRs.
     agent_egress: list[dict] = [
         {
             "to": [{"podSelector": {"matchLabels": {"app": "mitm"}}}],
@@ -912,9 +866,8 @@ def _network_policies(
             ],
         },
     ]
-    # SSH egress: TCP 22 only, to the given CIDRs only. This bypasses mitm
-    # (SSH is not HTTP — no allow-list, no credential injection), so the ipBlock
-    # set is the sole control; kube-dns above still resolves the target name.
+    # SSH egress: TCP 22 to the given CIDRs only. Bypasses mitm (SSH isn't HTTP),
+    # so the ipBlock set is the sole control.
     if ssh_cidrs:
         agent_egress.append(
             {
@@ -922,10 +875,8 @@ def _network_policies(
                 "ports": [{"protocol": "TCP", "port": 22}],
             }
         )
-    # SSH key holder: the agent reaches the ssh-agent-relay sidecar locally, but
-    # that sidecar egresses to the holder pod for signing. Only signatures cross
-    # this hop; the actual SSH connection still leaves the agent pod via the
-    # --ssh-cidr rule above.
+    # SSH key holder: the relay sidecar egresses to the holder for signing. Only
+    # signatures cross this hop; the SSH connection itself uses --ssh-cidr above.
     if ssh_relay:
         agent_egress.append(
             {
@@ -949,11 +900,8 @@ def _network_policies(
             pod_selector={"matchLabels": {"app": "agent"}},
             egress=agent_egress,
         ),
-        # mitm: accepts ingress from agent on 8080; egress to the whole internet
-        # (incl. the real AWS endpoints it re-signs for) EXCEPT link-local, so the
-        # agent can't pivot through the proxy to the node's cloud-metadata service
-        # (see _MITM_EGRESS_DENY_*). Two ipBlocks (v4 + v6) replace a blanket
-        # allow; a v6-less cluster simply never matches the v6 entry.
+        # mitm: ingress from agent on 8080; egress everywhere EXCEPT link-local,
+        # so the agent can't pivot to cloud-metadata (see _MITM_EGRESS_DENY_*).
         network_policy_manifest(
             "mitm-policy",
             ns,
@@ -970,8 +918,7 @@ def _network_policies(
             ],
         ),
     ]
-    # ssh-agent holder: accepts the signing bridge from the agent only; no egress
-    # (default-deny covers it — the agent does pure crypto, no network).
+    # ssh-agent holder: signing bridge from the agent only; no egress needed.
     if ssh_relay:
         policies.append(
             network_policy_manifest(

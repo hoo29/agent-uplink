@@ -1,12 +1,9 @@
 """AWS profile helpers shared by all agents.
 
-Real AWS credentials live on the host and ride into the mitm pod as a single
-K8s Secret: a JSON map from each profile's dummy AKIA to its real credentials.
-The mitm addon loads that map and re-signs requests with the matching real key.
-The agent container only ever sees deterministic dummy values per profile, so
-the mitm addon can map a signed request back to a real identity by the AKIA in
-its `Authorization` header.
-"""
+Real credentials ride into the mitm pod as a Secret mapping each profile's dummy
+AKIA to its real credentials. The agent container sees only the deterministic
+dummy values, so the addon maps a signed request back to a real identity by the
+AKIA in its `Authorization` header and re-signs."""
 
 import hashlib
 import json
@@ -17,13 +14,12 @@ from .process import run_command
 
 LOGGER = logging.getLogger("agent-uplink")
 
-# 40-char dummy AWS secret. Real secrets are 40 base64-ish chars; SDKs don't
-# validate format. The container signs with these and the signature is discarded
-# by the mitm addon, which re-signs with the real key.
+# 40-char dummy secret the container signs with; the signature is discarded and
+# re-signed by the addon. SDKs don't validate the format.
 _DUMMY_SECRET = "DUMMYsecret0000000000000000000000000000A"
 
-# Profile names are interpolated into INI section headers; restrict them to a
-# safe charset so they can't inject INI sections.
+# Profile names go into INI section headers; restrict the charset so they can't
+# inject sections.
 _PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
@@ -36,11 +32,8 @@ def validate_profile_name(profile_name: str) -> None:
 
 
 def export_aws_profile_env(profile_name: str) -> dict[str, str]:
-    """Return real AWS_* env vars for the given profile (host-side only).
-
-    Falls back to `aws sso login` (which launches a browser) if the initial
-    export fails, then retries.
-    """
+    """Real AWS_* env vars for the profile (host-side only). Falls back to
+    `aws sso login` (browser) on export failure, then retries."""
     cmd = [
         "aws", "configure", "export-credentials",
         "--format", "env-no-export", "--profile", profile_name,
@@ -48,9 +41,8 @@ def export_aws_profile_env(profile_name: str) -> dict[str, str]:
     try:
         creds_raw = run_command(cmd)
     except Exception as exc:
-        # Surface the original failure before the fallback: `aws sso login`
-        # fails for non-SSO problems (e.g. a typo'd profile name) with an error
-        # that would otherwise mask the real cause.
+        # Log the original failure first: for a non-SSO problem (e.g. a typo'd
+        # profile) `aws sso login` fails with an error that masks the real cause.
         LOGGER.info(
             f"aws export-credentials failed for profile {profile_name!r} "
             f"({exc}); attempting `aws sso login`"
@@ -67,11 +59,9 @@ def export_aws_profile_env(profile_name: str) -> dict[str, str]:
 
 
 def real_aws_credentials(env: dict[str, str]) -> dict[str, str]:
-    """Pick the real credential fields out of an exported AWS env dict.
-
-    The session token is included only when present (long-lived IAM-user keys
-    don't have one). Raises if the mandatory key/secret are missing.
-    """
+    """Real credential fields from an exported AWS env dict. Session token
+    included only when present (IAM-user keys have none); raises if key/secret
+    are missing."""
     try:
         creds = {
             "access_key_id": env["AWS_ACCESS_KEY_ID"],
@@ -85,20 +75,14 @@ def real_aws_credentials(env: dict[str, str]) -> dict[str, str]:
 
 
 def sigv4_credentials_json(akia_to_creds: dict[str, dict[str, str]]) -> bytes:
-    """Serialise the dummy-AKIA -> real-credentials map for the mitm pod.
-
-    Wrapped in a K8s Secret and mounted into the mitm pod, where the addon reads
-    it to re-sign requests. Never mounted into the agent pod.
-    """
+    """Serialise the dummy-AKIA -> real-credentials map for the mitm pod (never
+    the agent pod)."""
     return json.dumps(akia_to_creds, indent=2).encode("utf-8")
 
 
 def dummy_akia(profile_name: str) -> str:
-    """Generate a deterministic dummy AKIA-format access key for a profile.
-
-    The mitm addon parses this back out of the request's Authorization header to
-    find the real credentials to re-sign with.
-    """
+    """Deterministic dummy AKIA for a profile; the addon parses it back out of
+    the Authorization header to find the real credentials."""
     suffix = hashlib.sha256(profile_name.encode()).hexdigest()[:16].upper()
     return f"AKIA{suffix}"
 
@@ -106,11 +90,8 @@ def dummy_akia(profile_name: str) -> str:
 def dummy_aws_credentials_ini(
     aws_profile_names: list[str],
 ) -> tuple[bytes, dict[str, str]]:
-    """Build the dummy `~/.aws/credentials` INI for the agent container.
-
-    Returns (ini_bytes, profile_to_akia). When `aws_profile_names` is empty,
-    returns (b"", {}) so the caller can skip creating the Secret entirely.
-    """
+    """Dummy `~/.aws/credentials` INI for the agent container. Returns
+    (ini_bytes, profile_to_akia), or (b"", {}) when no profiles are given."""
     if not aws_profile_names:
         return b"", {}
     profile_to_akia: dict[str, str] = {}

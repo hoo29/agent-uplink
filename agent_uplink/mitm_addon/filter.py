@@ -1,20 +1,16 @@
 """mitmproxy addon: enforce allow-list rules, inject pre-resolved headers, and
 re-sign AWS SigV4 requests with real per-profile credentials.
 
-Receives a JSON rules file mounted into the container. The host process resolves
-any `{{keyring:...}}` placeholders before writing this file, so the addon never
-touches the user's keyring or YAML.
+The rules file is written by the host with all `{{keyring:...}}` placeholders
+already resolved, so the addon never touches the keyring or YAML.
 
-AWS requests arrive signed with deterministic *dummy* credentials (the agent pod
-only ever holds those). After the allow-list authorises the request, the addon
-looks up the real credentials for the dummy AKIA, derives the service and region
-from the host, strips the bogus signature and re-signs in place with the real
-key before forwarding straight to AWS. Real credentials live only in this pod
-(mounted from a Secret), never in the agent pod.
+AWS requests arrive signed with dummy credentials (all the agent pod holds).
+Once allow-listed, the addon maps the dummy AKIA to the real credentials
+(mounted here from a Secret, never in the agent pod), strips the bogus signature
+and re-signs in place before forwarding to AWS.
 
-Stdlib only — the addon ships as a ConfigMap into the stock mitmproxy image, so
-it cannot depend on botocore. SigV4 is implemented from the AWS reference.
-"""
+Stdlib only (ships as a ConfigMap into the stock mitmproxy image, no botocore);
+SigV4 is implemented from the AWS reference."""
 
 import datetime
 import hashlib
@@ -31,9 +27,8 @@ from mitmproxy.addonmanager import Loader
 from mitmproxy.proxy import layer
 from mitmproxy.proxy.layers import TCPLayer
 
-# This addon runs inside the mitmproxy container as its own process, so it logs
-# under the module name (not agent-uplink's host-side "agent-uplink" logger).
-# Messages keep an "agent-uplink" prefix so they're greppable in mitm's output.
+# Runs as its own process in the mitm container; messages keep an "agent-uplink"
+# prefix so they're greppable in mitm's output.
 logger = logging.getLogger(__name__)
 
 # AWS SigV4 Authorization header:
@@ -51,26 +46,19 @@ _SIGV4_HEADERS_TO_STRIP = (
 
 _UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD"
 
-# Bodies at or below this are buffered; anything larger (or of unknown length)
-# is relayed chunk by chunk. Streaming is decided here, per flow, rather than
-# with mitmproxy's `stream_large_bodies` option — see `_apply_streaming`.
+# Bodies over this (or of unknown length) stream; smaller ones buffer. Decided
+# per flow — see `_apply_streaming`.
 _STREAM_THRESHOLD = 1024 * 1024
 
-# A signable body this size is logged: SigV4 outside S3 covers the payload hash,
-# so the whole body is held in the pod to compute it, and that is worth being
-# able to explain. AWS's own per-request limits bound it (~50MB for the largest,
-# a direct Lambda code upload); S3, the service with no such ceiling, signs with
-# an unsigned payload and streams instead.
+# A signable body this size is logged: SigV4 outside S3 signs the payload hash,
+# so the whole body is held in the pod to compute it. AWS request limits bound it
+# (~50MB max, a direct Lambda upload); S3 signs unsigned-payload and streams.
 _LARGE_SIGNABLE_BODY = 8 * 1024 * 1024
 
-# Headers never included in the signature, lower-cased. Mirrors the AWS SDK
-# signers that aws-sigv4-proxy delegates to: the SDK owns `authorization`, while
-# `user-agent` / `x-amzn-trace-id` are added or rewritten by hops so AWS excludes
-# them. The hop-by-hop headers below are added/rewritten by mitmproxy on the way
-# out, so signing them would not match what AWS receives. Everything else on the
-# request IS signed — S3 rejects any `x-amz-*` (or content-*) header that is
-# present but absent from SignedHeaders ("headers present ... which were not
-# signed"), which a fixed minimal signed-header set could not satisfy.
+# Headers excluded from the signature (lower-cased): `authorization` is the
+# output, `user-agent`/`x-amzn-trace-id` and the hop-by-hop headers are
+# added/rewritten in transit so signing them wouldn't match what AWS receives.
+# Everything else IS signed — S3 rejects any present-but-unsigned header.
 _UNSIGNED_HEADERS = frozenset(
     {
         "authorization",
@@ -101,21 +89,13 @@ _AWS_SUFFIX = ".amazonaws.com"
 
 
 def parse_aws_host(host: str) -> tuple[str, str]:
-    """Derive (signing-name, region) from an AWS host.
+    """Derive (signing-name, region) from an AWS host. Pattern-based, handling
+    any region/service without a frozen endpoint table:
 
-    Pattern-based, so it handles any region/service rather than depending on a
-    frozen endpoint table:
-
-      sts.eu-west-2.amazonaws.com     -> ('sts', 'eu-west-2')
-      ssm.eu-west-2.amazonaws.com     -> ('ssm', 'eu-west-2')
-      s3.eu-west-2.amazonaws.com      -> ('s3',  'eu-west-2')
-      bucket.s3.eu-west-2.amazonaws.com -> ('s3', 'eu-west-2')
+      bucket.s3.eu-west-2.amazonaws.com      -> ('s3', 'eu-west-2')
       id.execute-api.us-east-1.amazonaws.com -> ('execute-api', 'us-east-1')
-      sts.amazonaws.com               -> ('sts', 'us-east-1')   # global endpoint
 
-    Region-less (global) endpoints sign as us-east-1, the aws partition's global
-    signing region.
-    """
+    Region-less (global) endpoints sign as us-east-1."""
     base = host[: -len(_AWS_SUFFIX)] if host.endswith(_AWS_SUFFIX) else host
     labels = base.split(".")
     region = None
@@ -127,20 +107,15 @@ def parse_aws_host(host: str) -> tuple[str, str]:
     if region is not None and region_idx is not None and region_idx > 0:
         service = labels[region_idx - 1]
     else:
-        # Global endpoint (no region label) or a degenerate host: the service is
-        # the last label and the request signs as us-east-1.
+        # Global/region-less endpoint: service is the last label, sign us-east-1.
         service = labels[-1]
         region = region or "us-east-1"
     return _SIGNING_NAME_OVERRIDES.get(service, service), region
 
 
 def _canonical_uri(path: str, service: str) -> str:
-    """Canonical URI for the canonical request.
-
-    S3 uses the path exactly as the client encoded it (single-encoded). Every
-    other service re-encodes it (so a wire `%XX` becomes `%25XX`), matching
-    botocore's SigV4 behaviour.
-    """
+    """Canonical URI. S3 uses the client's path as-is (single-encoded); every
+    other service re-encodes it, matching botocore."""
     if not path:
         return "/"
     if service == "s3":
@@ -183,15 +158,9 @@ def _now() -> datetime.datetime:
 
 def _collect_signed_headers(req: http.Request, amz_date: str, payload_hash: str,
                             token: str | None) -> dict[str, str]:
-    """All headers that go into the signature, lower-cased name -> trimmed value.
-
-    Signs every header on the request except the `_UNSIGNED_HEADERS` ignore-list,
-    matching the AWS SDK signers aws-sigv4-proxy delegates to. S3 enforces that
-    any header it receives appears in SignedHeaders, so a fixed minimal set is
-    not enough — `content-type`, `x-amz-*` extensions, `range`, etc. must all be
-    signed. The synthetic host / x-amz-date / x-amz-content-sha256 / security
-    token are set before collection so they're included too.
-    """
+    """Headers going into the signature, lower-cased name -> trimmed value: every
+    request header except `_UNSIGNED_HEADERS`, plus the synthetic host /
+    x-amz-date / x-amz-content-sha256 / security token."""
     signed: dict[str, str] = {}
     for name, value in req.headers.items(multi=True):
         lname = name.lower()
@@ -203,8 +172,7 @@ def _collect_signed_headers(req: http.Request, amz_date: str, payload_hash: str,
             signed[lname] = f"{signed[lname]},{trimmed}"
         else:
             signed[lname] = trimmed
-    # `host` is not a normal header field on the request object; add it explicitly.
-    signed["host"] = req.host
+    signed["host"] = req.host  # not a normal header field on the request object
     signed["x-amz-date"] = amz_date
     signed["x-amz-content-sha256"] = payload_hash
     if token:
@@ -219,11 +187,8 @@ def sigv4_sign(
     region: str,
     payload_hash: str,
 ) -> None:
-    """Sign `req` in place with SigV4, setting X-Amz-Date, X-Amz-Content-Sha256,
-    the session token (when present) and the Authorization header. Every header
-    present on the request (minus the `_UNSIGNED_HEADERS` ignore-list) is signed,
-    so S3 never rejects a present-but-unsigned header.
-    """
+    """Sign `req` in place: sets X-Amz-Date, X-Amz-Content-Sha256, the session
+    token (when present) and Authorization."""
     access_key = creds["access_key_id"]
     secret_key = creds["secret_access_key"]
     token = creds.get("session_token")
@@ -276,8 +241,7 @@ def sigv4_sign(
 
 
 class CompiledRule(NamedTuple):
-    """A rule with its regexes pre-compiled, kept as named fields so the match
-    loop reads by name instead of by tuple index."""
+    """An allow rule with its regexes pre-compiled."""
 
     hosts: list  # list[re.Pattern]; request host matches if ANY fullmatches
     methods: set
@@ -309,21 +273,12 @@ def _declared_body_size(msg) -> int | None:
 
 
 def _apply_streaming(flow: http.HTTPFlow, msg) -> None:
-    """Decide, before the headers are flushed, whether this body streams.
-
-    mitmproxy's own `stream_large_bodies` option cannot be used here. It reruns
-    its check as body bytes accumulate — after this hook has returned — and
-    flips a flow to streaming the moment the buffered body passes the limit
-    (`proxy/layers/http/__init__.py`, `check_body_size`). That silently undid the
-    non-streaming choice AWS signing depends on: the dummy signature had already
-    been stripped, the stripped headers went upstream the instant streaming
-    began, and the re-signing in the `request` hook landed after they were on the
-    wire — so a non-S3 AWS request with a body over the limit reached AWS with no
-    Authorization header at all, while the log claimed it was signed.
-
-    Deciding per flow here keeps that override switched off (the option is left
-    unset, so `check_body_size` returns immediately) and makes the choice final.
-    """
+    """Set `msg.stream` before the headers flush, in place of mitmproxy's
+    `stream_large_bodies`. That option reruns its check as body bytes accumulate,
+    after this hook returns, and can flip a flow to streaming once the buffer
+    passes the limit — which would override the non-streaming choice AWS signing
+    depends on and send the request upstream unsigned. Leaving the option unset
+    makes the choice here final."""
     size = _declared_body_size(msg)
     msg.stream = size is None or size > _STREAM_THRESHOLD
 
@@ -387,11 +342,9 @@ class RuleEnforcer:
             )
 
     def _match_l4(self, target_host: str) -> "str | None":
-        """Return the name of the first l4_forward rule matching the CONNECT
-        target, else None. `target_host` is the literal host the client put in
-        the request (the CONNECT authority) — NOT a DNS-resolved address. A
-        literal IP is matched against `cidrs`; anything else against `hosts`.
-        """
+        """Name of the first l4_forward rule matching the CONNECT target, else
+        None. `target_host` is the literal CONNECT authority, not DNS-resolved: a
+        literal IP matches `cidrs`, anything else `hosts`."""
         literal_ip = None
         try:
             literal_ip = ipaddress.ip_address(target_host)
@@ -406,23 +359,17 @@ class RuleEnforcer:
         return None
 
     def next_layer(self, nextlayer: layer.NextLayer) -> None:
-        """Before any TLS is terminated, decide whether this connection should be
-        tunnelled raw. mitm runs as an explicit HTTP proxy, so the CONNECT target
-        is in context.server.address — the host/IP the client asked for, before
-        DNS resolution. On an l4_forward match we install a raw TCPLayer: mitm
-        relays bytes without decrypting, so the agent's TLS (incl. any client
-        cert / mTLS) goes end-to-end to the upstream. Such connections bypass the
-        allow-list and header injection entirely.
+        """On an l4_forward match, install a raw TCPLayer before TLS is
+        terminated: mitm relays bytes without decrypting, so the agent's TLS
+        (incl. any client cert / mTLS) goes end-to-end and the connection bypasses
+        the allow-list and injection. The CONNECT target is in
+        context.server.address, before DNS resolution.
 
-        `ignore=True` relays without constructing a TCPFlow. A recording
-        TCPLayer appends every relayed chunk to `flow.messages` and mitmproxy
-        holds that flow for the rest of the process, so a tunnelled transfer
-        costs its full size in RAM permanently — 1.5GB streamed pins 1.5GB, and
-        the next transfer adds its own. The recorded bytes are TLS ciphertext
-        here in any case, so there is nothing to inspect. It also skips a
-        per-chunk hook dispatch (~24k round trips per GB), which is most of the
-        relay's CPU cost.
-        """
+        `ignore=True` relays without constructing a TCPFlow. A recording TCPLayer
+        appends every chunk to `flow.messages` and mitmproxy holds that flow for
+        the life of the process, so a tunnelled transfer would pin its full size
+        in RAM permanently. The bytes are ciphertext anyway, and skipping the
+        per-chunk hook dispatch is most of the relay's CPU cost."""
         if nextlayer.layer is not None:
             return  # another layer already decided
         address = nextlayer.context.server.address
@@ -438,10 +385,9 @@ class RuleEnforcer:
             nextlayer.layer = TCPLayer(nextlayer.context, ignore=True)
 
     def _match_rule(self, req: http.Request):
-        """Return (name, inject_headers) for the first allow rule that matches,
-        else None. Matching is host (any of `hosts` fullmatch) + optional method
-        + optional path. First match wins; rules are pre-ordered by layer.
-        """
+        """(name, inject_headers) for the first matching allow rule, else None.
+        Match is host (any `hosts` fullmatch) + optional method + optional path;
+        rules are pre-ordered by layer."""
         for rule in self._compiled:
             if not any(h.fullmatch(req.host) for h in rule.hosts):
                 continue
@@ -464,10 +410,9 @@ class RuleEnforcer:
         return m.group(1) if m.group(1) in self._aws_creds else None
 
     def _begin_sigv4(self, flow: http.HTTPFlow, akia: str, rule_name: str) -> None:
-        """Strip the dummy signature, then either sign now (S3, which can use an
-        unsigned payload so large objects keep streaming) or defer to the request
-        hook (every other service needs the real body hash, so buffer the body).
-        """
+        """Strip the dummy signature, then sign now (S3, via unsigned-payload, so
+        large objects stream) or defer to the request hook (other services need
+        the buffered body's hash)."""
         req = flow.request
         service, region = parse_aws_host(req.host)
         for h in _SIGV4_HEADERS_TO_STRIP:
@@ -489,8 +434,8 @@ class RuleEnforcer:
                 "so the body cannot stream"
             )
 
-        # Buffer the body so the request hook can hash it, and keep the headers
-        # pending until then so the real signature goes out with them.
+        # Buffer the body so `request` can hash it; keeps the headers pending
+        # until then so the real signature goes out with them.
         flow.request.stream = False
         flow.metadata["aws_sign"] = {
             "akia": akia,
@@ -500,11 +445,10 @@ class RuleEnforcer:
         }
 
     def requestheaders(self, flow: http.HTTPFlow) -> None:
-        # Enforce + inject at headers time, not in the `request` hook. A streamed
-        # request has its headers flushed upstream as soon as they arrive, with
-        # the body behind them, so the `request` hook is too late to change a
-        # header. AWS signing that needs the body keeps the flow non-streaming
-        # (see _begin_sigv4), which holds the headers back until `request`.
+        # Enforce + inject here, not in `request`: a streamed request flushes its
+        # headers upstream before the body, so `request` is too late to change a
+        # header. AWS signing keeps the flow non-streaming (see _begin_sigv4) to
+        # hold the headers back until `request`.
         req = flow.request
         matched = self._match_rule(req)
         if matched is None:
@@ -517,10 +461,8 @@ class RuleEnforcer:
             return
         _apply_streaming(flow, req)
         name, inject_headers = matched
-        # A matched AWS request signed with a known dummy AKIA is re-signed with
-        # real credentials. inject.headers and re-signing are mutually exclusive
-        # on such a request: the signer overwrites Authorization, so any injected
-        # header would be discarded — we skip them.
+        # A known dummy AKIA is re-signed with real credentials. The signer
+        # overwrites Authorization, so inject.headers is skipped on such a request.
         akia = self._signable_akia(req)
         if akia is not None:
             self._begin_sigv4(flow, akia, name)
@@ -528,8 +470,8 @@ class RuleEnforcer:
         if req.host.endswith(_AWS_SUFFIX) and _SIGV4_AKIA_RE.match(
             req.headers.get("Authorization", "")
         ):
-            # Authorised AWS host signed with an AKIA we hold no creds for. Leave
-            # it untouched; it will fail at AWS with the dummy signature.
+            # Allowed AWS host, but an AKIA we hold no creds for: leave it to
+            # fail at AWS with the dummy signature.
             logger.warning(
                 f"agent-uplink sigv4 no creds host={req.host} "
                 f"(request allowed but not re-signed)"
@@ -539,15 +481,13 @@ class RuleEnforcer:
         logger.info(f"agent-uplink ALLOW [{name}] {req.method} {req.host}{req.path}")
 
     def responseheaders(self, flow: http.HTTPFlow) -> None:
-        # Nothing in this addon inspects response bodies, so a large download (a
-        # git pack, an image layer, an S3 object) is relayed chunk by chunk
-        # instead of being held in the pod.
+        # Nothing inspects response bodies, so large downloads stream.
         if flow.response is not None:
             _apply_streaming(flow, flow.response)
 
     def request(self, flow: http.HTTPFlow) -> None:
-        # Second hook, reached only for AWS flows _begin_sigv4 deferred: the body
-        # is fully buffered now, so hash it and sign with the real credentials.
+        # Reached only for AWS flows _begin_sigv4 deferred: the body is buffered
+        # now, so hash and sign it with the real credentials.
         meta = flow.metadata.get("aws_sign")
         if not meta:
             return

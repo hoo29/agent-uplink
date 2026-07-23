@@ -7,9 +7,8 @@ LOGGER = logging.getLogger("agent-uplink")
 
 @dataclass
 class CommandResult:
-    """Outcome of a subprocess run. Keeps returncode, stdout and stderr distinct
-    so callers can tell a successful empty-output command from a failed one (a
-    bare stdout string cannot)."""
+    """Outcome of a subprocess run, keeping the three fields distinct so a
+    successful empty-output command is distinguishable from a failed one."""
 
     returncode: int
     stdout: str
@@ -27,9 +26,8 @@ def run(
     stdout: int | None = subprocess.PIPE,
     stderr: int | None = subprocess.PIPE,
 ) -> CommandResult:
-    """Run a command and return its full result. Never raises on a non-zero exit
-    (inspect `.ok`/`.returncode`); use `run_command` for the raise-or-string
-    convenience wrapper."""
+    """Run a command, returning its full result. Never raises on non-zero exit
+    (inspect `.ok`); `run_command` is the raise-or-string wrapper."""
     LOGGER.debug(f"running {command}")
     res = subprocess.run(
         command,
@@ -38,8 +36,7 @@ def run(
         stderr=stderr,
         check=False,
     )
-    # errors="replace": tool output is only logged/parsed leniently here, and a
-    # stray non-UTF-8 byte must not turn into a UnicodeDecodeError mid-run.
+    # errors="replace" so a stray non-UTF-8 byte can't raise mid-run.
     out = res.stdout.decode("utf-8", errors="replace") if res.stdout is not None else ""
     err = res.stderr.decode("utf-8", errors="replace") if res.stderr is not None else ""
     return CommandResult(res.returncode, out, err)
@@ -53,13 +50,8 @@ def run_command(
     stderr: int | None = subprocess.PIPE,
     raise_error: bool = True,
 ) -> str:
-    """Run a command and return its stdout.
-
-    On a non-zero exit: raise RuntimeError when `raise_error` (default), else log
-    stderr at warning and return "". The tolerated-failure path logs rather than
-    swallowing stderr so a failure isn't silently indistinguishable from empty
-    output; callers that must branch on the exit code should use `run` instead.
-    """
+    """Run a command, returning its stdout. On non-zero exit raise RuntimeError
+    when `raise_error` (default), else log stderr at warning and return ""."""
     res = run(command, stdin=stdin, stdout=stdout, stderr=stderr)
     if not res.ok:
         if raise_error:

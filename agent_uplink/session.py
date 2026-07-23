@@ -11,16 +11,15 @@ from .k8s import delete_namespace
 
 LOGGER = logging.getLogger("agent-uplink")
 
-# A session held this long is almost certainly an orphan from a crashed or
-# kill -9'd run rather than active work; each one pins a microVM and its pods.
+# Beyond this a session is almost certainly an orphan from a crashed run, still
+# pinning a microVM and its pods.
 STALE_SESSION_SECONDS = 24 * 3600
 
 
 @dataclass
 class Session:
-    """Single run of an agent. Owns one K8s namespace and a host-side scratch
-    directory for transient files (e.g. a fake credentials.json an agent
-    writes before it gets uploaded as a Secret)."""
+    """Single agent run. Owns one K8s namespace and a host-side scratch dir for
+    transient files (e.g. a fake credentials.json before it's uploaded)."""
 
     session_dir: Path
     namespace: str
@@ -30,8 +29,8 @@ class Session:
     def create(cls, state_dir: Path) -> Session:
         session_id = uuid.uuid4().hex[:12]
         session_dir = state_dir / "sessions" / session_id
-        # 0700: the scratch dir holds per-run files derived from host secrets
-        # (e.g. the sanitized ~/.claude.json, which keeps MCP env values).
+        # 0700: the scratch dir holds files derived from host secrets (e.g. the
+        # sanitized ~/.claude.json, which keeps MCP env values).
         session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         namespace = f"agent-uplink-{session_id}"
         return cls(session_dir=session_dir, namespace=namespace)
@@ -51,13 +50,9 @@ class Session:
 
 
 def warn_if_stale_sessions(exclude_namespace: str) -> None:
-    """Warn about other session namespaces alive for over 24h.
-
-    Teardown only deletes this run's namespace; a crashed or kill -9'd run leaks
-    its own. The background-delete line above is the moment the user is looking,
-    so we list the rest here and flag any older than 24h — each still holds a
-    microVM and pods. Best-effort: a failed lookup (e.g. cluster unreachable
-    during shutdown) must never block teardown."""
+    """Warn about other session namespaces alive over 24h (leaked by crashed
+    runs, each still holding a microVM). Best-effort: a failed lookup must never
+    block teardown."""
     try:
         from . import reaper
 

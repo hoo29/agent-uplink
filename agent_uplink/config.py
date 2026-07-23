@@ -1,37 +1,23 @@
-"""Load runtime config from `.agent-uplink.yaml` files and fold it into the
-argparse defaults so every CLI flag can be set from a file.
+"""Load runtime config from `.agent-uplink.yaml` files into the argparse defaults
+so every CLI flag can be set from a file.
 
-Discovery walks from the working directory up to `~/.agent-uplink.yaml`,
-collecting every `.agent-uplink.yaml` on the way. Precedence (lowest to
-highest): home file -> ... -> working-directory file -> CLI args. So a
-project-local config overrides the home one, and an explicit CLI flag overrides
-both.
+Discovery walks from the working directory up to `~/.agent-uplink.yaml`.
+Precedence low->high: home file -> ... -> cwd file -> CLI args. The schema is
+derived from the chosen subparser's actions, so any new flag is configurable
+automatically; keys are the flag's dest or long option (dashes/underscores
+interchangeable), values coerced with the action's own `type`.
 
-The config schema is derived from the chosen agent subparser's actions rather
-than hand-maintained, so any flag the CLI gains is configurable automatically.
-Keys are the flag's dest (underscores) or its long option (`anthropic`); dashes
-and underscores are interchangeable. Values are coerced with the action's own
-`type`, so a config error is caught here, before any pod is launched.
+Two shapes get special handling:
 
-Two value shapes get special handling:
+  - Repeatable flags (`--aws-profiles`, `--rules`, ...) are *additive* — every
+    file's values accumulate; a scalar is a one-element list. A `rules` item may
+    be a mapping (an inline rule, see `_STRUCTURED_LIST_DESTS`) passed through
+    verbatim; files and inline rules mix and resolve in order.
+  - store_const flags sharing a dest (`--anthropic`/`--bedrock` -> `auth_mode`)
+    set by option name (`anthropic: true`) or dest (`auth_mode: anthropic`).
 
-  - Repeatable flags (`--aws-profiles`, `--ssh-cidr`, `--mount-rw`, `--rules`,
-    ...) are *additive*: values from every config file (and then the CLI)
-    accumulate rather than replace. A scalar is accepted as a one-element list.
-    For `rules` a list item may also be a mapping — an inline rule (same schema
-    as a rules file's `rules:` entry) defined directly in the config — which is
-    passed through verbatim instead of being coerced to a `Path` (see
-    `_STRUCTURED_LIST_DESTS`); rule files and inline rules can be mixed in one
-    list and are resolved in order.
-  - store_const flags that share a dest (`--anthropic` / `--bedrock` ->
-    `auth_mode`) are set either by the option name (`anthropic: true`) or by the
-    dest (`auth_mode: anthropic`).
-
-This module only computes the per-dest values; the caller applies them with
-`subparser.set_defaults(**values)`, which is where the additive list / scalar
-override behaviour actually comes from (argparse extends a list default with the
-CLI values and replaces a scalar default).
-"""
+This module computes the per-dest values; the caller's `set_defaults(**values)`
+is where the additive-list / scalar-override behaviour comes from."""
 
 from __future__ import annotations
 
@@ -47,10 +33,8 @@ CONFIG_FILENAME = ".agent-uplink.yaml"
 # Never settable from a config file: the subcommand selector and the help flag.
 _EXCLUDED_DESTS = {"help", "agent_name"}
 
-# List-valued dests whose items may be structured mappings (inline rules) rather
-# than scalars. For these, a mapping item is passed through verbatim instead of
-# being run through the flag's `type` (which expects a string path); the rule
-# resolver validates the mapping later. Only `rules` accepts inline objects.
+# List dests whose items may be inline-rule mappings, passed through verbatim
+# (not run through the flag's `type`) for the rule resolver to validate later.
 _STRUCTURED_LIST_DESTS = {"rules"}
 
 
@@ -93,8 +77,8 @@ def _build_spec(parser: argparse.ArgumentParser) -> _Spec:
         spec.by_dest[_norm(dest)] = action
         if _is_list_action(action):
             spec.list_dests.add(dest)
-        # store_const flags with a non-bool const (e.g. --anthropic/--bedrock):
-        # store_true/store_false carry bool consts and are handled as plain flags.
+        # store_const with a non-bool const (--anthropic/--bedrock);
+        # store_true/false carry bool consts and are plain flags below.
         if isinstance(action, argparse._StoreConstAction) and not isinstance(
             action.const, bool
         ):

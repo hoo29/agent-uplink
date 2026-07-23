@@ -26,16 +26,11 @@ from .config import (
     sanitized_claude_json_bytes,
 )
 
-# Settings.json env injected per auth mode. anthropic mode steers the CLI via
-# a fake .credentials.json instead, so it has no entry here. Real credentials
-# are added by mitm header injection (see prepare()) and never enter the
-# container.
-#
-# CLAUDE_CODE_ENABLE_AUTO_MODE=1 (bedrock only): permission mode "auto" is off
-# on Bedrock until this is set, and defaultMode "auto" is ignored without it.
-# On the Anthropic API auto mode is available by default, so anthropic needs no
-# entry. (Bedrock supports auto only on Opus 4.7/4.8; other models fall back to
-# the default mode, with bypassPermissions still reachable via Shift+Tab.)
+# settings.json env injected per auth mode (placeholders only; real credentials
+# come from mitm injection, see prepare()). anthropic steers the CLI via a fake
+# .credentials.json and needs no entry. CLAUDE_CODE_ENABLE_AUTO_MODE=1 is
+# required for defaultMode "auto" on Bedrock (Opus 4.7/4.8 only; other models
+# fall back to the default mode, bypassPermissions still via Shift+Tab).
 _AUTH_MODE_ENV: dict[str, dict[str, str]] = {
     "bedrock": {
         "AWS_BEARER_TOKEN_BEDROCK": "placeholder",
@@ -47,23 +42,19 @@ _SETTINGS_SECRET = "claude-settings"
 _FAKE_CREDS_SECRET = "claude-fake-creds"
 _CLAUDE_MD_SECRET = "claude-md"
 _MANAGED_SETTINGS_SECRET = "claude-managed-settings"
-# Where the pod's managed settings mount. Fixed, and identical to the host path
-# HOST_MANAGED_SETTINGS reads from: Claude looks the file up here, and mounting
-# it anywhere else would leave its precedence over the user settings unapplied.
+# Where the pod mounts managed settings — the path Claude reads them from, so its
+# precedence over the user settings applies.
 _MANAGED_SETTINGS_PATH = "/etc/claude-code/managed-settings.json"
 
 
 class ClaudeAgent(Agent):
-    """Agent implementation for the Claude Code CLI.
-
-    Supports two auth modes:
-      --anthropic: real OAuth bearer is read from the host's
-                   ~/.claude/.credentials.json and injected by mitm;
-                   the container sees a fake credentials.json.
-      --bedrock:   bearer is read from the host keyring (`bedrock`/`key`) and
-                   injected by mitm on bedrock-runtime.<region>.amazonaws.com;
-                   the container sees AWS_BEARER_TOKEN_BEDROCK=placeholder.
-    """
+    """Claude Code CLI agent. Two auth modes, both injecting the real bearer via
+    mitm so it never enters the container:
+      --anthropic: OAuth bearer from ~/.claude/.credentials.json; container sees
+                   a fake credentials.json.
+      --bedrock:   bearer from the host keyring (`bedrock`/`key`), injected on
+                   bedrock-runtime.<region>.amazonaws.com; container sees
+                   AWS_BEARER_TOKEN_BEDROCK=placeholder."""
 
     name: ClassVar[str] = "claude"
 
@@ -89,10 +80,9 @@ class ClaudeAgent(Agent):
             default=cls.default_image_repo(),
             help="Claude image repo (registry endpoint + :tag added by orchestrator)",
         )
-        # Not required at the argparse level: the mode may instead come from a
-        # .agent-uplink.yaml (auth_mode/anthropic/bedrock). ClaudeAgent.__init__
-        # enforces that exactly one was supplied by either route. The group still
-        # makes --anthropic and --bedrock mutually exclusive on the CLI.
+        # Not argparse-required: the mode may come from .agent-uplink.yaml
+        # instead. __init__ enforces exactly one; the group makes the two flags
+        # mutually exclusive on the CLI.
         mode_group = parser.add_mutually_exclusive_group(required=False)
         mode_group.add_argument(
             "--anthropic",
@@ -174,18 +164,16 @@ class ClaudeAgent(Agent):
         settings = claude_settings_bytes(self._config(), auth_env)
         secret_payloads[_SETTINGS_SECRET] = {"settings.json": settings}
 
-        # Enterprise managed settings, when the host has them. Shipped via
-        # Secret like the user settings (the host file is left untouched) and
-        # mounted at the path Claude reads them from, so its own precedence
-        # rules apply unchanged. See _volumes_and_mounts.
+        # Enterprise managed settings, when the host has them (see
+        # _volumes_and_mounts).
         managed = load_managed_settings()
         if managed is not None:
             secret_payloads[_MANAGED_SETTINGS_SECRET] = {
                 "managed-settings.json": managed_settings_bytes(managed, auth_env)
             }
 
-        # CLAUDE.md = host's copy + appended sandbox guidance, shipped via Secret
-        # so the host file is left untouched (see _volumes_and_mounts).
+        # CLAUDE.md = host copy + sandbox guidance, via Secret (see
+        # _volumes_and_mounts).
         secret_payloads[_CLAUDE_MD_SECRET] = {"CLAUDE.md": claude_md_bytes()}
 
         return PreparedAgent(auth_rules=auth_rules, secret_payloads=secret_payloads)
@@ -217,17 +205,11 @@ class ClaudeAgent(Agent):
         container_home = f"/home/{username}"
         claude_dir = f"{container_home}/.claude"
 
-        # ~/.claude.json holds MCP server config, including bearer tokens in the
-        # `Authorization` header of http/sse servers. Mounting the host file would
-        # expose those and let the agent mutate the real host config. Instead ship a
-        # copy with each MCP `Authorization` header redacted into the session scratch
-        # dir and mount it read-write: the agent's runtime writes persist for the
-        # session, the host file is untouched, and the bearer token is wired back in
-        # via the user's mitm rules. (env-based creds for stdio servers are left
-        # intact and do enter the pod — see sanitized_claude_json_bytes.)
+        # A redacted copy of ~/.claude.json (MCP Authorization headers replaced)
+        # mounted read-write from the session dir, so the host file is untouched
+        # and the bearer is re-injected via mitm rules. Mode 0600 since env-based
+        # stdio-server secrets remain in the copy (see sanitized_claude_json_bytes).
         session_claude_json = ctx.session_dir / ".claude.json"
-        # 0600 like the original: redaction only covers MCP Authorization
-        # headers; env values (stdio server secrets) are still in this copy.
         session_claude_json.touch(mode=0o600)
         session_claude_json.write_bytes(sanitized_claude_json_bytes(HOST_CLAUDE_JSON))
 
@@ -280,8 +262,8 @@ class ClaudeAgent(Agent):
                 }
             )
 
-        # Managed settings only exist when the host has an enterprise policy;
-        # prepare() ships the Secret under the same condition.
+        # Only when the host has an enterprise policy; prepare() ships the Secret
+        # under the same condition.
         if HOST_MANAGED_SETTINGS.is_file():
             volumes.append(
                 secret_volume("managed-settings", _MANAGED_SETTINGS_SECRET)
@@ -295,8 +277,6 @@ class ClaudeAgent(Agent):
                 }
             )
 
-        # CLAUDE.md is shipped via Secret (host copy + sandbox guidance), not
-        # mounted from the host (see prepare()).
         volumes.append(secret_volume("claude-md", _CLAUDE_MD_SECRET))
         mounts.append(
             {
@@ -322,10 +302,8 @@ class ClaudeAgent(Agent):
                 }
             )
 
-        # Maven (opt-in via --maven): settings.xml read-only, the local repository
-        # read-write so the agent writes downloaded artifacts straight into the
-        # host's real repo. Other host configs (e.g. ~/.ansible.cfg) are no longer
-        # auto-mounted — use the generic --mount-ro / --mount-rw flags instead.
+        # --maven: settings.xml read-only, the local repository read-write so
+        # downloaded artifacts land in the host's real repo.
         if getattr(self.args, "maven", False):
             m2_dir = Path.home() / ".m2"
             m2_settings = m2_dir / "settings.xml"
@@ -351,18 +329,14 @@ class ClaudeAgent(Agent):
                 {"name": "m2-repo", "mountPath": f"{container_home}/.m2/repository"}
             )
 
-        # Private registry auth (ECR, etc.) is handled by mitm rules injecting
-        # the Authorization header on registry hosts, so ~/.docker/config.json
-        # is deliberately not mounted — no registry credentials enter the pod.
+        # Registry auth (ECR, etc.) comes from mitm header injection, so
+        # ~/.docker/config.json is not mounted — no registry creds in the pod.
 
-        # These two need tmpfs regardless of the rootfs being writable; every
-        # other path the agent writes lands on the container rootfs directly.
-        # /var/lib/docker: the nested dockerd's overlayfs upperdir. A disk-backed
-        # emptyDir lands on kata's virtio-fs, which the kernel won't accept as an
-        # overlayfs upperdir (EINVAL); tmpfs supports overlay natively. Cost:
-        # image layers + container rootfs are held in pod memory (see memory()).
-        # /run: holds the docker socket + pidfile; a unix socket on virtio-fs is
-        # unreliable, so tmpfs.
+        # Both need tmpfs even with a writable rootfs. /var/lib/docker is the
+        # nested dockerd's overlayfs upperdir: kata's virtio-fs is rejected as one
+        # (EINVAL), tmpfs supports overlay natively (cost: image layers held in
+        # pod memory, see memory()). /run holds the docker socket, unreliable on
+        # virtio-fs.
         volumes.append(tmpfs_volume("docker-lib", "2Gi"))
         volumes.append(tmpfs_volume("run", "64Mi"))
         mounts.append({"name": "docker-lib", "mountPath": "/var/lib/docker"})
@@ -384,8 +358,7 @@ class ClaudeAgent(Agent):
         # Only relevant with --maven; otherwise no-op.
         if not getattr(self.args, "maven", False):
             return {}
-        # The Maven JVM does not read HTTPS_PROXY (unlike dockerd), and the pod
-        # can egress only to mitm. Point Maven's HTTP client at mitm explicitly.
+        # The Maven JVM ignores HTTPS_PROXY, so point its HTTP client at mitm.
         host, port = ctx.proxy_host, ctx.proxy_port
         return {
             "MAVEN_OPTS": (
@@ -393,26 +366,18 @@ class ClaudeAgent(Agent):
                 f"-Dhttps.proxyHost={host} -Dhttps.proxyPort={port} "
                 "-Dhttp.nonProxyHosts=localhost|127.0.0.1"
             ),
-            # Lets ${env.CODEARTIFACT_AUTH_TOKEN} in settings.xml expand cleanly;
-            # the value is irrelevant — mitm overwrites the Authorization header.
+            # Lets ${env.CODEARTIFACT_AUTH_TOKEN} in settings.xml expand; the
+            # value is irrelevant, mitm overwrites the Authorization header.
             "CODEARTIFACT_AUTH_TOKEN": "placeholder",
         }
 
     def _container_security_context(self) -> dict:
-        # dockerd needs to manage iptables, cgroups, namespaces, mounts —
-        # privileged + root + unconfined seccomp is the minimum. PID 1 runs
-        # as root (image has no USER directive); the entrypoint launches
-        # dockerd then drops to ${USERNAME}. The grant is bounded by the Kata
-        # guest kernel — the host kernel is unaffected.
-        #
-        # readOnlyRootFilesystem is deliberately NOT set. On a privileged, root,
-        # seccomp-unconfined container it is not a boundary — the agent holds
-        # CAP_SYS_ADMIN and can remount the rootfs read-write at will — so it
-        # would only add friction (an explicit writable mount per path the agent
-        # or its tooling touches). The trust boundary is the Kata guest kernel
-        # plus the NetworkPolicy egress lock, not the in-container filesystem
-        # mode. The hardened support pods (mitm/sigv4), which are non-root and
-        # unprivileged, do keep readOnlyRootFilesystem.
+        # dockerd needs iptables/cgroups/namespaces/mounts, so privileged + root +
+        # unconfined seccomp is the minimum; the grant is bounded by the Kata guest
+        # kernel, not the host. readOnlyRootFilesystem is NOT set: with CAP_SYS_ADMIN
+        # the agent can remount rw at will, so it would only add friction, and the
+        # trust boundary is the guest kernel plus the NetworkPolicy egress lock.
+        # The non-root support pods (mitm/sigv4) do keep it.
         return {
             "privileged": True,
             "allowPrivilegeEscalation": True,
@@ -422,21 +387,15 @@ class ClaudeAgent(Agent):
     def _container_command(
         self, username: str, debug: bool, extra_args: list[str]
     ) -> list[str]:
-        # -d (debug) then --allow-dangerously-skip-permissions, then any
-        # user-supplied passthrough args (--resume <id>, -p "prompt", ...).
-        # The --allow- variant adds bypassPermissions to the Shift+Tab cycle
-        # WITHOUT activating it: the session starts in the default mode ("auto",
-        # set via settings.json defaultMode), but the user can Shift+Tab to
-        # bypass, and bypass stays reachable on models that don't support auto
-        # (e.g. older Sonnet, where auto falls back to the default mode). Each
-        # arg is shell-quoted so values can't break out of the `bash -lc` string.
+        # --allow-dangerously-skip-permissions adds bypassPermissions to the
+        # Shift+Tab cycle without activating it (the session starts in defaultMode
+        # "auto"), keeping bypass reachable on models that don't support auto. Args
+        # are shell-quoted so values can't break out of the `bash -lc` string.
         argv = (["-d"] if debug else []) + ["--allow-dangerously-skip-permissions"]
         argv += extra_args
         claude_args = " ".join(shlex.quote(a) for a in argv)
-        # PID 1 runs as root so it can start dockerd; drop to the agent user
-        # for the interactive session. runuser re-initialises HOME/USER/groups
-        # to the target user (including the `docker` group, so the socket is
-        # usable) without needing PAM.
+        # PID 1 is root (to start dockerd); runuser drops to the agent user and
+        # re-inits HOME/USER/groups (incl. `docker`, for the socket) without PAM.
         return [
             "runuser",
             "-u",

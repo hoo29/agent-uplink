@@ -15,24 +15,21 @@ from ..session import Session
 
 @dataclass
 class PodBuildContext:
-    """Inputs the orchestrator hands an agent to build its pod contribution.
-    Everything an agent needs to assemble its volumes/env/commands lives here,
-    so the agent exposes a single build hook instead of many fine-grained ones."""
+    """Inputs the orchestrator hands an agent to build its pod contribution."""
 
     cwd: Path
     username: str
     uid: int
     gid: int
-    # The mitm proxy the pod egresses through, for agents whose tooling needs
-    # explicit proxy config (the generic HTTP(S)_PROXY env is set by the
-    # orchestrator). Single source: cli wires these from its own constants.
+    # The mitm proxy the pod egresses through, for tooling that needs explicit
+    # proxy config beyond the orchestrator's HTTP(S)_PROXY env.
     proxy_host: str
     proxy_port: int
     aws_creds_secret_name: str | None
     debug_host_dir: Path | None
     debug: bool
-    # Per-run host scratch dir (Session.session_dir); for transient files the
-    # agent writes host-side and then mounts (e.g. a sanitized ~/.claude.json).
+    # Per-run host scratch dir, for transient files the agent writes then mounts
+    # (e.g. a sanitized ~/.claude.json).
     session_dir: Path
 
 
@@ -53,40 +50,26 @@ class PodContribution:
 
 @dataclass
 class PreparedAgent:
-    """Host-side products of prepare(). Returned (not stashed on the agent) so
-    there is no ordering landmine and no per-method 'prepare() not called' guard.
-
-    Real secrets live only in `auth_rules` (injected inside the mitm pod) and in
-    `secret_payloads` (K8s Secrets); neither ever reaches the agent container in
-    its real form."""
+    """Host-side products of prepare(). Real secrets live only in `auth_rules`
+    (injected inside the mitm pod) and `secret_payloads` (K8s Secrets); neither
+    reaches the agent container in its real form."""
 
     auth_rules: list[dict] = field(default_factory=list)
     secret_payloads: dict[str, dict[str, bytes]] = field(default_factory=dict)
 
 
 class Agent(ABC):
-    """Base class for an agent that runs inside agent-uplink's microVM sandbox.
+    """Base class for an agent running in agent-uplink's microVM sandbox. A
+    concrete Agent owns its image, auth resolution, Secrets/volumes/mounts, and
+    any auth rules mitm must inject; generic concerns (mitm, SigV4, bootstrap,
+    NetworkPolicy) are wired by `agent_uplink.cli`.
 
-    A concrete Agent owns:
-      - The container image (Dockerfile + default rules) under its own
-        package directory.
-      - Per-mode auth resolution and the host-side credential dance.
-      - The set of K8s Secrets, volumes, and volumeMounts the agent pod needs.
-      - Any auth rules the mitmproxy layer must inject.
-
-    Generic concerns (mitmproxy lifecycle, AWS SigV4 re-signing, registry
-    bootstrap, namespace lifecycle, NetworkPolicy) live outside subclasses and
-    are wired together by `agent_uplink.cli`.
-
-    Lifecycle (called by the CLI in order):
-      1. add_cli_args(parser)              — classmethod, registers subparser flags
-      2. __init__(args)                    — capture parsed args
-      3. discover_aws_profiles()           — extra AWS profiles to spin sidecars for
-      4. prepare(session, profiles)        — host-side auth → PreparedAgent
-                                             (auth_rules + secret_payloads)
-      5. pod_contribution(context)         — PodContribution: env, volumes, mounts,
-                                             securityContext, init/exec commands, memory
-    """
+    Lifecycle, called by the CLI in order:
+      1. add_cli_args(parser)       — classmethod, registers subparser flags
+      2. __init__(args)
+      3. discover_aws_profiles()    — extra AWS profiles to spin sidecars for
+      4. prepare(session, profiles) — host-side auth -> PreparedAgent
+      5. pod_contribution(context)  — env, volumes, mounts, securityContext, ..."""
 
     name: ClassVar[str]
 
@@ -114,11 +97,8 @@ class Agent(ABC):
         return getattr(self.args, "image", None) or self.default_image_repo()
 
     def default_rules(self) -> list[dict]:
-        """Agent-specific allow-list rules, loaded from default_rules.yaml in
-        the agent's package directory. Returns [] if the file is absent.
-
-        An instance method (not a classmethod) so a subclass can derive rules
-        from instance state; the resolver always calls it on an instance."""
+        """Agent-specific allow-list rules from default_rules.yaml, or [] if
+        absent. An instance method so a subclass can derive rules from state."""
         path = self.container_dir() / "default_rules.yaml"
         if not path.exists():
             return []
@@ -131,15 +111,13 @@ class Agent(ABC):
 
     @abstractmethod
     def prepare(self, session: Session, aws_profile_names: list[str]) -> PreparedAgent:
-        """Host-side prep: refresh OAuth, read keyring, produce in-memory bytes
-        for settings/credentials, and return the agent's auth rules + Secret
-        payloads. Real secrets stay on the host / inside mitm."""
+        """Host-side prep: refresh OAuth, read keyring, build settings/credential
+        bytes, and return auth rules + Secret payloads. Real secrets stay on the
+        host / inside mitm."""
 
     def pod_contribution(self, ctx: PodBuildContext) -> PodContribution:
-        """Agent-specific pod pieces. Default: drop into an interactive bash with
-        the full hardened security context and no extra volumes. Override to add
-        volumes/mounts/env, run a different PID 1, or relax hardening (e.g. to
-        run an in-pod dockerd)."""
+        """Agent-specific pod pieces. Default: interactive bash, hardened, no
+        extra volumes. Override to add volumes/mounts/env or relax hardening."""
         return PodContribution(
             security_context=hardened_container_security_context(
                 uid=ctx.uid, gid=ctx.gid
