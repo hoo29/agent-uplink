@@ -2,12 +2,12 @@
 
 ## Generic vs agent-specific
 
-The runtime splits cleanly into two halves:
+The runtime splits into two halves:
 
 | Layer | Files | Responsibility |
 |---|---|---|
-| **Generic** | `cli.py`, `k8s.py`, `bootstrap.py`, `rules.py`, `aws.py`, `kube.py`, `git.py`, `sshagent.py`, `session.py`, `process.py`, `mitm_addon/`, `default_rules.yaml` | mitm lifecycle, AWS SigV4 re-signing in mitm, K8s manifest assembly, registry + cert bootstrap, kube/git/ssh wiring, session cleanup, rule resolution. Knows nothing about specific agents. |
-| **Agent** | `agents/base.py` (interface), `agents/<name>/...` (impl) | Image to build, auth flow, fake-creds production, K8s volumes/mounts, agent-specific default rules, per-mode auth-rule injection. |
+| Generic | `cli.py`, `k8s.py`, `bootstrap.py`, `rules.py`, `aws.py`, `kube.py`, `git.py`, `sshagent.py`, `session.py`, `process.py`, `mitm_addon/`, `default_rules.yaml` | mitm lifecycle, AWS SigV4 re-signing in mitm, K8s manifest assembly, registry + cert bootstrap, kube/git/ssh wiring, session cleanup, rule resolution. Knows nothing about specific agents. |
+| Agent | `agents/base.py` (interface), `agents/<name>/...` (impl) | Image to build, auth flow, fake-creds production, K8s volumes/mounts, agent-specific default rules, per-mode auth-rule injection. |
 
 `cli.py` is the orchestrator. It parses args, picks an `Agent` subclass from the registry, and calls its lifecycle hooks at the right points around the generic plumbing.
 
@@ -46,8 +46,8 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
 4. `bootstrap.ensure_registry()` — apply registry Deployment/Service in `agent-uplink-system` (idempotent), wait for ready.
 5. `bootstrap.ensure_mitm_certs()` — generate mitmproxy CA into `~/.agent_uplink/mitm/` via a one-shot pod with hostPath if missing.
 6. `agent.discover_aws_profiles()` — agent may add to the AWS profile list (e.g. Claude bedrock mode picks up `env.AWS_PROFILE`). Combined with `--aws-profiles`, deduped.
-7. `agent.prepare(session, aws_profile_names)` — host-side OAuth refresh, keyring reads, fake-creds + settings.json bytes (all in memory; no disk writes). Returns a `PreparedAgent` (the agent's auth rules + K8s Secret payloads) rather than stashing them on the instance.
-8. `bootstrap.build_and_push_agent_image(...)` — assemble a temp build context (agent dir + the **public** mitm CA cert only; the CA private key never enters the context or any image layer), `docker build`, `docker push localhost:5000/<repo>:latest`. Rebuilds also fire if certs were just regenerated, `--force-rebuild`, or the image is older than `AGENT_IMAGE_MAX_AGE_SECONDS` (24 h).
+7. `agent.prepare(session, aws_profile_names)` — host-side OAuth refresh, keyring reads, fake-creds + settings.json bytes (all in memory; no disk writes). Returns a `PreparedAgent` (the agent's auth rules + K8s Secret payloads).
+8. `bootstrap.build_and_push_agent_image(...)` — assemble a temp build context (agent dir + the public mitm CA cert only; the CA private key never enters the context or any image layer), `docker build`, `docker push localhost:5000/<repo>:latest`. Rebuilds also fire if certs were just regenerated, `--force-rebuild`, or the image is older than `AGENT_IMAGE_MAX_AGE_SECONDS` (24 h).
 9. Build the dummy `~/.aws/credentials` INI (deterministic AKIA per profile) as bytes, wrap in a K8s Secret (`agent-aws-creds`) for the agent pod. For each AWS profile, export real AWS env vars on the host and collect them into a single dummy-AKIA → real-credentials JSON map, wrapped in one K8s Secret (`aws-sigv4-creds`) mounted only into the mitm pod.
 10. Resolve rules: layer in precedence order agent auth rules (from `prepare()`) → kube rules → user `--rules` YAML → agent default rules → generic defaults (first match wins, generic catch-all last); expand `{{keyring:...}}` (and `{{exec:...}}` only when `--allow-exec`) placeholders; wrap as Secret (`rules-json`).
 11. `prepared.secret_payloads` — any agent-specific Secrets (`claude-settings`, `claude-fake-creds` in anthropic mode).
@@ -64,7 +64,7 @@ Namespace cleanup (`kubectl delete ns`) is the entire teardown path.
   contain, or equal) the working directory or each other; startup is refused otherwise. Each path is mounted at its
   identical host path (see Extra mounts).
 - **Image rebuild triggers**: rebuild + push whenever mitm certs are newly generated, `--force-rebuild` is passed, the image doesn't exist locally, or it's older than `AGENT_IMAGE_MAX_AGE_SECONDS` (24 h).
-- **Security posture (agent pod)**: `runtimeClassName: kata-clh` (microVM isolation; `kata-qemu` / `kata-fc` selectable via `--agent-runtime-class`). Container runs `privileged=true`, `allowPrivilegeEscalation=true`, `seccompProfile=Unconfined`, PID 1 as root — required so the nested `dockerd` can manage cgroups/namespaces/mounts/iptables inside the guest. `readOnlyRootFilesystem` is deliberately **off** here. On a privileged, root, seccomp-unconfined container it is not a boundary — the agent holds `CAP_SYS_ADMIN` and can remount the rootfs read-write at will — so it would only add friction (an explicit writable mount per path the agent touches). The container rootfs is writable; the trust boundary is the kata guest kernel plus the NetworkPolicy egress lock. Two paths are still memory-backed tmpfs because they require it regardless: `/var/lib/docker` (2Gi — the nested `dockerd`'s overlayfs upperdir, which kata's virtio-fs rejects) and `/run` (64Mi — holds the `dockerd` unix socket, unreliable on virtio-fs). The interactive session drops to the host UID via `runuser` in `container_command`. NetworkPolicy egress restricted to `mitm:8080` + `kube-dns` (plus TCP 22 to `--ssh-cidr` ranges if set — see SSH egress). Memory limit 4Gi (sized for the 2Gi tmpfs `/var/lib/docker` plus headroom for image layers and the agent process), CPU limit 1; requests are lower (1Gi / 250m) so the pod schedules on small nodes but can burst to the limit. Trust boundary is the kata guest kernel.
+- **Security posture (agent pod)**: `runtimeClassName: kata-clh` (microVM isolation; `kata-qemu` / `kata-fc` selectable via `--agent-runtime-class`). Container runs `privileged=true`, `allowPrivilegeEscalation=true`, `seccompProfile=Unconfined`, PID 1 as root — required so the nested `dockerd` can manage cgroups/namespaces/mounts/iptables inside the guest. `readOnlyRootFilesystem` is deliberately off here. On a privileged, root, seccomp-unconfined container it is not a boundary — the agent holds `CAP_SYS_ADMIN` and can remount the rootfs read-write at will — so it would only add friction (an explicit writable mount per path the agent touches). The container rootfs is writable; the trust boundary is the kata guest kernel plus the NetworkPolicy egress lock. Two paths are still memory-backed tmpfs because they require it regardless: `/var/lib/docker` (2Gi — the nested `dockerd`'s overlayfs upperdir, which kata's virtio-fs rejects) and `/run` (64Mi — holds the `dockerd` unix socket, unreliable on virtio-fs). The interactive session drops to the host UID via `runuser` in `container_command`. NetworkPolicy egress restricted to `mitm:8080` + `kube-dns` (plus TCP 22 to `--ssh-cidr` ranges if set — see SSH egress). Memory limit 4Gi (sized for the 2Gi tmpfs `/var/lib/docker` plus headroom for image layers and the agent process), CPU limit 1; requests are lower (1Gi / 250m) so the pod schedules on small nodes but can burst to the limit. Trust boundary is the kata guest kernel.
 - **Security posture (mitm pod)**: full hardened container security context (`drop=[ALL]`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation=false`, `runAsNonRoot=true`, `seccompProfile=RuntimeDefault`) under the cluster default runtime (faster cold start). Holds the real AWS credentials (mounted Secret) and the resolved rules, so it is the most secret-bearing support pod — kept off any hostPath and locked down accordingly. Egress isolation enforced by NetworkPolicy. Memory limit 512Mi, CPU limit 500m (requests 96Mi·50m).
 
 ## Extra mounts
@@ -73,8 +73,8 @@ The working directory is always mounted read-write at its host path. Two orchest
 via `validate_mounts` / `HostMount`; no `Agent` subclass involved) add more host paths, each mounted at its identical
 host path:
 
-- `--mount-rw <PATH> [<PATH> ...]` — host file(s)/dir(s) mounted **read-write**, e.g. extra repos for cross-repo work.
-- `--mount-ro <PATH> [<PATH> ...]` — host file(s)/dir(s) mounted **read-only**, e.g. `~/.ansible.cfg` or a shared
+- `--mount-rw <PATH> [<PATH> ...]` — host file(s)/dir(s) mounted read-write, e.g. extra repos for cross-repo work.
+- `--mount-ro <PATH> [<PATH> ...]` — host file(s)/dir(s) mounted read-only, e.g. `~/.ansible.cfg` or a shared
   config dir.
 
 Each path must exist and be under `/home/<user>/`. The same path can't be requested both read-write and read-only.
@@ -108,7 +108,7 @@ the agent's own config (Claude's `~/.claude/*`), every host integration is expli
 | `agent_uplink/agents/claude/default_rules.yaml` | Claude-specific allow rules (Datadog log POSTs; GET-only hosts are covered by the generic rule) |
 | `agent_uplink/agents/claude/Dockerfile` | Claude container image (Ubuntu 24.04, Claude CLI, AWS CLI v2, Docker engine for the in-pod `dockerd`, dev tools, baked mitm CA) |
 | `agent_uplink/agents/claude/dockerd-entrypoint.sh` | Agent pod PID 1: starts nested `dockerd`, chgrp's the socket, then drops to `sleep infinity` as the agent user |
-| `agent_uplink/agents/claude/certs/` | Legacy path (gitignored, not packaged). Certs live in `~/.agent_uplink/mitm/`; the image build context is assembled in a tempdir with only the public cert, so this dir is no longer written to |
+| `agent_uplink/agents/claude/certs/` | Unused path (gitignored, not packaged). Certs live in `~/.agent_uplink/mitm/`; the image build context is assembled in a tempdir with only the public cert, so this dir is not written to |
 
 ## Adding a new agent
 

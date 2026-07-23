@@ -1,8 +1,4 @@
-"""kubectl wrappers + manifest builders.
-
-Stays low-level: no agent-uplink domain logic here. Other modules import these
-helpers to assemble pods/secrets/etc and apply them via stdin to kubectl.
-"""
+"""kubectl wrappers + manifest builders. Low-level, no domain logic."""
 
 from __future__ import annotations
 
@@ -25,16 +21,14 @@ LOGGER = logging.getLogger("agent-uplink")
 # ---------------------------------------------------------------------------
 
 
-# kubeconfig context every deploy-side kubectl call targets. Set once at startup
-# via set_kube_context(); None means "use the kubeconfig's current-context".
+# kubeconfig context every deploy-side kubectl call targets; None uses the
+# current-context. Set once at startup via set_kube_context().
 _KUBE_CONTEXT: str | None = None
 
 
 def set_kube_context(context: str | None) -> None:
-    """Select the kubeconfig context used for all deploy-side kubectl calls.
-
-    Call once at startup before any kubectl invocation. An empty/None value
-    falls back to the kubeconfig's current-context."""
+    """Select the context for all deploy-side kubectl calls. Call once at startup;
+    empty/None uses the kubeconfig's current-context."""
     global _KUBE_CONTEXT
     _KUBE_CONTEXT = context or None
 
@@ -98,9 +92,8 @@ def wait_for_pod_ready(namespace: str, pod_name: str, *, timeout: int = 180) -> 
             f"--timeout={timeout}s",
         )
     except RuntimeError as exc:
-        # kubectl wait's own error says only "timed out"; the cause (image pull
-        # failure, runtime error, scheduling) is in the pod status and events —
-        # capture them now, since teardown deletes the namespace right after.
+        # kubectl wait only says "timed out"; capture pod status + events for the
+        # real cause before teardown deletes the namespace.
         status = kubectl(
             "get", "pod", pod_name, "-n", namespace, "-o", "wide",
             raise_error=False,
@@ -231,15 +224,10 @@ def service_manifest(
 
 @dataclass
 class Resources:
-    """Container resource requests + limits.
-
-    `memory`/`cpu` are the limits (the burst ceiling). `*_request` are the
-    scheduler reservation; when unset they default to the limit — matching
-    Kubernetes' own behaviour when `requests` is omitted — so callers that only
-    care about a cap are unchanged. Set a request below the limit to schedule on
-    smaller nodes while still allowing the pod to burst (Burstable QoS). Set
-    `cpu=None` to omit the CPU limit entirely (uncapped burst) while still
-    reserving `cpu_request`."""
+    """Container resource requests + limits. `memory`/`cpu` are the limits;
+    `*_request` are the scheduler reservation, defaulting to the limit when unset.
+    A request below the limit gives Burstable QoS; `cpu=None` omits the CPU limit
+    entirely (uncapped burst)."""
 
     memory: str = "256Mi"
     cpu: str | None = "1"
@@ -409,23 +397,21 @@ def network_policy_manifest(
 
 
 def tmpfs_volume(name: str, size: str = "64Mi") -> dict:
-    """Memory-backed emptyDir (tmpfs). Counts against the pod's memory limit, so
-    reserve it for paths that genuinely need tmpfs semantics: an overlayfs
-    upperdir (kata's virtio-fs rejects a disk-backed emptyDir as one) or a unix
-    socket (unreliable on virtio-fs). Use emptydir_volume for everything else."""
+    """Memory-backed emptyDir (tmpfs), counting against the pod's memory limit.
+    Reserve for paths needing tmpfs: an overlayfs upperdir (kata's virtio-fs is
+    rejected as one) or a unix socket. Use emptydir_volume otherwise."""
     return {"name": name, "emptyDir": {"medium": "Memory", "sizeLimit": size}}
 
 
 def emptydir_volume(name: str, size: str) -> dict:
-    """Disk-backed emptyDir. Backed by node ephemeral storage (shared into a kata
-    guest over virtio-fs) rather than memory, so it does not consume the pod's
-    memory budget. sizeLimit caps ephemeral-storage use."""
+    """Disk-backed emptyDir on node ephemeral storage, not the pod's memory
+    budget. sizeLimit caps ephemeral-storage use."""
     return {"name": name, "emptyDir": {"sizeLimit": size}}
 
 
 def secret_volume(name: str, secret_name: str) -> dict:
-    """Secret volume fragment. Uses the K8s default mode (0o644, world-readable)
-    so the pod's runAsUser can read the file regardless of fsGroup."""
+    """Secret volume. K8s default mode (0o644) so runAsUser can read it
+    regardless of fsGroup."""
     return {"name": name, "secret": {"secretName": secret_name}}
 
 
@@ -440,8 +426,8 @@ def hostpath_volume(name: str, path: str, *, hp_type: str = "Directory") -> dict
 def hardened_container_security_context(
     *, uid: int | None = None, gid: int | None = None
 ) -> dict:
-    """Hardening flags safe for any of our containers. Pass uid/gid for
-    images whose default user we need to override (e.g. agent image)."""
+    """Hardening flags safe for any of our containers. Pass uid/gid to override
+    an image's default user."""
     sc: dict[str, Any] = {
         "allowPrivilegeEscalation": False,
         "capabilities": {"drop": ["ALL"]},

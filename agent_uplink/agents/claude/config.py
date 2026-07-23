@@ -1,7 +1,5 @@
-"""Claude-specific host-side config: ~/.claude/settings.json + .credentials.json.
-
-All functions here return bytes; the orchestrator wraps them in K8s Secrets.
-"""
+"""Claude-specific host-side config. Functions return bytes; the orchestrator
+wraps them in K8s Secrets."""
 
 import json
 import logging
@@ -15,20 +13,15 @@ LOGGER = logging.getLogger("agent-uplink")
 
 HOST_CLAUDE_DIR = Path.home() / ".claude"
 HOST_CLAUDE_JSON = Path.home() / ".claude.json"
-# Enterprise managed settings. Optional — most hosts have no such file. Claude
-# reads it from this same path inside the container, where it outranks the user
-# settings.json, so the pod's copy is mounted at the identical location and the
-# merge behaves exactly as it does on the host.
+# Optional enterprise policy. Mounted at this same path in the pod so Claude's
+# merge precedence over the user settings.json applies unchanged.
 HOST_MANAGED_SETTINGS = Path("/etc/claude-code/managed-settings.json")
 
-# An MCP server's `Authorization` header in ~/.claude.json is replaced with this
-# before the file is mounted, so its bearer token never enters the pod. Claude
-# still sees the header present; the user adds a mitm rule to inject the real
-# value. All other headers and every `env` value are left untouched.
+# Replaces an MCP server's `Authorization` header value so the real bearer never
+# enters the pod; the user re-injects it via a mitm rule.
 _MCP_PLACEHOLDER = "PLACEHOLDER"
 
-# Pin fake-oauth credentials ~10 years out so Claude never tries to refresh
-# from inside the container. Refresh lives on the host.
+# Pin fake-oauth creds far out so Claude never refreshes from the container.
 _FAKE_OAUTH_TTL_SECONDS = 10 * 365 * 24 * 3600
 
 
@@ -43,10 +36,7 @@ def load_claude_config() -> dict:
 
 
 def load_managed_settings() -> dict | None:
-    """The host's /etc/claude-code/managed-settings.json, or None when absent.
-
-    Unlike the user settings.json this file is optional — a host with no
-    enterprise policy simply has none, which is not an error."""
+    """The host's managed-settings.json, or None when absent (the common case)."""
     if not HOST_MANAGED_SETTINGS.is_file():
         return None
     return json.loads(HOST_MANAGED_SETTINGS.read_text(encoding="utf8"))
@@ -83,17 +73,12 @@ def read_anthropic_oauth_credentials() -> dict:
 
 
 def fake_oauth_credentials_bytes(real_creds: dict) -> tuple[bytes, str]:
-    """Build a fake ~/.claude/.credentials.json blob for the container.
+    """Fake ~/.claude/.credentials.json for the container: bogus tokens with
+    expiresAt pinned far out, so Claude takes the OAuth code path without a
+    usable token. mitm injects the real bearer on api.anthropic.com.
 
-    Claude trusts the file as OAuth-mode creds (so the welcome banner renders
-    and the configured account is shown), but accessToken/refreshToken are
-    bogus and expiresAt is pinned far in the future. mitmproxy swaps the
-    Authorization header for the real bearer when proxying api.anthropic.com,
-    so the real token never enters the container.
-
-    Returns (json_bytes, real_access_token). The caller hands real_access_token
-    to the rules layer for injection.
-    """
+    Returns (json_bytes, real_access_token) — the caller passes the token to the
+    rules layer for injection."""
     oauth = real_creds.get("claudeAiOauth")
     if not isinstance(oauth, dict):
         raise ValueError(
@@ -118,9 +103,10 @@ def fake_oauth_credentials_bytes(real_creds: dict) -> tuple[bytes, str]:
 _SANDBOX_GUIDANCE = """
 ## Sandbox
 
-- You are running in a microVM sandbox. All HTTPS egress goes through mitmproxy and is enforced against an allow-list.
+- You are running in a microVM sandbox. All HTTPS egress goes through mitmproxy and is enforced against an allow-list. Most credentials will be injected there.
 - A `403` with text 'request not permitted by rules' means the host is blocked by policy. Stop — do not retry or try to work around it.
 - If anything fails because of the sandbox (blocked network, missing access, readonly filesystem issues etc), stop and say so. Don't waste time or money trying to fix sandbox limitations.
+- SSH public keys might be available in ~/.ssh. SSH_AUTH_SOCK points at a proxy with the private keys.
 - A Python venv at `~/.venv`. Use it rather than any user-mounted venv in the current directory to avoid any ABI issues with the host OS and python version.
 """
 
@@ -136,14 +122,9 @@ def claude_md_bytes() -> bytes:
 
 
 def sanitized_claude_json_bytes(source: Path) -> bytes:
-    """Return `source` (~/.claude.json) with each MCP server's `Authorization`
-    header value redacted.
-
-    Walks the top-level `mcpServers` map and each `projects.<path>.mcpServers`
-    map; in every server, the `Authorization` header value (if present) is
-    replaced with a placeholder. All other headers, every `env` value, and the
-    rest of the file are passed through unchanged. Returns b"{}" if `source` is
-    absent."""
+    """`source` (~/.claude.json) with every MCP server's `Authorization` header
+    redacted, in the top-level and per-project `mcpServers` maps. Other headers
+    and `env` values pass through. Returns b"{}" if `source` is absent."""
     if not source.exists():
         return b"{}"
     config = json.loads(source.read_text(encoding="utf8"))
@@ -155,11 +136,9 @@ def sanitized_claude_json_bytes(source: Path) -> bytes:
 
 
 def _redact_mcp_servers(servers: object) -> None:
-    """Replace the `Authorization` header value of each server in one mcpServers
-    map with a placeholder, in place. No-op if `servers` is not a dict or a server
-    has no `Authorization` header (match is case-insensitive). All other headers
-    and every `env` value are left untouched, so any secret they carry still
-    enters the pod."""
+    """Redact each server's `Authorization` header (case-insensitive) in place.
+    No-op if `servers` is not a dict. Other headers and `env` are untouched, so
+    secrets they carry still enter the pod."""
     if not isinstance(servers, dict):
         return
     for server in servers.values():
@@ -178,15 +157,11 @@ def get_bedrock_aws_profile_name(claude_config: dict) -> str | None:
 
 
 def claude_settings_bytes(claude_config: dict, auth_env: dict[str, str]) -> bytes:
-    """Build the in-pod settings.json by copying the host settings.json wholesale,
-    with two changes: the top-level `sandbox` key is dropped, and `permissions` is
-    replaced with `{defaultMode: "auto", skipDangerousModePermissionPrompt: true}`.
-    The pod's settings.json mounts at ~/.claude/settings.json (user settings) — the
-    only scope from which Claude honours `defaultMode: "auto"`. skipDangerousMode...
-    keeps Shift+Tab into bypassPermissions prompt-free (the launch flag is
-    --allow-dangerously-skip-permissions, which enables but does not activate that
-    mode). `auth_env` (our injected placeholders, e.g. AWS_BEARER_TOKEN_BEDROCK and,
-    in bedrock mode, CLAUDE_CODE_ENABLE_AUTO_MODE) is merged into env and wins."""
+    """In-pod ~/.claude/settings.json: the host settings.json with `sandbox`
+    dropped and `permissions` replaced by `defaultMode: auto` (the user scope is
+    the only one honouring it). `skipDangerousModePermissionPrompt` keeps
+    Shift+Tab into bypassPermissions prompt-free. `auth_env` placeholders are
+    merged into env and win."""
     settings = dict(claude_config)
     settings.pop("sandbox", None)
     if auth_env:
@@ -200,17 +175,12 @@ def claude_settings_bytes(claude_config: dict, auth_env: dict[str, str]) -> byte
 
 
 def managed_settings_bytes(managed: dict, auth_env: dict[str, str]) -> bytes:
-    """Build the in-pod managed-settings.json from the host's copy.
-
-    Same treatment as the user settings.json: the top-level `sandbox` key is
-    dropped (the pod is the sandbox), `permissions` is replaced with the
-    sandbox's own `defaultMode: auto` policy, and `auth_env` is merged into env
-    and wins. Managed settings outrank the user settings in Claude's merge, so
-    if the host policy's `permissions` were left intact it would override the
-    `auto` mode set on the user settings.json and the agent would prompt inside
-    the pod; and a real credential in the host policy's `env` would likewise
-    outrank the placeholder there and reach the agent container. Any MCP
-    `Authorization` header is redacted, as in sanitized_claude_json_bytes."""
+    """In-pod managed-settings.json: same treatment as claude_settings_bytes
+    (drop `sandbox`, force `permissions` to `auto`, merge `auth_env`), plus MCP
+    `Authorization` redaction. Managed settings outrank the user settings in
+    Claude's merge, so a left-intact host `permissions` or a real `env`
+    credential here would override the `auto` mode and placeholders shipped in
+    settings.json and reach the agent container."""
     settings = dict(managed)
     settings.pop("sandbox", None)
     _redact_mcp_servers(settings.get("mcpServers"))

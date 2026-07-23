@@ -1,11 +1,6 @@
-"""Session reaper: list and delete the per-run `agent-uplink-<id>` namespaces.
-
-Teardown normally rides on the run's signal handlers, so a `kill -9`, a host
-crash, or a closed lid leaks a namespace (and its pods/microVM). The `list` and
-`clean` subcommands find those by the `managed-by=agent-uplink` label and delete
-them. The long-lived registry namespace carries no such label, and is excluded
-by name as well, so it is never a target.
-"""
+"""Session reaper: list and delete per-run `agent-uplink-<id>` namespaces leaked
+by crashed runs. `list` and `clean` find them by the `managed-by=agent-uplink`
+label; the long-lived registry namespace is excluded by name."""
 
 from __future__ import annotations
 
@@ -89,10 +84,9 @@ def select_for_clean(
     all_sessions: bool,
     older_than_seconds: float | None,
 ) -> list[SessionNamespace]:
-    """Pick which sessions to delete. Exactly one selector must be given:
-    combining them is refused rather than silently picking one (ids alongside
-    --older-than could otherwise delete far more than the named sessions), and
-    so is giving none (a bare `clean` can't wipe everything by accident)."""
+    """Pick which sessions to delete. Exactly one selector is required — both
+    combining them and giving none are refused, so a bare `clean` can't wipe
+    everything by accident."""
     given = sum(
         (bool(all_sessions), older_than_seconds is not None, bool(ids))
     )

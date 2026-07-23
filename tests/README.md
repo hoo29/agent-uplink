@@ -48,7 +48,7 @@ itself needs — see the top-level CLAUDE.md):
   registry;
 - `docker` on PATH (to build + push the test image).
 
-**No real credentials are required** — every secret in the suite is a dummy or a
+No real credentials are required — every secret in the suite is a dummy or a
 sentinel.
 
 ```bash
@@ -71,13 +71,13 @@ GitHub runner and runs the whole suite there.
 ## How it works
 
 The harness (`tests/integration/harness.py`) assembles each namespace out of the
-**real** production builders — `cli._network_policies`, `cli._mitm_manifests`,
+real production builders — `cli._network_policies`, `cli._mitm_manifests`,
 `cli._agent_env`, `rules.resolve`, `aws.*` — so the tests exercise shipping code,
 not a parallel reimplementation. Only two things are swapped for testability:
 
 - **the agent image** → a small probe image (`tests/integration/testimage/`,
-  built `FROM docker:dind`) instead of the full Claude image, and **privileged +
-  the default runtime** instead of `runtimeClassName: kata-*`, so the suite runs
+  built `FROM docker:dind`) instead of the full Claude image, and privileged +
+  the default runtime instead of `runtimeClassName: kata-*`, so the suite runs
   on any k3s without kata;
 - **the upstreams** → an in-cluster `echo` server that reflects the request it
   received, so a test can read back exactly what mitm forwarded, injected or

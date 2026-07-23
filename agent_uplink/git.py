@@ -1,18 +1,14 @@
 """Runtime git config overlay for the agent pod.
 
 The agent image bakes /etc/gitconfig with SSH->HTTPS `insteadOf` rewrites for the
-default hosts (github.com, gitlab.com, bitbucket.org) and an `include.path` to a
-runtime overlay file. This module builds that overlay, which the orchestrator
-mounts at the included path when non-empty:
+default hosts and an `include.path` to this overlay, mounted when non-empty:
 
-  - extra SSH->HTTPS rewrites for `--git-https-rewrite` hosts (e.g. self-hosted
-    GitLab), accumulated with the baked defaults (insteadOf is a multivar), and
-  - the host's git identity (user.name / user.email) unless disabled, so the
-    agent's commits are attributed correctly.
+  - extra SSH->HTTPS rewrites for `--git-https-rewrite` hosts (insteadOf is a
+    multivar, so these add to the baked defaults), and
+  - the host's git identity (user.name / user.email) unless disabled.
 
-The overlay carries no secrets — git auth is injected host-side by mitm via the
-rules engine — so the Secret it ships in is safe to mount into the agent pod.
-"""
+The overlay carries no secrets (git auth is injected by mitm), so its Secret is
+safe to mount into the agent pod."""
 
 from __future__ import annotations
 
@@ -42,8 +38,8 @@ def _git_global(key: str) -> str | None:
     except FileNotFoundError:
         LOGGER.warning("git not found on host; skipping git identity")
         return None
-    # `git config --get` exits 1 with empty output for an unset key; treat that
-    # the same as an empty value rather than an error worth surfacing.
+    # `git config --get` exits 1 with empty output for an unset key; treat it as
+    # empty, not an error.
     return res.stdout.strip() or None
 
 
@@ -57,10 +53,8 @@ def _rewrite_block(host: str) -> str:
 
 
 def build_overlay(extra_hosts: list[str], include_identity: bool) -> bytes | None:
-    """Build the runtime gitconfig overlay, or None when it would be empty.
-
-    Raises ValueError for a malformed --git-https-rewrite host.
-    """
+    """The gitconfig overlay bytes, or None when empty. Raises ValueError for a
+    malformed --git-https-rewrite host."""
     sections: list[str] = []
 
     if include_identity:

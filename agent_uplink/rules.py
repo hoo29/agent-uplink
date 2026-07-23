@@ -1,18 +1,13 @@
-"""Layer + resolve the YAML rule files into the JSON blob the mitm addon reads.
-
-Pure functions; the caller wraps the returned bytes in a K8s Secret. Two header
-placeholder forms are resolved here on the host (so the addon never touches the
-user's keyring, YAML, or shell):
+"""Layer + resolve the YAML rule files into the JSON the mitm addon reads. Two
+header-placeholder forms are resolved here on the host so the addon never touches
+the keyring, YAML, or shell:
 
   {{keyring:SERVICE:USERNAME}}  static secret from the OS keyring
   {{exec:COMMAND}}              stdout of a host shell command, run at startup
 
-`{{exec:...}}` runs an arbitrary command via the shell with the user's host
-environment and credentials — identical trust to a `{{keyring:...}}` lookup or
-to typing the command in your own terminal. Only use `--rules` files you trust.
-It exists for short-lived dynamic credentials (e.g. an AWS CodeArtifact auth
-token) that keyring can't hold. The command can't contain a literal `}}`.
-"""
+`{{exec:...}}` runs an arbitrary shell command with the user's host credentials
+(gated behind --allow-exec) — for short-lived dynamic tokens keyring can't hold.
+Only use `--rules` files you trust. The command can't contain a literal `}}`."""
 
 import ipaddress
 import json
@@ -37,10 +32,9 @@ VALID_METHODS = {
     "HEAD", "OPTIONS", "CONNECT", "TRACE",
 }
 
-# One combined pattern, resolved in a single pass so a resolved secret value is
-# never re-scanned (a keyring value that happened to contain "{{exec:...}}" must
-# not be executed). keyring: service can't contain ':' or '}', username can't
-# contain '}' (usernames with ':' still allowed). exec: non-greedy up to '}}'.
+# One combined pattern in a single pass, so a resolved secret is never re-scanned
+# (a keyring value containing "{{exec:...}}" must not be executed). keyring:
+# service excludes ':'/'}', username excludes '}'; exec: non-greedy up to '}}'.
 _PLACEHOLDER_RE = re.compile(
     r"\{\{(?:keyring:(?P<service>[^:}]+):(?P<username>[^}]+)"
     r"|exec:(?P<cmd>.+?))\}\}",
@@ -106,12 +100,9 @@ def _validate_hosts(rule: dict, name: str) -> list[str]:
 
 
 def _validate_l4_forward_rule(rule: dict, name: str) -> dict:
-    """An l4_forward rule is an L4 (TCP) passthrough decision, not an HTTP allow
-    rule: mitm tunnels the raw connection without terminating TLS, so the agent's
-    client cert reaches the upstream end-to-end. It carries no methods/paths/
-    inject (mitm never sees the plaintext), and matches on either `hosts` (a list
-    of regexes, for connections to a hostname) or `cidrs` (when the request
-    target is a literal IP). At least one must be present."""
+    """An l4_forward rule tunnels raw TCP without terminating TLS, so it takes no
+    methods/paths/inject (mitm never sees the plaintext) and matches on `hosts`
+    (hostname regexes) and/or `cidrs` (literal-IP targets); at least one."""
     hosts = rule.get("hosts")
     cidrs = rule.get("cidrs")
     if hosts is None and cidrs is None:
@@ -206,51 +197,27 @@ def resolve(
     allow_exec: bool = False,
     kube_rules: list[dict] | None = None,
 ) -> bytes:
-    """Build the resolved rules JSON.
+    """Build the resolved rules JSON. First match wins in the addon, so priority
+    is by LAYER (declaration order preserved within each):
 
-    Match priority is by LAYER, not by regex length — first match wins in the
-    addon, so the order here is the precedence:
-
-      1. agent auth rules          (per-mode auth header injection, from
-                                    prepare(); attaches the agent's own credential
-                                    to a specific backend host)
-      2. kube rules                (auto-generated from --kube-context; always
-                                    included when kube is enabled, regardless of
-                                    --no-default-rules, so k8s traffic is allowed)
-      3. user-supplied rules       (the operator's added destinations)
+      1. agent auth rules   (per-mode credential injection, from prepare())
+      2. kube rules         (from --kube-context)
+      3. user rules         (the operator's added destinations)
       4. agents/<name>/default_rules.yaml   (per-agent)
-      5. agent_uplink/default_rules.yaml    (generic catch-all, evaluated LAST)
-
-    Within a layer, declaration order is preserved. Ordering by layer (rather
-    than the old sort-by-host-length heuristic) keeps the broad generic rule
-    last and a user rule ahead of the per-agent/generic defaults.
-
-    `user_rules` is a sequence of rule *sources*, concatenated in order to form
-    the user layer (so a source listed first wins first-match over a later one):
-
-      - a `Path`          a YAML rules file ({rules: [...], replace_defaults?})
-      - a `dict`          a single inline rule (same schema as a file rule),
-                          e.g. supplied directly in `.agent-uplink.yaml`
-
-    A bare `Path`/`None` is accepted as shorthand for a single-file / empty
-    source list.
+      5. agent_uplink/default_rules.yaml    (generic catch-all, LAST)
 
     Auth and kube rules sit ABOVE user rules deliberately: each injects a
-    credential on a narrow host (bedrock-runtime.<region>.amazonaws.com,
-    api.anthropic.com, the k8s API server), and a broad user allow rule for an
-    overlapping host (e.g. `.*\\.amazonaws\\.com`) would otherwise win first-match
-    and strip the injected credential, breaking auth. To take over the agent's
-    auth entirely, use --no-default-rules and supply your own rule.
+    credential on a narrow host, and a broad user allow rule on an overlapping
+    host would otherwise win first-match and strip it. Use --no-default-rules to
+    take over auth entirely.
 
-    `--no-default-rules` (or `replace_defaults: true` in any rules file) keeps
-    only the kube rules and the user rules, dropping the auth rule too — the user
-    becomes responsible for supplying any auth the chosen mode needs.
+    `user_rules` is a sequence of rule *sources* forming the user layer, first
+    source winning: a `Path` (a YAML `{rules: [...], replace_defaults?}` file) or
+    a `dict` (a single inline rule). A bare `Path`/`None` is shorthand.
 
-    `allow_exec` permits `{{exec:...}}` placeholders to run host shell commands.
-    `kube_rules` are synthetic rules produced by kube.resolve(); they are always
-    included when non-empty so that k8s traffic is allowed regardless of
-    --no-default-rules.
-    """
+    `--no-default-rules` (or `replace_defaults: true` in a file) drops the auth
+    and per-agent/generic layers, keeping only kube + user rules. `kube_rules`
+    are always included when non-empty. `allow_exec` gates `{{exec:...}}`."""
     if user_rules is None:
         sources: list = []
     elif isinstance(user_rules, (str, Path)):
@@ -258,7 +225,6 @@ def resolve(
     else:
         sources = list(user_rules)
 
-    # Concatenate every source into the user layer, first source first.
     # `replace_defaults` in any file source switches off the built-in layers.
     user_layer: list[dict] = []
     replace_defaults = False
@@ -274,13 +240,9 @@ def resolve(
     use_defaults = not (no_default_rules or replace_defaults)
 
     layered: list[dict] = []
-    # Auth rules first so a broad user allow rule on an overlapping host can't
-    # win first-match and strip the agent's injected credential. Dropped by
-    # --no-default-rules, where the user takes over auth.
     if use_defaults:
         layered.extend(auth_rules)
-    # Kube rules are always included when provided — dropping them via
-    # --no-default-rules would silently block all kubectl traffic. Above user
+    # Always included (dropping them would block all kubectl traffic); above user
     # rules for the same shadow-protection reason as auth rules.
     layered.extend(kube_rules or [])
     layered.extend(user_layer)

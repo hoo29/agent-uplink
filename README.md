@@ -4,9 +4,9 @@ Run a coding agent in a Kata Containers microVM on a local k3s cluster with rest
 is routed through a mitmproxy pod that enforces an allowlist and can inject credentials from your OS keyring, so secrets never
 enter the agent pod.
 
-Agent-agnostic: orchestration is generic, each agent is a subclass under `agent_uplink/agents/<name>/`. Today only `claude` is implemented.
+Agent-agnostic: orchestration is generic, each agent is a subclass under `agent_uplink/agents/<name>/`. Only `claude` is implemented.
 
-**Linux only** (WSL2 works). Tested against k3s.
+Linux only (WSL2 works). Tested against k3s.
 
 ## Architecture
 
@@ -141,27 +141,27 @@ agent-uplink claude --anthropic -- -p "summarise the build failure"
 (set it once with `keyring set bedrock key`).
 
 Anything after a `--` separator is forwarded verbatim to the in-pod `claude` CLI (e.g. `--resume <id>`, `-c`, `-p
-"<prompt>"`). The pod defaults to permission mode `auto`; `--allow-dangerously-skip-permissions` is always added so
-`bypassPermissions` stays reachable via `Shift+Tab` (and on models without `auto` support, e.g. older Sonnet, where
-the default falls back to `default` mode). Pass `--permission-mode` after `--` to override the default.
+"<prompt>"`). The pod defaults to permission mode `auto` and always adds `--allow-dangerously-skip-permissions` so
+`bypassPermissions` stays reachable via `Shift+Tab` (on models without `auto` support, e.g. older Sonnet, the default
+falls back to `default` mode). Pass `--permission-mode` after `--` to override.
 
 Each run creates a session namespace `agent-uplink-<id>`, torn down on exit.
 
 ### Configuration file
 
-Every CLI flag can be set in a `.agent-uplink.yaml` file so you don't have to retype them. On an agent run, agent-uplink
-reads every `.agent-uplink.yaml` from the working directory up to and including `~/.agent-uplink.yaml`, then applies the
-CLI args on top. Precedence, lowest to highest:
+Every CLI flag can be set in a `.agent-uplink.yaml` file. On an agent run, agent-uplink reads every `.agent-uplink.yaml`
+from the working directory up to and including `~/.agent-uplink.yaml`, then applies the CLI args on top. Precedence,
+lowest to highest:
 
 ```sh
 ~/.agent-uplink.yaml  <  ...  <  ./<project>/.agent-uplink.yaml  <  CLI args
 ```
 
-So a home-level file holds your defaults, a project-level file overrides them, and an explicit CLI flag always wins. The
-`list` / `clean` subcommands ignore config.
+A home-level file holds defaults, a project-level file overrides them, an explicit CLI flag always wins. The `list` /
+`clean` subcommands ignore config.
 
 Keys are the flag's long name with or without dashes (`mount-rw` and `mount_rw` both work). Scalars and booleans follow
-the precedence above (closer file wins, CLI wins over all). **Repeatable flags are additive** — values from every config
+the precedence above (closer file wins, CLI wins over all). Repeatable flags are additive — values from every config
 file and the CLI accumulate rather than replace:
 
 ```yaml
@@ -215,41 +215,40 @@ selector is refused, so it can't wipe everything by accident.
 
 ### Authenticated docker pulls
 
-`~/.docker/config.json` is never mounted into the pod. Private registry auth is handled the same way as everything else — a mitm
-rule injects the `Authorization` header on the registry host. The in-pod `dockerd` pulls anonymously; mitm adds the credential.
-`examples/rules/ecr.yaml` shows this for AWS ECR (Basic auth, token resolved on the host via `{{exec:...}}`, never entering the
-pod).
+`~/.docker/config.json` is never mounted into the pod. A mitm rule injects the `Authorization` header on the registry host;
+the in-pod `dockerd` pulls anonymously and mitm adds the credential. `examples/rules/ecr.yaml` shows this for AWS ECR (Basic
+auth, token resolved on the host via `{{exec:...}}`, never entering the pod).
 
 ### SSH egress
 
-By default the agent pod reaches only `mitm` and `kube-dns`, so SSH is blocked. The SSH *transport* still **bypasses mitm** —
-SSH is not HTTP, so there is no allow-list or rule engine for it; reachability is the only control. Two flags open it:
+By default the agent pod reaches only `mitm` and `kube-dns`, so SSH is blocked. The SSH transport bypasses mitm — SSH is
+not HTTP, so there is no allow-list or rule engine for it; reachability is the only control. Two flags open it:
 
-- `--ssh-cidr <CIDR> [<CIDR> ...]` — allows **TCP 22 only** to those CIDRs (a bare IP becomes `/32`). This is the sole control
+- `--ssh-cidr <CIDR> [<CIDR> ...]` — allows TCP 22 only to those CIDRs (a bare IP becomes `/32`). This is the sole control
   on which hosts SSH can reach, so scope it tightly. NetworkPolicy matches resolved IPs, not DNS names, so mind DNS/CDN churn
   for hosts like GitHub.
-- `--ssh-key-dir <DIR>` — the **private keys never enter the agent pod**. They are loaded into an `ssh-agent` in a separate,
-  hardened *holder* pod, and the agent reaches it over a socat bridge, so it can sign but never read the key bytes. (The holder
+- `--ssh-key-dir <DIR>` — the private keys never enter the agent pod. They are loaded into an `ssh-agent` in a separate,
+  hardened holder pod, and the agent reaches it over a socat bridge, so it can sign but never read the key bytes. (The holder
   is a separate pod because the privileged agent container could read a same-pod sidecar's memory.) The agent gets only the
   public keys + any `config`, placed in the standard `~/.ssh`; signing happens in the holder. Pin a key to a host with
   `IdentityFile ~/.ssh/<name>.pub` + `IdentitiesOnly yes`. Keys must be passphraseless (the holder loads them non-interactively).
 
-This protects key **confidentiality** — a compromised agent can't steal the keys — but not authorization: the agent can still
+This protects key confidentiality — a compromised agent can't steal the keys — but not authorization: the agent can still
 use a key against any host the `--ssh-cidr` set allows, so that CIDR set remains the egress control. The flags are independent
 but want each other (each logs a warning if used alone).
 
 ### Git over HTTPS
 
-SSH egress is for shelling into machines, not git. Git runs over **HTTPS**, through mitm, so the allow-list governs it
-and injects credentials host-side. The agent image bakes `insteadOf` rewrites for **github.com, gitlab.com,
-bitbucket.org** that turn SSH remotes (`git@host:owner/repo`, `ssh://git@host/...`) into HTTPS at operation time, so
-existing SSH remotes and submodules just work — `git clone git@github.com:owner/repo.git` becomes an HTTPS clone.
+SSH egress is for shelling into machines, not git. Git runs over HTTPS, through mitm, so the allow-list governs it and
+injects credentials host-side. The agent image bakes `insteadOf` rewrites for github.com, gitlab.com, and bitbucket.org
+that turn SSH remotes (`git@host:owner/repo`, `ssh://git@host/...`) into HTTPS at operation time, so existing SSH remotes
+and submodules just work — `git clone git@github.com:owner/repo.git` becomes an HTTPS clone.
 
 - `--git-https-rewrite <HOST> [<HOST> ...]` — rewrite extra hosts (e.g. self-hosted GitLab) too.
 - `--no-git-identity` — by default the host's `user.name`/`user.email` are surfaced so commits are attributed; this
   omits them. The injected config carries no secrets and leaves the agent's `~/.gitconfig` writable.
 
-Auth is **opt-in**: the default allow-list permits only `GET`/`OPTIONS`/`HEAD`, but git fetch/push POST to
+Auth is opt-in: the default allow-list permits only `GET`/`OPTIONS`/`HEAD`, but git fetch/push POST to
 `git-upload-pack`/`git-receive-pack`. Pass `--rules examples/rules/git.yaml` to allow those endpoints and inject HTTP
 Basic auth (token resolved on the host, never entering the pod). Without it, even a public clone is denied.
 
@@ -289,7 +288,7 @@ For each context, agent-uplink reads the cluster CA, server URL, and credentials
 
 Real tokens and client keys never appear in the pod kubeconfig or the agent container.
 
-**Supported auth methods:** static bearer token (`user.token` / `user.tokenFile`) and client certificate
+Supported auth methods: static bearer token (`user.token` / `user.tokenFile`) and client certificate
 (`user.client-certificate-data` + `user.client-key-data`). `exec`/`auth-provider` contexts (EKS, GKE, AKS, OIDC) and
 `insecure-skip-tls-verify` are refused at startup with a clear error.
 
@@ -300,16 +299,16 @@ Real tokens and client keys never appear in the pod kubeconfig or the agent cont
 mitmproxy verifies upstream certificates against its built-in roots (the image's `certifi` bundle). Two flags adjust that
 for upstreams those roots don't cover (a corporate proxy, an internal service with a private CA):
 
-- `--mitm-ca-cert <file> [<file> ...]` trusts extra CA(s) **on top of** the defaults. Each file is PEM-encoded and may hold
-  multiple concatenated certs; the flag is repeatable. mitmproxy's trust option *replaces* rather than augments its store,
+- `--mitm-ca-cert <file> [<file> ...]` trusts extra CA(s) on top of the defaults. Each file is PEM-encoded and may hold
+  multiple concatenated certs; the flag is repeatable. mitmproxy's trust option replaces rather than augments its store,
   so agent-uplink concatenates the default roots, any kube cluster CAs, and your CA(s) into one bundle the mitm pod trusts.
   Prefer this over `--mitm-insecure`.
 - `--mitm-insecure` disables upstream certificate verification entirely (`ssl_insecure`). It accepts any cert, including
-  self-signed, and **removes protection against an upstream MITM** — use only as a last resort. Off by default.
+  self-signed, and removes protection against an upstream MITM — use only as a last resort. Off by default.
 
 ## Rules
 
-YAML allow-list, first match wins. Match priority is by **layer**, not regex length: the agent's auth rule (and any kube
+YAML allow-list, first match wins. Match priority is by layer, not regex length: the agent's auth rule (and any kube
 rules) first, then your rules, then agent defaults, then the generic `GET`/`OPTIONS`/`HEAD`-anywhere catch-all last. Auth
 and kube rules lead so a broad rule of yours on an overlapping host (e.g. `.*\.amazonaws\.com`) can't shadow an injected
 credential. `--no-default-rules` (or `replace_defaults: true` in any rules file) keeps only your rules (and drops the auth
@@ -351,7 +350,7 @@ rules:
 ```
 
 Matching is on the CONNECT target before DNS resolution; `hosts` matches hostnames, `cidrs` matches literal-IP requests (a
-hostname that resolves into the range is not matched). Such connections **bypass the allow-list and injection** — mitm can't
+hostname that resolves into the range is not matched). Such connections bypass the allow-list and injection — mitm can't
 see inside the tunnel — so scope them narrowly. See `docs/rules.md` and `examples/rules/l4-passthrough.yaml`.
 
 See `examples/rules/`.
@@ -365,12 +364,12 @@ single-user tool, and is not a malware sandbox. Known limitations/tradeoffs of t
   via GET query strings/headers. For untrusted workloads, run `--no-default-rules` with an explicit allow-list.
 - DNS to kube-dns is allowed (`^`) — a residual exfiltration channel the mitm allow-list never sees.
 - `--allow-exec` lets a `--rules` file run host shell commands at startup - only enable it for rules files you trust.
-- `--ssh-cidr` opens TCP 22 to the given CIDRs **bypassing mitm entirely** (no allow-list or rule engine for the SSH transport)
+- `--ssh-cidr` opens TCP 22 to the given CIDRs bypassing mitm entirely (no allow-list or rule engine for the SSH transport)
   — scope the CIDRs tightly. With `--ssh-key-dir` the private keys stay in a separate holder pod and never enter the agent (it
   signs via an ssh-agent bridge), so the keys can't be stolen, but they can still be used against any host the CIDRs allow.
-- For the `claude` agent, the host `~/.claude/settings.json` is currently copied into the pod **wholesale** (only the top-level
-  `sandbox` key is dropped and `permissions` is replaced). Secret-bearing keys — `apiKeyHelper` and any secret `env` vars —
-  therefore **do** reach the agent pod's `settings.json`, so keep secrets out of your host `settings.json`.
+- For the `claude` agent, the host `~/.claude/settings.json` is copied into the pod wholesale (only the top-level `sandbox`
+  key is dropped and `permissions` is replaced). Secret-bearing keys — `apiKeyHelper` and any secret `env` vars — reach the
+  agent pod's `settings.json`, so keep secrets out of your host `settings.json`.
 
 ^ NetworkPolicies can't restrict traffic for pod <-> host where the pod is scheduled.
 
@@ -387,8 +386,8 @@ Unit tests need nothing. The integration suite runs against a live k3s cluster
 (reusing the same `kubectl` + `docker` + `localhost:5000` registry setup the tool
 itself needs) and focuses on the security posture: credentials never reaching the
 agent pod, the agent's egress being confined to mitm + kube-dns, and the
-allow-list / credential-injection / SigV4 re-signing behaving as designed. **No real
-credentials are needed** — every secret is a dummy or a sentinel. Pods run
+allow-list / credential-injection / SigV4 re-signing behaving as designed. No real
+credentials are needed — every secret is a dummy or a sentinel. Pods run
 privileged on the default runtime (no kata), so the suite runs on a bare k3s /
 GitHub runner; `.github/workflows/integration-tests.yml` does exactly that. If no
 cluster is reachable the integration suite skips itself. See

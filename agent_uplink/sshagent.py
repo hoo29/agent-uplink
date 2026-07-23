@@ -1,20 +1,14 @@
 """SSH agent-forwarding relay.
 
-The private keys live in a dedicated holder pod running `ssh-agent`; the agent
-pod reaches that agent over a socat TCP bridge and only ever obtains signatures,
-never the private key bytes. This keeps key material off the privileged agent
-container, whose `CAP_SYS_ADMIN` would let it read a same-pod sidecar's memory —
-hence the holder must be a separate pod, reachable only over the network (the
-same trust model as the mitm pod).
+Private keys live in a dedicated holder pod running `ssh-agent`; the agent pod
+reaches it over a socat TCP bridge and only ever obtains signatures. The holder
+is a separate pod (not a sidecar) because the privileged agent's CAP_SYS_ADMIN
+could read a same-pod process's memory — same trust model as the mitm pod.
 
-Host->key mapping stays client-side: the user's `config` and the matching public
-keys (which are not secret) are mounted into the agent pod's ~/.ssh, so a rule
-like `IdentityFile ~/.ssh/<name>.pub` + `IdentitiesOnly yes` pins one key to a
-host. ssh loads the public half locally and asks the holder's agent to sign. The
-public key is always derived from the private one (not read from a shipped
-`.pub`) so it cannot drift, and deriving doubles as a passphraseless check — the
-holder's `ssh-add` runs non-interactively and can't unlock an encrypted key.
-"""
+Host->key mapping stays client-side: the user's `config` and derived public keys
+are mounted into the agent pod's ~/.ssh, so `IdentityFile ~/.ssh/<name>.pub` +
+`IdentitiesOnly yes` pins one key to a host. Public keys are derived from the
+private half (so they can't drift), which doubles as a passphraseless check."""
 
 from __future__ import annotations
 
@@ -24,41 +18,29 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-# A private key is identified by this PEM marker; everything else in the dir is
-# an ssh client config file or ignored. The marker is authoritative over the
-# filename: a file carrying it is always treated as a private key (and so kept
-# off the agent pod), even if it is named like a config file.
+# A file carrying this PEM marker is always treated as a private key (kept off
+# the agent pod), regardless of its name.
 _PRIVATE_KEY_MARKER = b"PRIVATE KEY-----"
 
-# Non-key support files that belong in the agent pod's ~/.ssh, not the holder.
-# `known_hosts` is deliberately excluded: it would be mounted read-only, which
-# blocks ssh from appending newly accepted host keys (EROFS). ssh creates its
-# own writable known_hosts in the agent pod's ~/.ssh instead.
+# Non-key files for the agent pod's ~/.ssh. `known_hosts` is excluded: mounted
+# read-only it would block ssh appending host keys (EROFS); ssh makes its own.
 _CONFIG_FILES = frozenset({"config"})
 
 
 @dataclass
 class SshAgentPlan:
-    """Split of a host key dir into the two pods.
-
-    `private_keys` (filename -> bytes) become the holder's `ssh-agent-keys`
-    Secret; `agent_files` (derived public keys + config) become the agent pod's
-    `ssh-pub` Secret, dropped file-by-file into ~/.ssh.
-    """
+    """Split of a host key dir: `private_keys` become the holder's Secret;
+    `agent_files` (derived public keys + config) go to the agent pod's ~/.ssh."""
 
     private_keys: dict[str, bytes]
     agent_files: dict[str, bytes]
 
 
 def _derive_public_key(priv: Path) -> bytes:
-    """Public half of a passphraseless private key via `ssh-keygen -y`.
-
-    An encrypted key must fail here, not in the holder. ssh-keygen reads a
-    passphrase from the controlling terminal or an askpass helper, not stdin, so
-    closing stdin alone is not enough: `start_new_session=True` detaches the
-    controlling terminal (no /dev/tty to prompt on) and the environment disables
-    askpass. With both, an encrypted key has no way to be unlocked and exits
-    non-zero, which we surface as a clear host-side error."""
+    """Public half of a passphraseless private key via `ssh-keygen -y`. An
+    encrypted key must fail here, not in the holder: `start_new_session=True`
+    detaches the controlling terminal and the env disables askpass, so ssh-keygen
+    has no way to prompt and exits non-zero, surfaced as a clear error."""
     env = {**os.environ, "SSH_ASKPASS_REQUIRE": "never", "DISPLAY": ""}
     env.pop("SSH_ASKPASS", None)
     result = subprocess.run(
@@ -79,13 +61,10 @@ def _derive_public_key(priv: Path) -> bytes:
 
 
 def prepare(key_dir: Path) -> SshAgentPlan | None:
-    """Classify the host key dir; return None if it holds no private keys.
-
-    Private keys go to the holder; a freshly derived `<name>.pub`, any `config`,
-    and any OpenSSH certificate (`*-cert.pub`) go to the agent pod so a host->key
-    mapping can pin a key. Certificates are kept because they cannot be derived
-    from the private key and the holder still signs with the private half.
-    """
+    """Classify the host key dir, or None if it holds no private keys. Private
+    keys go to the holder; a derived `<name>.pub`, any `config`, and any OpenSSH
+    certificate (`*-cert.pub`, kept because it can't be derived) go to the agent
+    pod so a host->key mapping can pin a key."""
     private_keys: dict[str, bytes] = {}
     agent_extra: dict[str, bytes] = {}  # config + certificates -> agent pod ~/.ssh
 

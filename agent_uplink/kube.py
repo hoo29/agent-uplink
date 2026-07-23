@@ -1,22 +1,14 @@
-"""Kubernetes context resolution for agent-uplink.
+"""Kubernetes context resolution.
 
-Reads host kubeconfig contexts (via `kubectl config view --flatten --minify`),
-resolves bearer-token or client-certificate credentials, and produces a KubePlan
-that the orchestrator uses to:
+Reads host kubeconfig contexts, resolves credentials, and produces a KubePlan the
+orchestrator uses to wire mitm (client certs on the upstream leg, cluster CAs in
+the trust store, bearer injection via the allow-list) and mount a sanitized pod
+kubeconfig with the real credential stripped.
 
-  - Wire mitm to present client certs on the upstream TLS leg (client cert auth).
-  - Add cluster CAs to mitm's upstream trust store.
-  - Inject the real bearer token as an Authorization header via the allow-list.
-  - Mount a sanitized pod kubeconfig (mitm CA for trust, real cred stripped).
-
-Only two auth methods are supported in v1:
-  - Static bearer token (user.token or user.tokenFile)
-  - Client certificate (user.client-certificate-data + user.client-key-data)
-
-exec / auth-provider (EKS/GKE/AKS plugins, OIDC) and username/password are
-rejected at startup with a clear "unsupported in v1" error. insecure-skip-tls-verify
-contexts are also refused.
-"""
+Two auth methods are supported: static bearer token (user.token/tokenFile) and
+client certificate (user.client-certificate-data + client-key-data). exec /
+auth-provider, username/password, and insecure-skip-tls-verify are rejected at
+startup."""
 
 from __future__ import annotations
 
@@ -39,28 +31,21 @@ _BEARER_PLACEHOLDER = "agent-uplink-placeholder"
 class KubePlan:
     """Products of kubeconfig resolution; consumed by cli.py."""
 
-    # Synthetic allow rules — one per cluster host. Bearer rules carry the
-    # resolved Authorization header; cert rules carry none (the cert is
-    # presented on the TLS leg by mitm's client_certs option, not via a header).
+    # One synthetic allow rule per cluster host. Bearer rules carry the
+    # Authorization header; cert rules carry none (mitm presents the cert).
     rules: list[dict] = field(default_factory=list)
-    # Filename -> PEM bytes (cert + key concatenated) for mitm's client_certs
-    # directory. mitmproxy looks up <host>.pem when connecting to that host.
+    # <host>.pem -> cert+key bytes for mitm's client_certs dir.
     client_certs: dict[str, bytes] = field(default_factory=dict)
-    # All cluster CA PEMs concatenated — passed to mitm as its upstream trust
-    # bundle (additive to the system trust store).
+    # All cluster CA PEMs concatenated, for mitm's upstream trust bundle.
     upstream_ca_bundle: bytes = b""
-    # Sanitized kubeconfig: real server URLs, mitm CA for trust, real
-    # credentials stripped (bearer token replaced with placeholder, client
-    # cert/key fields absent).
+    # Sanitized kubeconfig: real server URLs, mitm CA for trust, credentials
+    # stripped (bearer -> placeholder, cert/key absent).
     pod_kubeconfig: bytes = b""
 
 
 def _kubectl_view(context: str, kubeconfig_path: Path | None) -> dict[str, Any]:
-    """Return the flattened, minified kubeconfig for one context as parsed JSON.
-
-    --flatten inlines file-based certs/keys into their *-data counterparts.
-    --minify trims to the single selected context, cluster, and user.
-    """
+    """The flattened (--flatten inlines file certs/keys), minified (--minify
+    trims to the one context) kubeconfig for `context`, as parsed JSON."""
     cmd = [
         "kubectl", "config", "view",
         "--flatten",
@@ -85,16 +70,10 @@ def resolve(
     context_names: list[str],
     mitm_ca_cert: bytes,
 ) -> KubePlan:
-    """Resolve kubeconfig contexts into a KubePlan.
-
-    For each named context, reads the cluster CA, server URL, and user
-    credentials from the host kubeconfig; validates the auth method; builds
-    mitm wiring and a sanitized pod kubeconfig. Real credentials (token or
-    client key) never appear in the pod kubeconfig or in the KubePlan's rules
-    in cleartext beyond what the mitm rules engine already holds.
-
-    Raises ValueError on any unsupported or unsafe configuration.
-    """
+    """Resolve kubeconfig contexts into a KubePlan: per context, read the cluster
+    CA, server URL, and credentials, validate the auth method, and build the mitm
+    wiring and sanitized pod kubeconfig. Raises ValueError on any unsupported or
+    unsafe configuration."""
     if not context_names:
         return KubePlan()
 
@@ -198,13 +177,9 @@ def resolve(
                 "name": f"kube-{ctx_name}",
                 "hosts": [re.escape(host)],
             }
-            # mitm presents the real client cert on the upstream TLS leg, so the
-            # pod kubeconfig carries none. But an empty user makes kubectl fall
-            # back to interactive basic auth and prompt for a username *before*
-            # it ever connects — so it never reaches mitm. A placeholder bearer
-            # token gives kubectl a non-interactive credential; it's irrelevant
-            # to the API server, which authenticates via the client cert (the
-            # x509 authenticator runs ahead of the bearer-token one).
+            # mitm presents the cert, so the pod kubeconfig carries none. The
+            # placeholder bearer stops kubectl prompting for a username before it
+            # connects; the API server ignores it and authenticates via the cert.
             pod_user_data = {"token": _BEARER_PLACEHOLDER}
 
         else:
@@ -242,7 +217,6 @@ def resolve(
         pod_kubeconfig_dict, default_flow_style=False, allow_unicode=True
     ).encode("utf-8")
 
-    # Concatenate all cluster CAs into a single PEM bundle.
     upstream_ca_bundle = b"\n".join(ca_pems)
 
     return KubePlan(

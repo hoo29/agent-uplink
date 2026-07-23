@@ -12,7 +12,7 @@ Key points:
 - **Precedence** (lowest to highest): `~/.agent-uplink.yaml` → … → project `./.agent-uplink.yaml` → CLI args. Scalars and
   booleans: closer file wins, CLI wins over all (`--no-debug` beats a config `debug: true`).
 - **Repeatable flags are additive.** List-valued flags (`aws_profiles`, `ssh_cidr`, `mount_rw`, `mount_ro`,
-  `git_https_rewrite`, `kube_context`, `rules`) accumulate across every config file *and* the CLI. This relies on argparse's
+  `git_https_rewrite`, `kube_context`, `rules`) accumulate across every config file and the CLI. This relies on argparse's
   `extend` action extending the `set_defaults` list default with the CLI values. The passthrough positional (`claude_args`,
   after `--`) is the exception: a CLI `-- …` replaces a config `claude_args:`.
 - **Inline rules.** The `rules` list is special-cased (`config._STRUCTURED_LIST_DESTS`): a list item that is a mapping is
@@ -21,7 +21,7 @@ Key points:
   (earlier sources win first-match). So rules can be defined entirely inline in `.agent-uplink.yaml` with no separate file.
 - **store_const flags** that share a dest (`--anthropic`/`--bedrock` → `auth_mode`) are settable by option name
   (`anthropic: true`) or dest (`auth_mode: anthropic`). Because config can supply the mode, the claude subparser's mode
-  group is **not** argparse-`required`; `ClaudeAgent.__init__` enforces that one was supplied by either route.
+  group is not argparse-`required`; `ClaudeAgent.__init__` enforces that one was supplied by either route.
 - Values are coerced with each action's `type` (so a config `rules:` becomes a `Path`, `~` expanded). A malformed YAML,
   unknown key, or invalid value raises `config.ConfigError` and aborts startup before any pod is launched.
 
